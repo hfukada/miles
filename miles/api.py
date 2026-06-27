@@ -1,5 +1,6 @@
 import sqlite3
 import uvicorn
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict
 
@@ -210,21 +211,28 @@ def get_marathon_weeks(build_weeks: int = _BUILD_WEEKS) -> list[MarathonWeeks]:
     out: list[MarathonWeeks] = []
     for race in races:
         race_date: str = race["race_date"]
-        build_start: str = conn.execute(
-            "SELECT DATE(?, ?)", (race_date, f"-{build_weeks * 7} days")
-        ).fetchone()[0]
+        # Align to Monday so every week is Mon–Sun and no week is partially cut off.
+        # race_week_monday = the Monday on or before race_date.
+        race_dt = date.fromisoformat(race_date)
+        race_week_monday = race_dt - timedelta(days=race_dt.weekday())
+        build_start = (race_week_monday - timedelta(weeks=build_weeks)).isoformat()
 
+        # Offset formula anchored to build_start (always a Monday):
+        #   0  = race week (race_week_monday through race_date, inclusive)
+        #  -1  = week before, … -12 = first week of build
+        # Using build_start as anchor keeps all differences positive so CAST
+        # truncates correctly without needing floor division.
         week_rows = conn.execute(f"""
             SELECT
-                CAST((julianday(DATE(start_date)) - julianday(?)) / 7.0 AS INTEGER) AS week_offset,
+                CAST((julianday(DATE(start_date)) - julianday(?)) / 7.0 AS INTEGER) - {build_weeks} AS week_offset,
                 ROUND(SUM(distance_m) / 1609.34, 2) AS miles
             FROM activities
             WHERE {tc}
               AND DATE(start_date) >= ?
-              AND DATE(start_date) < ?
+              AND DATE(start_date) <= ?
             GROUP BY week_offset
             ORDER BY week_offset
-        """, [race_date] + tp + [build_start, race_date]).fetchall()
+        """, [build_start] + tp + [build_start, race_date]).fetchall()
 
         out.append(MarathonWeeks(
             name=race["name"],
