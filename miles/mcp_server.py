@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import statistics
 from datetime import date, timedelta
 
 from mcp.server.fastmcp import FastMCP
@@ -15,6 +16,20 @@ def _conn() -> sqlite3.Connection:
     conn = db.connect()
     db.init_db(conn)
     return conn
+
+
+def _filter_to_rep_laps(laps: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """
+    From a list of non-trivial laps for one session, return only the interval reps.
+    Uses median duration clustering: keeps laps within 60-140% of the median duration,
+    which separates uniform-duration reps from warmup/cooldown (different length) and
+    recovery jogs that slipped past the basic distance/time filter.
+    """
+    if len(laps) < 2:
+        return list(laps)
+    durations: list[float] = [float(row["moving_time_s"]) for row in laps]
+    median_dur = statistics.median(durations)
+    return [row for row in laps if 0.6 * median_dur <= float(row["moving_time_s"]) <= 1.4 * median_dur]
 
 
 def _run_type_filter(sport_types: tuple[str, ...] = RUN_TYPES) -> tuple[str, list[str]]:
@@ -504,26 +519,49 @@ def compare_workouts_by_build(
         ORDER BY race_date
     """, [MARATHON_MIN_M, MARATHON_MAX_M]).fetchall()
 
-    sessions = conn.execute("""
-        SELECT
-            a.activity_id,
-            a.name,
-            DATE(a.start_date) AS date,
-            COUNT(l.lap_id) AS rep_count,
-            ROUND(AVG(26.8224 / l.average_speed_mps), 2) AS avg_rep_pace,
-            ROUND(AVG(l.average_heartrate), 1) AS avg_rep_hr,
-            ROUND(MIN(26.8224 / l.average_speed_mps), 2) AS best_rep_pace
-        FROM activities a
-        JOIN laps l USING (activity_id)
-        WHERE a.workout_label = ?
-          AND a.run_type = 'workout'
-          AND l.distance_m >= 200
-          AND l.moving_time_s >= 45
-          AND l.average_speed_mps IS NOT NULL
-          AND l.average_speed_mps > 0
-        GROUP BY a.activity_id
-        ORDER BY a.start_date
+    # Fetch session metadata and all non-trivial laps separately, then filter in Python.
+    session_rows = conn.execute("""
+        SELECT activity_id, name, DATE(start_date) AS date
+        FROM activities
+        WHERE workout_label = ? AND run_type = 'workout'
+        ORDER BY start_date
     """, [workout_label]).fetchall()
+
+    if not session_rows:
+        return json.dumps([])
+
+    id_list = [int(row["activity_id"]) for row in session_rows]
+    placeholders = ",".join("?" * len(id_list))
+    lap_rows = conn.execute(f"""
+        SELECT activity_id, moving_time_s, average_speed_mps, average_heartrate
+        FROM laps
+        WHERE activity_id IN ({placeholders})
+          AND distance_m >= 200 AND moving_time_s >= 45
+          AND average_speed_mps IS NOT NULL AND average_speed_mps > 0
+        ORDER BY activity_id, lap_index
+    """, id_list).fetchall()
+
+    # Group laps by activity
+    laps_by_id: dict[int, list[sqlite3.Row]] = {aid: [] for aid in id_list}
+    for lap in lap_rows:
+        laps_by_id[int(lap["activity_id"])].append(lap)
+
+    # Compute per-session rep stats using median-duration clustering
+    session_stats: dict[int, dict[str, object]] = {}
+    for activity_id, laps in laps_by_id.items():
+        rep_laps = _filter_to_rep_laps(laps)
+        if not rep_laps:
+            continue
+        paces = [26.8224 / float(l["average_speed_mps"]) for l in rep_laps]
+        hrs = [float(l["average_heartrate"]) for l in rep_laps if l["average_heartrate"] is not None]
+        session_stats[activity_id] = {
+            "rep_count": len(rep_laps),
+            "avg_rep_pace": round(sum(paces) / len(paces), 2),
+            "avg_rep_hr": round(sum(hrs) / len(hrs), 1) if hrs else None,
+            "best_rep_pace": round(min(paces), 2),
+        }
+
+    sessions_by_id = {int(row["activity_id"]): row for row in session_rows}
 
     builds: list[dict[str, object]] = []
     for race in races:
@@ -532,10 +570,12 @@ def compare_workouts_by_build(
         race_week_monday = race_dt - timedelta(days=race_dt.weekday())
         build_start = (race_week_monday - timedelta(weeks=build_weeks)).isoformat()
 
-        build_sessions = [
-            dict(s) for s in sessions
-            if build_start <= s["date"] < race_date_str
-        ]
+        build_sessions = []
+        for aid in id_list:
+            row = sessions_by_id[aid]
+            if build_start <= str(row["date"]) < race_date_str and aid in session_stats:
+                build_sessions.append({"activity_id": aid, "name": row["name"], "date": row["date"], **session_stats[aid]})
+
         if build_sessions:
             builds.append({
                 "race": race["name"],
