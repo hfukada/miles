@@ -1,0 +1,35 @@
+[project]
+name = "miles"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "stravalib>=2.0",
+    "mcp[cli]>=1.0",
+    "python-dotenv>=1.0",
+    "click>=8.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "aiofiles>=23.0",
+]
+
+[project.scripts]
+miles-sync = "miles.sync:main"
+miles-auth = "miles.auth:main"
+miles-mcp = "miles.mcp_server:main"
+miles-api = "miles.api:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.411",
+]
+
+[tool.pyright]
+include = ["miles"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"

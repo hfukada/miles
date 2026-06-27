@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Miles</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f8fafc;
+      color: #1e293b;
+      min-height: 100vh;
+    }
+
+    header {
+      background: #0f172a;
+      color: #fff;
+      padding: 1.25rem 2rem;
+      display: flex;
+      align-items: baseline;
+      gap: 1rem;
+    }
+    header h1 { font-size: 1.125rem; font-weight: 700; letter-spacing: -0.02em; }
+    header span { font-size: 0.8125rem; color: #64748b; }
+
+    main { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+
+    #status { font-size: 0.8125rem; color: #94a3b8; margin-bottom: 2rem; }
+
+    section { margin-bottom: 3rem; }
+
+    section h2 {
+      font-size: 0.9375rem;
+      font-weight: 600;
+      color: #0f172a;
+      letter-spacing: -0.01em;
+      margin-bottom: 0.25rem;
+    }
+    .desc {
+      font-size: 0.8rem;
+      color: #94a3b8;
+      margin-bottom: 0.875rem;
+    }
+
+    .scroll {
+      overflow-x: auto;
+      border-radius: 8px;
+      border: 1px solid #e2e8f0;
+      box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: #fff;
+      font-size: 0.8125rem;
+      white-space: nowrap;
+    }
+
+    thead th {
+      padding: 0.5rem 1rem;
+      background: #f8fafc;
+      font-weight: 600;
+      color: #64748b;
+      text-align: left;
+      border-bottom: 1px solid #e2e8f0;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    thead th.r { text-align: right; }
+
+    tbody td {
+      padding: 0.5625rem 1rem;
+      border-bottom: 1px solid #f1f5f9;
+      color: #334155;
+      vertical-align: middle;
+    }
+    tbody tr:last-child td { border-bottom: none; }
+
+    td.r   { text-align: right; font-variant-numeric: tabular-nums; }
+    td.dim  { color: #94a3b8; font-size: 0.75rem; }
+    td.bold { font-weight: 600; }
+    td.dash { text-align: right; color: #cbd5e1; }
+
+    tr.pr   td { background: #f0fdf4; }
+    tr.pr   td.bold { color: #15803d; }
+    tr.sub3 td { background: #fafffe; }
+    tr.virt td { color: #94a3b8; font-style: italic; }
+    tr.virt td.bold { color: #94a3b8; font-weight: 500; }
+
+    tbody tr:not(.virt):hover td { background: #f8fafc; }
+    tr.pr:hover td  { background: #dcfce7; }
+    tr.sub3:hover td { background: #ecfdf5; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Miles</h1>
+  <span>marathon build analysis</span>
+</header>
+
+<main>
+  <div id="status">Loading…</div>
+
+  <section>
+    <h2>Build Comparison</h2>
+    <p class="desc">12-week build window before each race · sorted fastest to slowest · virtual races shown separately</p>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Race</th>
+            <th>Date</th>
+            <th class="r">Time</th>
+            <th class="r">Build mpw</th>
+            <th class="r">Workouts</th>
+            <th class="r">Workout pace</th>
+            <th class="r">Long runs</th>
+            <th class="r">Long run pace</th>
+            <th class="r">Easy HR</th>
+          </tr>
+        </thead>
+        <tbody id="body-builds"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <h2>Peak Weeks</h2>
+    <p class="desc">Highest single week and rolling 3-week average within each build window</p>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Race</th>
+            <th>Date</th>
+            <th class="r">Time</th>
+            <th class="r">Peak week</th>
+            <th class="r">Peak 3-wk avg</th>
+            <th class="r">Build avg mpw</th>
+          </tr>
+        </thead>
+        <tbody id="body-peaks"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+  // Format decimal minutes (e.g. 7.82) → "7:49"
+  function pace(dec) {
+    if (dec == null) return null;
+    const m = Math.floor(dec);
+    const s = String(Math.round((dec - m) * 60)).padStart(2, '0');
+    return `${m}:${s}`;
+  }
+
+  // Render a table cell; null → muted dash
+  function td(val, cls = 'r') {
+    if (val == null) return `<td class="dash">—</td>`;
+    return `<td class="${cls}">${val}</td>`;
+  }
+
+  function rowClass(r, isVirtual) {
+    if (isVirtual) return 'virt';
+    const t = r.finish_time_s;
+    if (t != null && t < 10800) return 'sub3'; // sub-3:00:00
+    return '';
+  }
+
+  async function load() {
+    const res = await fetch('/api/marathons');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    const real = data.filter(r => !r.name?.includes('Virtual'));
+    const virt = data.filter(r =>  r.name?.includes('Virtual'));
+    const sorted = [
+      ...real.sort((a, b) => (a.finish_time_s ?? 99999) - (b.finish_time_s ?? 99999)),
+      ...virt,
+    ];
+
+    document.getElementById('status').textContent =
+      `${real.length} marathons` + (virt.length ? ` · ${virt.length} virtual` : '');
+
+    const rowsBuilds = [];
+    const rowsPeaks  = [];
+
+    sorted.forEach((r, i) => {
+      const isVirtual = r.name?.includes('Virtual') ?? false;
+      const isPR      = !isVirtual && i === 0;
+      const rc        = isPR ? 'pr' : rowClass(r, isVirtual);
+      const bt        = r.build.by_type ?? {};
+      const wko       = bt.workout;
+      const lr        = bt.long_run;
+      const easy      = bt.easy;
+
+      rowsBuilds.push(`<tr class="${rc}">
+        ${td(r.name, '')}
+        ${td(r.date, 'dim')}
+        ${td(r.finish_time, 'r bold')}
+        ${td(r.build.avg_mpw?.toFixed(1))}
+        ${td(wko?.runs)}
+        ${td(pace(wko?.avg_pace_min_per_mile))}
+        ${td(lr?.runs)}
+        ${td(pace(lr?.avg_pace_min_per_mile))}
+        ${td(easy?.avg_hr != null ? Math.round(easy.avg_hr) : null)}
+      </tr>`);
+
+      rowsPeaks.push(`<tr class="${rc}">
+        ${td(r.name, '')}
+        ${td(r.date, 'dim')}
+        ${td(r.finish_time, 'r bold')}
+        ${td(r.build.peak_week?.toFixed(1))}
+        ${td(r.build.peak_3wk_avg?.toFixed(1))}
+        ${td(r.build.avg_mpw?.toFixed(1))}
+      </tr>`);
+    });
+
+    document.getElementById('body-builds').innerHTML = rowsBuilds.join('');
+    document.getElementById('body-peaks').innerHTML  = rowsPeaks.join('');
+  }
+
+  load().catch(err => {
+    document.getElementById('status').textContent = `Error: ${err.message}`;
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "miles": {
+      "command": "uv",
+      "args": ["run", "miles-mcp"],
+      "cwd": "/absolute/path/to/this/repo"
+    }
+  }
+}
