@@ -21,15 +21,15 @@ def _conn() -> sqlite3.Connection:
 def _filter_to_rep_laps(laps: list[sqlite3.Row]) -> list[sqlite3.Row]:
     """
     From a list of non-trivial laps for one session, return only the interval reps.
-    Uses median duration clustering: keeps laps within 60-140% of the median duration,
-    which separates uniform-duration reps from warmup/cooldown (different length) and
-    recovery jogs that slipped past the basic distance/time filter.
+    Uses pace-based clustering: keeps laps within 80% of the session's fastest lap speed.
+    Reps and recovery/warmup/cooldown are separated by a 30–60% speed gap, so this
+    boundary is far more stable than duration-based approaches.
     """
-    if len(laps) < 2:
-        return list(laps)
-    durations: list[float] = [float(row["moving_time_s"]) for row in laps]
-    median_dur = statistics.median(durations)
-    return [row for row in laps if 0.6 * median_dur <= float(row["moving_time_s"]) <= 1.4 * median_dur]
+    if not laps:
+        return []
+    max_speed = max(float(row["average_speed_mps"]) for row in laps)
+    threshold = max_speed * 0.80
+    return [row for row in laps if float(row["average_speed_mps"]) >= threshold]
 
 
 def _run_type_filter(sport_types: tuple[str, ...] = RUN_TYPES) -> tuple[str, list[str]]:
@@ -360,6 +360,17 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
     build_start = (race_week_monday - timedelta(weeks=build_weeks)).isoformat()
     weeks_to_race = (race_dt - date.today()).days // 7
 
+    race_result_row = conn.execute("""
+        SELECT moving_time_s, ROUND(distance_m / 1609.34, 2) AS distance_miles,
+               CASE WHEN average_speed_mps > 0
+                    THEN ROUND(26.8224 / average_speed_mps, 2)
+                    ELSE NULL END AS pace_min_per_mile
+        FROM activities
+        WHERE run_type = 'race' AND distance_m BETWEEN ? AND ?
+          AND DATE(start_date) = ?
+    """, [MARATHON_MIN_M, MARATHON_MAX_M, race_date_str]).fetchone()
+    race_result: dict[str, object] | None = dict(race_result_row) if race_result_row else None
+
     weeks = conn.execute(f"""
         SELECT
             CAST((julianday(DATE(start_date)) - julianday(?)) / 7.0 AS INTEGER) - ? AS week_offset,
@@ -410,6 +421,7 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
     return json.dumps({
         "race": race_name,
         "race_date": race_date_str,
+        "race_result": race_result,
         "build_start": build_start,
         "weeks_to_race": weeks_to_race,
         "weeks": [dict(w) for w in weeks],
