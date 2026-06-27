@@ -337,6 +337,10 @@
 
         let color, lineWidth, lineOpacity, highlighted;
 
+        // Natural color each series would have across the full spectrum —
+        // used as the emphasis color so hovering a gray line reveals it.
+        const naturalColor = isVirtual ? '#94a3b8' : gradientColor(i, real.length);
+
         if (mode === 'fastest') {
           highlighted  = !isVirtual && i < 5;
           color        = highlighted ? gradientColor(i, 5) : '#cbd5e1';
@@ -354,6 +358,8 @@
           lineWidth    = highlighted ? 3 : 1;
           lineOpacity  = highlighted ? 1 : 0.25;
         }
+
+        const emphasisColor = highlighted ? color : naturalColor;
 
         const prMark = {
           markPoint: {
@@ -389,7 +395,7 @@
           connectNulls: false,
           symbol: 'none',
           lineStyle: { color, width: lineWidth, opacity: lineOpacity, type: isVirtual ? 'dashed' : 'solid' },
-          emphasis: { focus: 'series', lineStyle: { width: lineWidth + 1, opacity: 1 } },
+          emphasis: { focus: 'series', lineStyle: { color: emphasisColor, width: lineWidth + 1.5, opacity: 1 } },
           blur:     { lineStyle: { opacity: 0.12 } },
           ...(isPR ? prMark : highlighted ? dotMark : {}),
           ...(i === 0 ? taper : {}),
