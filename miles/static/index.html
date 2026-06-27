@@ -105,6 +105,29 @@
     tbody tr:not(.virt):hover td { background: #f8fafc; }
     tr.pr:hover td  { background: #dcfce7; }
     tr.sub3:hover td { background: #ecfdf5; }
+
+    .mode-tabs {
+      display: flex;
+      gap: 0.25rem;
+      margin-bottom: 0.75rem;
+    }
+    .mode-tab {
+      padding: 0.25rem 0.75rem;
+      border: 1px solid #e2e8f0;
+      border-radius: 4px;
+      background: #f8fafc;
+      color: #64748b;
+      font-size: 0.75rem;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .mode-tab.active {
+      background: #0f172a;
+      color: #fff;
+      border-color: #0f172a;
+    }
+    .mode-tab:hover:not(.active) { background: #f1f5f9; }
   </style>
 </head>
 <body>
@@ -120,6 +143,11 @@
   <section>
     <h2>Weekly Mileage by Build</h2>
     <p class="desc">Each line is one marathon build · weeks run right to race day · virtual races dashed</p>
+    <div class="mode-tabs">
+      <button class="mode-tab active" data-mode="fastest">Fastest 5</button>
+      <button class="mode-tab" data-mode="recent">Recent 3</button>
+      <button class="mode-tab" data-mode="focus">PR vs Recent</button>
+    </div>
     <div class="chart-wrap">
       <div id="chart-builds" style="width:100%;height:100%"></div>
     </div>
@@ -244,12 +272,14 @@
     document.getElementById('body-peaks').innerHTML  = rowsPeaks.join('');
   }
 
-  function buildColor(index, total, isVirtual) {
-    if (isVirtual) return '#94a3b8';
-    const t = total > 1 ? index / (total - 1) : 0; // 0=fastest, 1=slowest
-    const h = Math.round(220 + t * (25 - 220));     // blue → orange
-    const l = 42 + t * 6;                           // slightly lighter for slower
-    return `hsl(${h}, 75%, ${l}%)`;
+  function gradientColor(rank, total) {
+    const t = total > 1 ? rank / (total - 1) : 0;
+    return `hsl(${Math.round(215 + t * (15 - 215))}, 82%, ${42 + t * 6}%)`;
+  }
+
+  function recentColor(rank, total) {
+    const t = total > 1 ? rank / (total - 1) : 0;
+    return `hsl(${Math.round(48 + t * (20 - 48))}, 90%, 45%)`;
   }
 
   function legendLabel(name, finish_time_s, date) {
@@ -271,6 +301,27 @@
     return `${short} · ${h}:${m}`;
   }
 
+  function fmtTime(s) {
+    return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}`;
+  }
+
+  function shortName(name, date) {
+    const nameYear = (name.match(/\d{4}/) ?? [])[0];
+    const fallback = date ? date.slice(0, 4) : null;
+    const year = nameYear ?? fallback;
+    const yr = year ? `'${year.slice(2)}` : '';
+    let short = name
+      .replace("Grandma's Marathon", "Grandma's")
+      .replace('Marathon', '')
+      .replace(/\s+/g, ' ').trim();
+    if (nameYear) {
+      short = short.replace(nameYear, yr).replace(/\s+/g, ' ').trim();
+    } else if (year) {
+      short = `${short} ${yr}`;
+    }
+    return short;
+  }
+
   async function loadChart() {
     const res = await fetch('/api/marathon-weeks');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -285,57 +336,104 @@
     const virt   = data.filter(r =>  r.name?.includes('Virtual'));
     const sorted = [...real, ...virt];
 
-    const realCount = real.length;
-    const series = sorted.map((marathon, i) => {
-      const weekMap   = Object.fromEntries(marathon.weeks.map(w => [w.offset, w.miles]));
-      const isVirtual = marathon.name?.includes('Virtual') ?? false;
-      const isPR      = !isVirtual && i === 0;
-      const color     = buildColor(i, realCount, isVirtual);
-      const label     = legendLabel(marathon.name ?? '', marathon.finish_time_s ?? 0, marathon.date);
-      return {
-        name: label,
-        type: 'line',
-        color,
-        z: isPR ? 10 : 1,
-        data: offsets.map(o => weekMap[o] ?? null),
-        connectNulls: false,
-        symbol: 'none',
-        lineStyle: {
-          color,
-          width: isPR ? 3 : 1.5,
-          type: isVirtual ? 'dashed' : 'solid',
-        },
-        emphasis: {
-          focus: 'series',
-          lineStyle: { width: isPR ? 4 : 2.5 },
-        },
-        blur: {
-          lineStyle: { opacity: 0.12 },
-        },
-        markPoint: {
-          symbol: 'circle',
-          symbolSize: 6,
-          itemStyle: { color, borderColor: '#fff', borderWidth: 1.5 },
-          data: [{ type: 'max', label: { show: false } }],
-        },
-        ...(i === 0 ? {
+    // precompute special indices
+    const byDate      = [...real].sort((a, b) => b.date.localeCompare(a.date));
+    const recent3Set  = new Set(byDate.slice(0, 3).map(m => m.date));
+    const recent2Set  = new Set(byDate.slice(0, 2).map(m => m.date));
+    const recentRank  = new Map(byDate.slice(0, 3).map((m, i) => [m.date, i]));
+    const recentIdx   = sorted.findIndex(m => m.date === byDate[0].date);
+
+    function makeSeries(mode) {
+      return sorted.map((marathon, i) => {
+        const isVirtual = marathon.name?.includes('Virtual') ?? false;
+        const isPR      = !isVirtual && i === 0;
+        const inRecent3 = recent3Set.has(marathon.date ?? '');
+        const isRecent1 = i === recentIdx;
+        const weekMap   = Object.fromEntries(marathon.weeks.map(w => [w.offset, w.miles]));
+        const label     = legendLabel(marathon.name ?? '', marathon.finish_time_s ?? 0, marathon.date);
+
+        let color, lineWidth, lineOpacity, highlighted;
+
+        if (mode === 'fastest') {
+          highlighted  = !isVirtual && i < 5;
+          color        = highlighted ? gradientColor(i, 5) : '#cbd5e1';
+          lineWidth    = isPR ? 3 : highlighted ? 2 : 1;
+          lineOpacity  = highlighted || isVirtual ? 1 : 0.45;
+        } else if (mode === 'recent') {
+          highlighted  = inRecent3 && !isVirtual;
+          const rRank  = recentRank.get(marathon.date ?? '') ?? 0;
+          color        = highlighted ? recentColor(rRank, 3) : isPR ? '#93c5fd' : '#cbd5e1';
+          lineWidth    = highlighted ? 2.5 : isPR ? 1.5 : 1;
+          lineOpacity  = highlighted ? 1 : isPR ? 0.65 : 0.35;
+        } else { // focus: PR vs most recent
+          highlighted  = isPR || isRecent1;
+          color        = isPR ? 'hsl(215, 85%, 45%)' : isRecent1 ? 'hsl(40, 90%, 48%)' : '#cbd5e1';
+          lineWidth    = highlighted ? 3 : 1;
+          lineOpacity  = highlighted ? 1 : 0.25;
+        }
+
+        // at most 2 end labels per tab to avoid clustering
+        const showEndLabel = mode === 'fastest'  ? (!isVirtual && i < 2)
+                           : mode === 'recent'   ? recent2Set.has(marathon.date ?? '')
+                           : /* focus */           (isPR || isRecent1);
+
+        const endLabelText = `${shortName(marathon.name ?? '', marathon.date)}\n${fmtTime(marathon.finish_time_s ?? 0)}`;
+
+        const prMark = {
+          markPoint: {
+            symbol: 'roundRect',
+            symbolSize: [24, 14],
+            symbolOffset: [0, -20],
+            itemStyle: { color: 'hsl(215, 85%, 45%)', borderRadius: 2 },
+            data: [{ type: 'max', label: { show: true, formatter: 'PR', color: '#fff', fontSize: 9, fontWeight: 700 } }],
+          },
+        };
+        const dotMark = {
+          markPoint: {
+            symbol: 'circle', symbolSize: 6,
+            itemStyle: { color, borderColor: '#fff', borderWidth: 1.5 },
+            data: [{ type: 'max', label: { show: false } }],
+          },
+        };
+        const taper = {
           markArea: {
             silent: true,
             itemStyle: { color: 'rgba(148,163,184,0.07)' },
-            label: {
-              show: true, position: 'insideTopLeft',
-              formatter: 'Taper', fontSize: 10, color: '#94a3b8',
-            },
+            label: { show: true, position: 'insideTopLeft', formatter: 'Taper', fontSize: 10, color: '#94a3b8' },
             data: [[{ xAxis: '2' }, { xAxis: 'Race wk' }]],
           },
-        } : {}),
-      };
-    });
+        };
+
+        return {
+          name: label,
+          type: 'line',
+          color,
+          z: isPR ? 10 : highlighted ? 2 : 1,
+          data: offsets.map(o => weekMap[o] ?? 0),
+          connectNulls: false,
+          symbol: 'none',
+          lineStyle: { color, width: lineWidth, opacity: lineOpacity, type: isVirtual ? 'dashed' : 'solid' },
+          emphasis: { focus: 'series', lineStyle: { width: lineWidth + 1, opacity: 1 } },
+          blur:     { lineStyle: { opacity: 0.12 } },
+          endLabel: {
+            show: showEndLabel,
+            formatter: endLabelText,
+            color,
+            fontSize: 10,
+            lineHeight: 14,
+            fontWeight: isPR || isRecent1 ? 700 : 500,
+            padding: [1, 3],
+          },
+          ...(isPR ? prMark : highlighted ? dotMark : {}),
+          ...(i === 0 ? taper : {}),
+        };
+      });
+    }
 
     const chart = echarts.init(document.getElementById('chart-builds'));
     chart.setOption({
       animation: false,
-      grid: { top: 16, right: 24, bottom: 72, left: 52 },
+      grid: { top: 16, right: 72, bottom: 72, left: 52 },
       legend: {
         type: 'scroll',
         bottom: 0,
@@ -355,7 +453,7 @@
           const title = lbl === 'Race wk' ? 'Race week'
                       : `${lbl} week${lbl === '1' ? '' : 's'} before race`;
           const rows  = params
-            .filter(p => p.value != null)
+            .filter(p => p.value > 0)
             .sort((a, b) => b.value - a.value)
             .map(p => `<div style="display:flex;justify-content:space-between;gap:1rem">
                          <span>${p.marker}${p.seriesName}</span>
@@ -392,7 +490,15 @@
         axisLabel: { fontSize: 11, color: '#94a3b8' },
         min: val => Math.max(0, Math.floor((val.min - 5) / 5) * 5),
       },
-      series,
+      series: makeSeries('fastest'),
+    });
+
+    document.querySelectorAll('.mode-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.mode-tab').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        chart.setOption({ series: makeSeries(/** @type {string} */ (btn.dataset.mode)) }, { replaceMerge: ['series'] });
+      });
     });
 
     window.addEventListener('resize', () => chart.resize());
