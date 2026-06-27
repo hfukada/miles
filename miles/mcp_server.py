@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from datetime import date, timedelta
 
 from mcp.server.fastmcp import FastMCP
 
@@ -306,6 +307,243 @@ def get_workout_laps(
         })
 
     return json.dumps(out)
+
+
+@mcp.tool()
+def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> str:
+    """
+    Week-by-week breakdown of a marathon build.
+    race_date: YYYY-MM-DD of the target race. If omitted, uses the most recent marathon in the DB.
+    Returns: race info, weeks_to_race (negative = past race), week-by-week mileage with
+    workout/long-run counts, all workout sessions with rep stats, and long run list.
+    Use this to orient at the start of any build-specific conversation.
+    """
+    conn = _conn()
+    type_clause, type_params = _run_type_filter()
+
+    if race_date:
+        race_date_str = race_date
+        race_row = conn.execute("""
+            SELECT name FROM activities
+            WHERE run_type = 'race' AND distance_m BETWEEN ? AND ?
+              AND DATE(start_date) = ?
+        """, [MARATHON_MIN_M, MARATHON_MAX_M, race_date]).fetchone()
+        race_name: str | None = race_row["name"] if race_row else None
+    else:
+        race_row = conn.execute("""
+            SELECT name, DATE(start_date) AS race_date FROM activities
+            WHERE run_type = 'race' AND distance_m BETWEEN ? AND ?
+            ORDER BY start_date DESC LIMIT 1
+        """, [MARATHON_MIN_M, MARATHON_MAX_M]).fetchone()
+        if not race_row:
+            return json.dumps({"error": "No marathon found in the database."})
+        race_date_str = race_row["race_date"]
+        race_name = race_row["name"]
+
+    race_dt = date.fromisoformat(race_date_str)
+    race_week_monday = race_dt - timedelta(days=race_dt.weekday())
+    build_start = (race_week_monday - timedelta(weeks=build_weeks)).isoformat()
+    weeks_to_race = (race_dt - date.today()).days // 7
+
+    weeks = conn.execute(f"""
+        SELECT
+            CAST((julianday(DATE(start_date)) - julianday(?)) / 7.0 AS INTEGER) - ? AS week_offset,
+            ROUND(SUM(distance_m) / 1609.34, 1) AS miles,
+            COUNT(*) AS runs,
+            SUM(CASE WHEN run_type = 'workout' THEN 1 ELSE 0 END) AS workouts,
+            SUM(CASE WHEN run_type = 'long_run' THEN 1 ELSE 0 END) AS long_runs
+        FROM activities
+        WHERE {type_clause}
+          AND DATE(start_date) >= ? AND DATE(start_date) <= ?
+        GROUP BY week_offset
+        ORDER BY week_offset
+    """, [build_start, build_weeks] + type_params + [build_start, race_date_str]).fetchall()
+
+    workouts = conn.execute("""
+        SELECT
+            a.activity_id,
+            a.name,
+            DATE(a.start_date) AS date,
+            a.workout_label,
+            COUNT(l.lap_id) AS rep_count,
+            ROUND(AVG(26.8224 / l.average_speed_mps), 2) AS avg_rep_pace,
+            ROUND(AVG(l.average_heartrate), 1) AS avg_rep_hr
+        FROM activities a
+        LEFT JOIN laps l ON l.activity_id = a.activity_id
+            AND l.distance_m >= 200 AND l.moving_time_s >= 45
+            AND l.average_speed_mps IS NOT NULL AND l.average_speed_mps > 0
+        WHERE a.run_type = 'workout'
+          AND DATE(a.start_date) >= ? AND DATE(a.start_date) < ?
+        GROUP BY a.activity_id
+        ORDER BY a.start_date
+    """, [build_start, race_date_str]).fetchall()
+
+    long_runs = conn.execute(f"""
+        SELECT
+            DATE(start_date) AS date,
+            ROUND(distance_m / 1609.34, 1) AS miles,
+            CASE WHEN average_speed_mps > 0
+                 THEN ROUND(26.8224 / average_speed_mps, 2)
+                 ELSE NULL END AS avg_pace,
+            ROUND(average_heartrate) AS avg_hr
+        FROM activities
+        WHERE {type_clause} AND run_type = 'long_run'
+          AND DATE(start_date) >= ? AND DATE(start_date) < ?
+        ORDER BY start_date
+    """, type_params + [build_start, race_date_str]).fetchall()
+
+    return json.dumps({
+        "race": race_name,
+        "race_date": race_date_str,
+        "build_start": build_start,
+        "weeks_to_race": weeks_to_race,
+        "weeks": [dict(w) for w in weeks],
+        "workouts": [dict(w) for w in workouts],
+        "long_runs": [dict(lr) for lr in long_runs],
+    })
+
+
+@mcp.tool()
+def get_workout_session(activity_id: int) -> str:
+    """
+    Detailed view of a single workout: reps only, in sequence.
+    Non-rep laps (< 200m or < 45s) are filtered out.
+    Each rep: rep_num, distance_miles, duration_s, pace_min_mi, avg_hr, max_hr.
+    Use this to inspect within-session structure — whether reps held even, drifted,
+    or fell apart — rather than relying solely on session averages.
+    activity_id comes from get_build_snapshot, compare_workouts_by_build, or get_activities.
+    """
+    conn = _conn()
+
+    activity = conn.execute("""
+        SELECT activity_id, name, DATE(start_date) AS date, workout_label,
+               ROUND(distance_m / 1609.34, 2) AS total_miles,
+               moving_time_s AS total_time_s, strava_url
+        FROM activities WHERE activity_id = ?
+    """, [activity_id]).fetchone()
+
+    if not activity:
+        return json.dumps({"error": f"Activity {activity_id} not found."})
+
+    reps = conn.execute("""
+        SELECT
+            lap_index,
+            ROUND(distance_m / 1609.34, 3) AS distance_miles,
+            moving_time_s AS duration_s,
+            CASE WHEN average_speed_mps > 0
+                 THEN ROUND(26.8224 / average_speed_mps, 2)
+                 ELSE NULL END AS pace_min_mi,
+            ROUND(average_heartrate) AS avg_hr,
+            ROUND(max_heartrate) AS max_hr
+        FROM laps
+        WHERE activity_id = ?
+          AND distance_m >= 200 AND moving_time_s >= 45
+          AND average_speed_mps IS NOT NULL AND average_speed_mps > 0
+        ORDER BY lap_index
+    """, [activity_id]).fetchall()
+
+    return json.dumps({
+        **dict(activity),
+        "reps": [{"rep_num": i + 1, **dict(r)} for i, r in enumerate(reps)],
+    })
+
+
+@mcp.tool()
+def get_easy_hr_trend(months: int = 36) -> str:
+    """
+    Monthly average HR and pace for easy runs — the primary long-term aerobic fitness signal.
+    A declining HR trend at stable or faster paces indicates improving aerobic efficiency
+    accumulated across builds, not attributable to any single cycle.
+    Returns months with avg_hr, avg_pace_min_mi, run_count. Filtered to easy-tagged runs only.
+    """
+    conn = _conn()
+    type_clause, type_params = _run_type_filter()
+
+    cutoff_dt = date.today() - timedelta(days=months * 30)
+    cutoff = cutoff_dt.isoformat()
+
+    rows = conn.execute(f"""
+        SELECT
+            strftime('%Y-%m', start_date) AS month,
+            COUNT(*) AS runs,
+            ROUND(AVG(average_heartrate), 1) AS avg_hr,
+            CASE WHEN AVG(average_speed_mps) > 0
+                 THEN ROUND(26.8224 / AVG(average_speed_mps), 2)
+                 ELSE NULL END AS avg_pace_min_mi
+        FROM activities
+        WHERE {type_clause}
+          AND run_type = 'easy'
+          AND average_heartrate IS NOT NULL
+          AND start_date >= ?
+        GROUP BY month
+        ORDER BY month
+    """, type_params + [cutoff]).fetchall()
+
+    return json.dumps([dict(r) for r in rows])
+
+
+@mcp.tool()
+def compare_workouts_by_build(
+    workout_label: str,
+    build_weeks: int = 12,
+) -> str:
+    """
+    Compare workout sessions (by label) across marathon builds.
+    Non-rep laps are filtered out (distance < 200m or duration < 45s), so stats
+    reflect actual work intervals only — not warmup, recovery jogs, or GPS artifacts.
+    Returns builds chronologically, each with per-session:
+      date, name, rep_count, avg_rep_pace_min_mi, avg_rep_hr, best_rep_pace_min_mi
+    Use this for cross-build quality questions: "Did my LT pace drop at lower HR over time?"
+    """
+    conn = _conn()
+
+    races = conn.execute("""
+        SELECT name, DATE(start_date) AS race_date
+        FROM activities
+        WHERE run_type = 'race' AND distance_m BETWEEN ? AND ?
+        ORDER BY race_date
+    """, [MARATHON_MIN_M, MARATHON_MAX_M]).fetchall()
+
+    sessions = conn.execute("""
+        SELECT
+            a.activity_id,
+            a.name,
+            DATE(a.start_date) AS date,
+            COUNT(l.lap_id) AS rep_count,
+            ROUND(AVG(26.8224 / l.average_speed_mps), 2) AS avg_rep_pace,
+            ROUND(AVG(l.average_heartrate), 1) AS avg_rep_hr,
+            ROUND(MIN(26.8224 / l.average_speed_mps), 2) AS best_rep_pace
+        FROM activities a
+        JOIN laps l USING (activity_id)
+        WHERE a.workout_label = ?
+          AND a.run_type = 'workout'
+          AND l.distance_m >= 200
+          AND l.moving_time_s >= 45
+          AND l.average_speed_mps IS NOT NULL
+          AND l.average_speed_mps > 0
+        GROUP BY a.activity_id
+        ORDER BY a.start_date
+    """, [workout_label]).fetchall()
+
+    builds: list[dict[str, object]] = []
+    for race in races:
+        race_date_str: str = race["race_date"]
+        race_dt = date.fromisoformat(race_date_str)
+        race_week_monday = race_dt - timedelta(days=race_dt.weekday())
+        build_start = (race_week_monday - timedelta(weeks=build_weeks)).isoformat()
+
+        build_sessions = [
+            dict(s) for s in sessions
+            if build_start <= s["date"] < race_date_str
+        ]
+        if build_sessions:
+            builds.append({
+                "race": race["name"],
+                "race_date": race_date_str,
+                "sessions": build_sessions,
+            })
+
+    return json.dumps(builds)
 
 
 @mcp.tool()
