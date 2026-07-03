@@ -6,7 +6,7 @@ from datetime import date, timedelta
 from mcp.server.fastmcp import FastMCP
 
 from . import db
-from .classifier import LapType, classify_laps
+from .derive import ensure_derived
 from .races import MARATHON_MAX_M, MARATHON_MIN_M
 
 mcp = FastMCP("miles")
@@ -17,17 +17,8 @@ RUN_TYPES = ("Run", "TrailRun", "VirtualRun")
 def _conn() -> sqlite3.Connection:
     conn = db.connect()
     db.init_db(conn)
+    ensure_derived(conn)
     return conn
-
-
-def _classify_lap_rows(laps: list[sqlite3.Row]) -> list[LapType]:
-    """Run the lap classifier over sqlite rows (need average_speed_mps, distance_m, average_heartrate)."""
-    return classify_laps(
-        speeds=[float(row["average_speed_mps"]) for row in laps],
-        distances_m=[float(row["distance_m"]) for row in laps],
-        heartrates=[float(row["average_heartrate"]) if row["average_heartrate"] is not None else None
-                    for row in laps],
-    )
 
 
 _PACE_KEYS = frozenset({
@@ -350,10 +341,7 @@ def get_workout_laps(
         laps = conn.execute("""
             SELECT
                 lap_index,
-                distance_m,
-                moving_time_s,
-                average_speed_mps,
-                average_heartrate,
+                lap_type,
                 ROUND(distance_m / 1609.34, 3) AS distance_miles,
                 CASE WHEN average_speed_mps > 0
                      THEN ROUND(26.8224 / average_speed_mps, 2)
@@ -365,18 +353,7 @@ def get_workout_laps(
             ORDER BY lap_index
         """, [act["activity_id"]]).fetchall()
 
-        # Classify only non-trivial laps; trivial ones get lap_type None.
-        classifiable = [
-            i for i, lap in enumerate(laps)
-            if float(lap["distance_m"]) >= 200 and int(lap["moving_time_s"]) >= 45
-            and lap["average_speed_mps"] is not None and float(lap["average_speed_mps"]) > 0
-        ]
-        sub_types = _classify_lap_rows([laps[i] for i in classifiable])
-        lap_types: list[LapType | None] = [None] * len(laps)
-        for i, t in zip(classifiable, sub_types):
-            lap_types[i] = t
-
-        keep = ("lap_index", "distance_miles", "pace_min_per_mile", "avg_hr", "max_hr")
+        keep = ("lap_index", "distance_miles", "pace_min_per_mile", "avg_hr", "max_hr", "lap_type")
         out.append({
             "activity_id": act["activity_id"],
             "name": act["name"],
@@ -387,10 +364,7 @@ def get_workout_laps(
             "apparent_temp_c_max": act["apparent_temp_c_max"],
             "humidity_avg": act["humidity_avg"],
             "wind_kph_avg": act["wind_kph_avg"],
-            "laps": [
-                {**{k: lap[k] for k in keep}, "lap_type": t}
-                for lap, t in zip(laps, lap_types)
-            ],
+            "laps": [{k: lap[k] for k in keep} for lap in laps],
         })
 
     return json.dumps(_fmt_paces(out))
@@ -543,9 +517,7 @@ def get_workout_session(activity_id: int) -> str:
     laps = conn.execute("""
         SELECT
             lap_index,
-            distance_m,
-            average_speed_mps,
-            average_heartrate,
+            lap_type,
             ROUND(distance_m / 1609.34, 3) AS distance_miles,
             moving_time_s AS duration_s,
             CASE WHEN average_speed_mps > 0
@@ -560,13 +532,12 @@ def get_workout_session(activity_id: int) -> str:
         ORDER BY lap_index
     """, [activity_id]).fetchall()
 
-    lap_types = _classify_lap_rows(laps)
     keep = ("lap_index", "distance_miles", "duration_s", "pace_min_mi", "avg_hr", "max_hr")
     return json.dumps(_fmt_paces({
         **dict(activity),
         "laps": [
-            {"lap_num": i + 1, "lap_type": t, **{k: r[k] for k in keep}}
-            for i, (r, t) in enumerate(zip(laps, lap_types))
+            {"lap_num": i + 1, "lap_type": r["lap_type"], **{k: r[k] for k in keep}}
+            for i, r in enumerate(laps)
         ],
     }))
 
@@ -645,24 +616,20 @@ def compare_workouts_by_build(
     id_list = [int(row["activity_id"]) for row in session_rows]
     placeholders = ",".join("?" * len(id_list))
     lap_rows = conn.execute(f"""
-        SELECT activity_id, distance_m, moving_time_s, average_speed_mps, average_heartrate
+        SELECT activity_id, average_speed_mps, average_heartrate
         FROM laps
-        WHERE activity_id IN ({placeholders})
-          AND distance_m >= 200 AND moving_time_s >= 45
-          AND average_speed_mps IS NOT NULL AND average_speed_mps > 0
+        WHERE activity_id IN ({placeholders}) AND lap_type = 'work'
         ORDER BY activity_id, lap_index
     """, id_list).fetchall()
 
-    # Group laps by activity
+    # Group rep laps by activity
     laps_by_id: dict[int, list[sqlite3.Row]] = {aid: [] for aid in id_list}
     for lap in lap_rows:
         laps_by_id[int(lap["activity_id"])].append(lap)
 
-    # Compute per-session rep stats over classified work laps
+    # Compute per-session rep stats over work laps
     session_stats: dict[int, dict[str, object]] = {}
-    for activity_id, laps in laps_by_id.items():
-        lap_types = _classify_lap_rows(laps)
-        rep_laps = [lap for lap, t in zip(laps, lap_types) if t == "work"]
+    for activity_id, rep_laps in laps_by_id.items():
         if not rep_laps:
             continue
         paces = [26.8224 / float(l["average_speed_mps"]) for l in rep_laps]
@@ -758,11 +725,16 @@ def run_sql(query: str) -> str:
 
     Table: laps  (one row per lap; only workout activities are synced)
       lap_id, activity_id, lap_index, distance_m, moving_time_s, average_speed_mps,
-      average_heartrate, max_heartrate, average_cadence, total_elevation_gain_m, pace_zone
+      average_heartrate, max_heartrate, average_cadence, total_elevation_gain_m, pace_zone,
+      lap_type (derived, rebuilt each sync — warmup/work/recovery/float/cooldown/steady;
+      NULL for trivial laps under the 200m/45s floor)
 
     Table: weather  (one row per activity; populated by miles-sync)
       activity_id, fetched_at, temp_c_start, temp_c_end, temp_c_avg, temp_c_max,
       apparent_temp_c_max, humidity_avg, precip_mm, wind_kph_avg, hourly_json
+
+    Table: meta  (key-value; derived-layer bookkeeping, rebuilt each sync)
+      key, value — see derive_version, derived_at
     """
     stripped = query.strip().upper().lstrip("(")
     if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):

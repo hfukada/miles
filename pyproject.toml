@@ -17,6 +17,7 @@ miles-sync = "miles.sync:main"
 miles-auth = "miles.auth:main"
 miles-mcp = "miles.mcp_server:main"
 miles-api = "miles.api:main"
+miles-derive = "miles.derive:main"
 
 [build-system]
 requires = ["hatchling"]

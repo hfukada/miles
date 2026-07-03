@@ -11,6 +11,7 @@ uv run miles-auth   # one-time OAuth setup
 uv run miles-sync   # sync activities from Strava (--full to ignore last sync date)
 uv run miles-mcp    # start MCP server (stdio)
 uv run miles-api    # start web UI on http://localhost:8000
+uv run miles-derive # rebuild derived values (run_type_inferred, laps.lap_type); no API calls
 uv run pyright      # type check
 ```
 
@@ -24,7 +25,10 @@ Strava API → miles-sync → SQLite (data/activities.db)
 ```
 
 Key files:
-- `miles/db.py` — schema, upsert, `ActivityRow` / `LapRow` TypedDicts, `WORKOUT_TYPE_MAP`
+- `miles/db.py` — schema, upsert, `ActivityRow` / `LapRow` TypedDicts, `WORKOUT_TYPE_MAP`, `EFFECTIVE_RUN_TYPE_SQL`
+- `miles/races.py` — race-distance buckets (`classify_race_distance`), nominal distances, marathon bounds
+- `miles/inference.py` — infers run_type for untagged (`workout_type = 0`) activities from name/distance/history; explicit Strava tags always win
+- `miles/derive.py` — `derive_all`: full recompute of all derived values + `meta` version stamp; runs at end of every sync, self-heals on version mismatch when tools connect. Derived values are rebuildable — raw synced rows are ground truth
 - `miles/classifier.py` — keyword-based `workout_label` classifier (extend `WORKOUT_LABEL_PATTERNS` to add new types) and `classify_laps`, which types each lap as warmup/work/recovery/float/cooldown/steady via positional work-block detection (speed gap split + HR-guarded edge trim)
 - `miles/mcp_server.py` — MCP tools: `get_weekly_mileage`, `get_activities`, `get_training_block`, `get_marathon_comparison`, `get_workout_laps`, `run_sql`
 - `miles/api.py` — FastAPI endpoints `/api/marathons` and `/api/marathon-weeks`, also serves `miles/static/`
@@ -34,7 +38,7 @@ Key files:
 
 ## Data model
 
-`run_type` is derived from Strava's `workout_type` int at sync time: `easy`(0) `race`(1) `long_run`(2) `workout`(3). Set by the athlete in Strava.
+`run_type` is derived from Strava's `workout_type` int at sync time: `easy`(0) `race`(1) `long_run`(2) `workout`(3). Set by the athlete in Strava; 0 means *unset*, and those rows get a `run_type_inferred` (see `inference.py`). Query the effective type with `EFFECTIVE_RUN_TYPE_SQL` (`db.py`) — explicit tags always win.
 
 Marathon detection: `run_type = 'race'` AND `distance_m BETWEEN 42000 AND 43500`.
 
@@ -57,7 +61,7 @@ Range: `>= build_start AND <= race_date` (includes race day in week 0).
 
 Laps use the athlete's manual lap button or Garmin auto-lap (1-mile splits). Filter out artifact laps (`moving_time_s < 30` or `distance_m < 0.02`) when analyzing rep data.
 
-`classify_laps` (classifier.py) assigns per-lap types used by the lap MCP tools; `compare_workouts_by_build` stats cover `work` laps only. Known limitations: laps under the 200m/45s floor are never classified (drops hill sprints / 150–200m reps entirely), and uphill reps invert the pace signal so they classify as `float`, not `work`.
+`classify_laps` (classifier.py) assigns per-lap types, persisted to `laps.lap_type` by the derive step (`derive.py` is its only caller; the lap MCP tools read the column); `compare_workouts_by_build` stats cover `work` laps only. Known limitations: laps under the 200m/45s floor are never classified (drops hill sprints / 150–200m reps entirely), and uphill reps invert the pace signal so they classify as `float`, not `work`.
 
 ## Development notes
 

@@ -147,7 +147,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE activities ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass
-    for col in ("raw_json TEXT",):
+    for col in ("raw_json TEXT", "lap_type TEXT"):
         try:
             conn.execute(f"ALTER TABLE laps ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -157,6 +157,12 @@ def init_db(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE weather ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     conn.commit()
 
 

@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .derive import ensure_derived
 from .races import MARATHON_MAX_M, MARATHON_MIN_M
 
 app = FastAPI(title="miles")
@@ -48,6 +49,7 @@ class MarathonRow(TypedDict):
 def _conn() -> sqlite3.Connection:
     conn = db.connect()
     db.init_db(conn)
+    ensure_derived(conn)
     return conn
 
 
