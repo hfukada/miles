@@ -103,40 +103,52 @@ def get_activities(
     limit: int = 50,
 ) -> str:
     """
-    List individual runs with key stats.
+    List individual runs with key stats, including weather conditions when available.
     run_type: 'easy' | 'workout' | 'long_run' | 'race' | None for all.
     Dates are YYYY-MM-DD. Returns up to `limit` rows, newest first.
+    Weather fields (temp_c_start, temp_c_max, apparent_temp_c_max, humidity_avg,
+    precip_mm, wind_kph_avg) are null if not yet synced for that activity.
     """
     conn = _conn()
-    type_clause, params = _run_type_filter()
-    where = f"WHERE {type_clause}"
+    _, sport_params = _run_type_filter()
+    placeholders = ",".join("?" * len(sport_params))
+    conditions = [f"a.sport_type IN ({placeholders})"]
+    params: list[str | int] = list(sport_params)
     if run_type:
-        where += " AND run_type = ?"
+        conditions.append("a.run_type = ?")
         params.append(run_type)
     if start_date:
-        where += " AND start_date >= ?"
+        conditions.append("a.start_date >= ?")
         params.append(start_date)
     if end_date:
-        where += " AND start_date <= ?"
+        conditions.append("a.start_date <= ?")
         params.append(end_date)
+    where = "WHERE " + " AND ".join(conditions)
 
     rows = conn.execute(f"""
         SELECT
-            activity_id,
-            name,
-            start_date,
-            run_type,
-            ROUND(distance_m / 1609.34, 2) AS miles,
-            moving_time_s,
-            CASE WHEN average_speed_mps > 0
-                 THEN ROUND(26.8224 / average_speed_mps, 2)
+            a.activity_id,
+            a.name,
+            a.start_date,
+            a.run_type,
+            ROUND(a.distance_m / 1609.34, 2) AS miles,
+            a.moving_time_s,
+            CASE WHEN a.average_speed_mps > 0
+                 THEN ROUND(26.8224 / a.average_speed_mps, 2)
                  ELSE NULL END AS pace_min_per_mile,
-            average_heartrate,
-            total_elevation_gain_m,
-            strava_url
-        FROM activities
+            a.average_heartrate,
+            a.total_elevation_gain_m,
+            a.strava_url,
+            w.temp_c_start,
+            w.temp_c_max,
+            w.apparent_temp_c_max,
+            w.humidity_avg,
+            w.precip_mm,
+            w.wind_kph_avg
+        FROM activities a
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
         {where}
-        ORDER BY start_date DESC
+        ORDER BY a.start_date DESC
         LIMIT ?
     """, params + [limit]).fetchall()
     return json.dumps(_fmt_paces([dict(r) for r in rows]))
@@ -303,26 +315,31 @@ def get_workout_laps(
       laps: [{lap_index, distance_miles, pace_min_per_mile, avg_hr, max_hr}]
     """
     conn = _conn()
-    type_clause, params = _run_type_filter()
-    where = f"WHERE {type_clause} AND run_type = 'workout'"
+    _, sport_params = _run_type_filter()
+    placeholders = ",".join("?" * len(sport_params))
+    conditions = [f"a.sport_type IN ({placeholders})", "a.run_type = 'workout'"]
+    params: list[str | int] = list(sport_params)
     if workout_label:
-        where += " AND workout_label = ?"
+        conditions.append("a.workout_label = ?")
         params.append(workout_label)
     if name_contains:
-        where += " AND name LIKE ?"
+        conditions.append("a.name LIKE ?")
         params.append(f"%{name_contains}%")
     if start_date:
-        where += " AND start_date >= ?"
+        conditions.append("a.start_date >= ?")
         params.append(start_date)
     if end_date:
-        where += " AND start_date <= ?"
+        conditions.append("a.start_date <= ?")
         params.append(end_date)
+    where = "WHERE " + " AND ".join(conditions)
 
     activities = conn.execute(f"""
-        SELECT activity_id, name, DATE(start_date) AS date, workout_label
-        FROM activities
+        SELECT a.activity_id, a.name, DATE(a.start_date) AS date, a.workout_label,
+               w.temp_c_start, w.temp_c_max, w.apparent_temp_c_max, w.humidity_avg, w.wind_kph_avg
+        FROM activities a
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
         {where}
-        ORDER BY start_date DESC
+        ORDER BY a.start_date DESC
         LIMIT ?
     """, params + [limit]).fetchall()
 
@@ -346,6 +363,11 @@ def get_workout_laps(
             "name": act["name"],
             "date": act["date"],
             "workout_label": act["workout_label"],
+            "temp_c_start": act["temp_c_start"],
+            "temp_c_max": act["temp_c_max"],
+            "apparent_temp_c_max": act["apparent_temp_c_max"],
+            "humidity_avg": act["humidity_avg"],
+            "wind_kph_avg": act["wind_kph_avg"],
             "laps": [dict(lap) for lap in laps],
         })
 
@@ -421,11 +443,17 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
             a.workout_label,
             COUNT(l.lap_id) AS rep_count,
             ROUND(AVG(26.8224 / l.average_speed_mps), 2) AS avg_rep_pace,
-            ROUND(AVG(l.average_heartrate), 1) AS avg_rep_hr
+            ROUND(AVG(l.average_heartrate), 1) AS avg_rep_hr,
+            w.temp_c_start,
+            w.temp_c_max,
+            w.apparent_temp_c_max,
+            w.humidity_avg,
+            w.wind_kph_avg
         FROM activities a
         LEFT JOIN laps l ON l.activity_id = a.activity_id
             AND l.distance_m >= 200 AND l.moving_time_s >= 45
             AND l.average_speed_mps IS NOT NULL AND l.average_speed_mps > 0
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
         WHERE a.run_type = 'workout'
           AND DATE(a.start_date) >= ? AND DATE(a.start_date) < ?
         GROUP BY a.activity_id
@@ -434,16 +462,24 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
 
     long_runs = conn.execute(f"""
         SELECT
-            DATE(start_date) AS date,
-            ROUND(distance_m / 1609.34, 1) AS miles,
-            CASE WHEN average_speed_mps > 0
-                 THEN ROUND(26.8224 / average_speed_mps, 2)
+            DATE(a.start_date) AS date,
+            ROUND(a.distance_m / 1609.34, 1) AS miles,
+            CASE WHEN a.average_speed_mps > 0
+                 THEN ROUND(26.8224 / a.average_speed_mps, 2)
                  ELSE NULL END AS avg_pace,
-            ROUND(average_heartrate) AS avg_hr
-        FROM activities
-        WHERE {type_clause} AND run_type = 'long_run'
-          AND DATE(start_date) >= ? AND DATE(start_date) < ?
-        ORDER BY start_date
+            ROUND(a.average_heartrate) AS avg_hr,
+            a.activity_id,
+            w.temp_c_start,
+            w.temp_c_max,
+            w.apparent_temp_c_max,
+            w.humidity_avg,
+            w.precip_mm,
+            w.wind_kph_avg
+        FROM activities a
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
+        WHERE {type_clause.replace("sport_type", "a.sport_type")} AND a.run_type = 'long_run'
+          AND DATE(a.start_date) >= ? AND DATE(a.start_date) < ?
+        ORDER BY a.start_date
     """, type_params + [build_start, race_date_str]).fetchall()
 
     return json.dumps(_fmt_paces({
@@ -561,10 +597,12 @@ def compare_workouts_by_build(
 
     # Fetch session metadata and all non-trivial laps separately, then filter in Python.
     session_rows = conn.execute("""
-        SELECT activity_id, name, DATE(start_date) AS date
-        FROM activities
-        WHERE workout_label = ? AND run_type = 'workout'
-        ORDER BY start_date
+        SELECT a.activity_id, a.name, DATE(a.start_date) AS date,
+               w.temp_c_start, w.temp_c_max, w.apparent_temp_c_max, w.humidity_avg, w.wind_kph_avg
+        FROM activities a
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
+        WHERE a.workout_label = ? AND a.run_type = 'workout'
+        ORDER BY a.start_date
     """, [workout_label]).fetchall()
 
     if not session_rows:
@@ -614,7 +652,17 @@ def compare_workouts_by_build(
         for aid in id_list:
             row = sessions_by_id[aid]
             if build_start <= str(row["date"]) < race_date_str and aid in session_stats:
-                build_sessions.append({"activity_id": aid, "name": row["name"], "date": row["date"], **session_stats[aid]})
+                build_sessions.append({
+                    "activity_id": aid,
+                    "name": row["name"],
+                    "date": row["date"],
+                    **session_stats[aid],
+                    "temp_c_start": row["temp_c_start"],
+                    "temp_c_max": row["temp_c_max"],
+                    "apparent_temp_c_max": row["apparent_temp_c_max"],
+                    "humidity_avg": row["humidity_avg"],
+                    "wind_kph_avg": row["wind_kph_avg"],
+                })
 
         if build_sessions:
             builds.append({
@@ -627,6 +675,39 @@ def compare_workouts_by_build(
 
 
 @mcp.tool()
+def get_activity_weather(activity_id: int) -> str:
+    """
+    Hourly weather breakdown for a specific activity.
+    Returns temp, apparent (feels-like) temp, humidity, wind, and precipitation
+    for each hour of the run — useful when understanding how conditions evolved
+    during a long run (e.g. started cool but got hot by mile 18).
+    Also returns summary stats: temp at start/end/max, avg humidity, total precip.
+    Returns null hourly field if weather hasn't been synced for this activity (run miles-sync).
+    activity_id comes from get_activities or get_build_snapshot.
+    """
+    conn = _conn()
+    row = conn.execute("""
+        SELECT
+            a.activity_id, a.name, DATE(a.start_date) AS date, a.run_type,
+            ROUND(a.distance_m / 1609.34, 2) AS miles, a.moving_time_s,
+            w.temp_c_start, w.temp_c_end, w.temp_c_avg, w.temp_c_max,
+            w.apparent_temp_c_max, w.humidity_avg, w.precip_mm, w.wind_kph_avg,
+            w.hourly_json
+        FROM activities a
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
+        WHERE a.activity_id = ?
+    """, [activity_id]).fetchone()
+
+    if not row:
+        return json.dumps({"error": f"Activity {activity_id} not found."})
+
+    result = dict(row)
+    hourly_raw = result.pop("hourly_json", None)
+    result["hourly"] = json.loads(hourly_raw) if hourly_raw else None
+    return json.dumps(result)
+
+
+@mcp.tool()
 def run_sql(query: str) -> str:
     """
     Run a read-only SQL SELECT against the database.
@@ -636,11 +717,15 @@ def run_sql(query: str) -> str:
       activity_id, name, sport_type, start_date, workout_type, run_type, workout_label,
       distance_m, moving_time_s, elapsed_time_s, total_elevation_gain_m,
       average_speed_mps, max_speed_mps, average_heartrate, max_heartrate,
-      average_cadence, gear_id, strava_url, synced_at
+      average_cadence, gear_id, strava_url, synced_at, start_lat, start_lng
 
     Table: laps  (one row per lap; only workout activities are synced)
       lap_id, activity_id, lap_index, distance_m, moving_time_s, average_speed_mps,
       average_heartrate, max_heartrate, average_cadence, total_elevation_gain_m, pace_zone
+
+    Table: weather  (one row per activity; populated by miles-sync)
+      activity_id, fetched_at, temp_c_start, temp_c_end, temp_c_avg, temp_c_max,
+      apparent_temp_c_max, humidity_avg, precip_mm, wind_kph_avg, hourly_json
     """
     stripped = query.strip().upper().lstrip("(")
     if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):

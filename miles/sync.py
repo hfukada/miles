@@ -1,11 +1,12 @@
 import sqlite3
 import time
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timezone
 
 import click
 from stravalib.exc import Fault
 
-from . import db, strava_client
+from . import db, strava_client, weather as weather_module
 from .classifier import classify_workout
 
 
@@ -84,6 +85,46 @@ def _run(conn: sqlite3.Connection, full: bool) -> None:
                 )
     if unlabeled:
         conn.commit()
+
+    # Weather sync: fetch for any activity with location but no weather yet.
+    needs_weather = conn.execute("""
+        SELECT a.activity_id, a.start_lat, a.start_lng, a.start_date, a.moving_time_s
+        FROM activities a
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
+        WHERE a.start_lat IS NOT NULL AND a.start_lng IS NOT NULL
+          AND a.moving_time_s IS NOT NULL AND a.start_date IS NOT NULL
+          AND w.activity_id IS NULL
+        ORDER BY a.start_date DESC
+    """).fetchall()
+
+    if needs_weather:
+        total_w = len(needs_weather)
+        print(f"Fetching weather for {total_w} activities...")
+
+        # Group by rounded location (~11km grid) so each group needs at most 2 API calls.
+        groups: defaultdict[tuple[float, float], list[weather_module.WeatherSpec]] = defaultdict(list)
+        for act in needs_weather:
+            key = (round(float(act["start_lat"]), 1), round(float(act["start_lng"]), 1))
+            start_dt = datetime.fromisoformat(act["start_date"])
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=timezone.utc)
+            groups[key].append({
+                "activity_id": act["activity_id"],
+                "start_dt": start_dt,
+                "duration_s": int(act["moving_time_s"]),
+            })
+
+        total_groups = len(groups)
+        print(f"  {total_groups} location group(s) — at most {total_groups * 2} API calls total.")
+        fetched_w = 0
+        for g_idx, ((lat, lng), specs) in enumerate(groups.items(), 1):
+            rows = weather_module.fetch_weather_bulk(specs, lat, lng)
+            if rows:
+                db.upsert_weather(conn, rows)
+                fetched_w += len(rows)
+            print(f"  Group {g_idx}/{total_groups} ({lat:.1f},{lng:.1f}): {len(rows)}/{len(specs)} fetched. Total: {fetched_w}/{total_w}")
+
+        print(f"Weather done. {fetched_w} new records.")
 
 
 @click.command()

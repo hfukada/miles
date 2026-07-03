@@ -2,6 +2,8 @@ import sqlite3
 from pathlib import Path
 from typing import TypedDict
 
+from .weather import WeatherRow
+
 
 class LapRow(TypedDict):
     lap_id: int
@@ -15,6 +17,7 @@ class LapRow(TypedDict):
     average_cadence: float | None
     total_elevation_gain_m: float | None
     pace_zone: int | None
+    raw_json: str
 
 
 class ActivityRow(TypedDict):
@@ -36,6 +39,9 @@ class ActivityRow(TypedDict):
     gear_id: str | None
     strava_url: str
     synced_at: str
+    start_lat: float | None
+    start_lng: float | None
+    raw_json: str
 
 
 DB_PATH = Path(__file__).parent.parent / "data" / "activities.db"
@@ -75,7 +81,10 @@ def init_db(conn: sqlite3.Connection) -> None:
             average_cadence   REAL,
             gear_id       TEXT,
             strava_url    TEXT,
-            synced_at     TEXT
+            synced_at     TEXT,
+            start_lat     REAL,
+            start_lng     REAL,
+            raw_json      TEXT
         )
     """)
     conn.execute("""
@@ -91,13 +100,41 @@ def init_db(conn: sqlite3.Connection) -> None:
             average_cadence        REAL,
             total_elevation_gain_m REAL,
             pace_zone              INTEGER,
+            raw_json               TEXT,
             UNIQUE(activity_id, lap_index)
         )
     """)
-    try:
-        conn.execute("ALTER TABLE activities ADD COLUMN workout_label TEXT")
-    except sqlite3.OperationalError:
-        pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS weather (
+            activity_id        INTEGER PRIMARY KEY REFERENCES activities(activity_id) ON DELETE CASCADE,
+            fetched_at         TEXT NOT NULL,
+            temp_c_start       REAL,
+            temp_c_end         REAL,
+            temp_c_avg         REAL,
+            temp_c_max         REAL,
+            apparent_temp_c_max REAL,
+            humidity_avg       REAL,
+            precip_mm          REAL,
+            wind_kph_avg       REAL,
+            hourly_json        TEXT,
+            raw_json           TEXT
+        )
+    """)
+    for col in ("workout_label TEXT", "start_lat REAL", "start_lng REAL", "raw_json TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE activities ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
+    for col in ("raw_json TEXT",):
+        try:
+            conn.execute(f"ALTER TABLE laps ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
+    for col in ("raw_json TEXT",):
+        try:
+            conn.execute(f"ALTER TABLE weather ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
 
 
@@ -110,7 +147,8 @@ def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> None
             total_elevation_gain_m,
             average_speed_mps, max_speed_mps,
             average_heartrate, max_heartrate, average_cadence,
-            gear_id, strava_url, synced_at
+            gear_id, strava_url, synced_at,
+            start_lat, start_lng, raw_json
         ) VALUES (
             :activity_id, :name, :sport_type, :start_date,
             :workout_type, :run_type,
@@ -118,7 +156,25 @@ def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> None
             :total_elevation_gain_m,
             :average_speed_mps, :max_speed_mps,
             :average_heartrate, :max_heartrate, :average_cadence,
-            :gear_id, :strava_url, :synced_at
+            :gear_id, :strava_url, :synced_at,
+            :start_lat, :start_lng, :raw_json
+        )
+    """, rows)
+    conn.commit()
+
+
+def upsert_weather(conn: sqlite3.Connection, rows: list[WeatherRow]) -> None:
+    conn.executemany("""
+        INSERT OR REPLACE INTO weather (
+            activity_id, fetched_at,
+            temp_c_start, temp_c_end, temp_c_avg, temp_c_max,
+            apparent_temp_c_max, humidity_avg, precip_mm, wind_kph_avg,
+            hourly_json, raw_json
+        ) VALUES (
+            :activity_id, :fetched_at,
+            :temp_c_start, :temp_c_end, :temp_c_avg, :temp_c_max,
+            :apparent_temp_c_max, :humidity_avg, :precip_mm, :wind_kph_avg,
+            :hourly_json, :raw_json
         )
     """, rows)
     conn.commit()
@@ -130,12 +186,12 @@ def upsert_laps(conn: sqlite3.Connection, laps: list[LapRow]) -> None:
             lap_id, activity_id, lap_index,
             distance_m, moving_time_s, average_speed_mps,
             average_heartrate, max_heartrate, average_cadence,
-            total_elevation_gain_m, pace_zone
+            total_elevation_gain_m, pace_zone, raw_json
         ) VALUES (
             :lap_id, :activity_id, :lap_index,
             :distance_m, :moving_time_s, :average_speed_mps,
             :average_heartrate, :max_heartrate, :average_cadence,
-            :total_elevation_gain_m, :pace_zone
+            :total_elevation_gain_m, :pace_zone, :raw_json
         )
     """, laps)
     conn.commit()

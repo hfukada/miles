@@ -59,6 +59,7 @@ def _lap_row(lap: Lap, activity_id: int) -> LapRow:
         "average_cadence": lap.average_cadence,
         "total_elevation_gain_m": flt(lap.total_elevation_gain),
         "pace_zone": lap.pace_zone,
+        "raw_json": lap.model_dump_json(),
     }
 
 
@@ -95,6 +96,10 @@ def row_from_activity(activity: SummaryActivity) -> ActivityRow:
     def flt(q: float | None) -> float | None:
         return float(q) if q is not None else None
 
+    latlng = activity.start_latlng
+    start_lat: float | None = latlng.lat if latlng is not None else None
+    start_lng: float | None = latlng.lon if latlng is not None else None
+
     assert activity.id is not None, "Activity must have an id"
     return {
         "activity_id": activity.id,
@@ -115,4 +120,7 @@ def row_from_activity(activity: SummaryActivity) -> ActivityRow:
         "gear_id": activity.gear_id,
         "strava_url": f"https://www.strava.com/activities/{activity.id}",
         "synced_at": datetime.now(timezone.utc).isoformat(),
+        "start_lat": start_lat,
+        "start_lng": start_lng,
+        "raw_json": activity.model_dump_json(),
     }

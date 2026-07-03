@@ -1,1 +1,8 @@
-{}
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run pyright)",
+      "Bash(uv run python3 scripts/inspect_models.py)"
+    ]
+  }
+}

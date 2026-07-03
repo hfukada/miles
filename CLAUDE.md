@@ -67,6 +67,16 @@ The chart has three tabs (Fastest 5 / Recent 3 / PR vs Recent) toggling which bu
 
 **`screenshot.py`:** requires `uv add --dev playwright` + `sudo apt install -y chromium-browser`. Run with `uv run python screenshot.py` while `miles-api` is running.
 
+## Eval harness
+
+`eval_coach.py` runs a question through the coach agent and saves a full transcript to `eval_results/` (gitignored). Use it to catch regressions after changing MCP tools or the coach prompt.
+
+```bash
+uv run python eval_coach.py "question" --label my-label
+```
+
+Standard eval questions are tracked in `evals.local.md` (also gitignored).
+
 ## Type checking
 
 All code must pass `uv run pyright` with zero errors. Follow these practices:
