@@ -1,4 +1,5 @@
 import sqlite3
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -135,9 +136,36 @@ def _run(conn: sqlite3.Connection, full: bool) -> None:
 
 @click.command()
 @click.option("--full", is_flag=True, help="Ignore last sync date and fetch everything.")
-def main(full: bool) -> None:
+@click.option("--max-hr", type=int, default=None, help="Set max heart rate and exit (no Strava calls).")
+@click.option("--long-run-floor", type=float, default=None, help="Set long-run distance floor in miles and exit (no Strava calls).")
+def main(full: bool, max_hr: int | None, long_run_floor: float | None) -> None:
     conn = db.connect()
     db.init_db(conn)
+
+    if max_hr is not None or long_run_floor is not None:
+        existing = db.get_athlete(conn)
+        merged_max_hr = max_hr if max_hr is not None else (existing["max_hr"] if existing else None)
+        merged_floor = (
+            long_run_floor if long_run_floor is not None
+            else (existing["long_run_floor_miles"] if existing else None)
+        )
+        db.upsert_athlete(conn, max_hr=merged_max_hr, long_run_floor_miles=merged_floor)
+        counts = derive_all(conn)
+        summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no changes"
+        print(f"Athlete profile updated. Derive done. {summary}")
+        return
+
+    if db.get_athlete(conn) is None and sys.stdin.isatty():
+        raw = click.prompt(
+            "Max heart rate for HR-based analysis (Enter to skip)",
+            default="", show_default=False,
+        )
+        prompted_max_hr: int | None
+        try:
+            prompted_max_hr = int(raw) if raw.strip() else None
+        except ValueError:
+            prompted_max_hr = None
+        db.upsert_athlete(conn, max_hr=prompted_max_hr, long_run_floor_miles=None)
 
     while True:
         try:

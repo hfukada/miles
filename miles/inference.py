@@ -17,8 +17,11 @@ from bisect import bisect_left
 from datetime import date, datetime
 from typing import TypedDict
 
+from . import db
 from .classifier import classify_workout
 from .races import classify_race_distance
+
+MILES_TO_METERS = 1609.34
 
 # Workout inference is name-based only: a max/avg speed-spread signal can't separate
 # workouts from ordinary runs (max_speed is an instantaneous GPS value).
@@ -77,11 +80,16 @@ def _percentile(values: list[float], pct: float) -> float:
     return s[f] * (c - k) + s[c] * (k - f)
 
 
-def infer_run_types(activities: list[ActivityForInference]) -> dict[int, str]:
+def infer_run_types(
+    activities: list[ActivityForInference], *, long_run_floor_m: float | None = None
+) -> dict[int, str]:
     """
     Infer run_type for workout_type == 0 rows in `activities` (must be chronologically
     sorted by start_date). Returns {activity_id: inferred_type} only for rows where a
     rule fired; rows with no match get no entry (treated as easy by the caller).
+
+    long_run_floor_m, when given, replaces the learned tagged-P25/P95 floor entirely
+    (an athlete's explicit override); the relative and duration checks still apply.
     """
     dated = [(d, a) for a in activities if (d := _parse_date(a["start_date"])) is not None]
     dated.sort(key=lambda pair: pair[0])
@@ -136,19 +144,22 @@ def infer_run_types(activities: list[ActivityForInference]) -> dict[int, str]:
             if recent_window:
                 median_recent = statistics.median(recent_window)
                 if median_recent > 0 and distance_m >= LONG_RUN_FACTOR * median_recent:
-                    # Widen the tagged lookback until enough exist — a long-run
-                    # standard doesn't shrink during a training lapse.
-                    tagged_window = window(tagged_ordinals, tagged_distances, ordv, LONG_RUN_NORM_DAYS)
-                    if len(tagged_window) < LONG_RUN_MIN_TAGGED:
-                        tagged_window = window(tagged_ordinals, tagged_distances, ordv, LONG_RUN_NORM_DAYS * 2)
-                    if len(tagged_window) < LONG_RUN_MIN_TAGGED:
-                        tagged_window = tagged_distances[: bisect_left(tagged_ordinals, ordv)]
                     floor: float | None
-                    if len(tagged_window) >= LONG_RUN_MIN_TAGGED:
-                        floor = _percentile(tagged_window, 25)
+                    if long_run_floor_m is not None:
+                        floor = long_run_floor_m
                     else:
-                        norm_window = window(all_ordinals, all_distances, ordv, LONG_RUN_NORM_DAYS)
-                        floor = LONG_RUN_P95_FRACTION * _percentile(norm_window, 95) if norm_window else None
+                        # Widen the tagged lookback until enough exist — a long-run
+                        # standard doesn't shrink during a training lapse.
+                        tagged_window = window(tagged_ordinals, tagged_distances, ordv, LONG_RUN_NORM_DAYS)
+                        if len(tagged_window) < LONG_RUN_MIN_TAGGED:
+                            tagged_window = window(tagged_ordinals, tagged_distances, ordv, LONG_RUN_NORM_DAYS * 2)
+                        if len(tagged_window) < LONG_RUN_MIN_TAGGED:
+                            tagged_window = tagged_distances[: bisect_left(tagged_ordinals, ordv)]
+                        if len(tagged_window) >= LONG_RUN_MIN_TAGGED:
+                            floor = _percentile(tagged_window, 25)
+                        else:
+                            norm_window = window(all_ordinals, all_distances, ordv, LONG_RUN_NORM_DAYS)
+                            floor = LONG_RUN_P95_FRACTION * _percentile(norm_window, 95) if norm_window else None
                     if floor is not None and distance_m >= floor:
                         result[a["activity_id"]] = "long_run"
                         continue
@@ -159,6 +170,7 @@ def infer_run_types(activities: list[ActivityForInference]) -> dict[int, str]:
 def apply_inference(conn: sqlite3.Connection) -> dict[str, int]:
     """
     Full recompute of run_type_inferred for every Run/TrailRun/VirtualRun activity.
+    Honors the athlete's long_run_floor_miles override (see db.get_athlete) when set.
     Idempotent: always clears workout_type == 0 rows first, then re-derives from
     scratch, so re-running after a threshold tweak (or a fresh sync) never leaves
     stale values around. Returns counts of inferred rows per inferred type.
@@ -185,7 +197,14 @@ def apply_inference(conn: sqlite3.Connection) -> dict[str, int]:
         for row in rows
     ]
 
-    inferred = infer_run_types(activities)
+    athlete = db.get_athlete(conn)
+    long_run_floor_m = (
+        athlete["long_run_floor_miles"] * MILES_TO_METERS
+        if athlete and athlete["long_run_floor_miles"] is not None
+        else None
+    )
+
+    inferred = infer_run_types(activities, long_run_floor_m=long_run_floor_m)
 
     conn.execute("UPDATE activities SET run_type_inferred = NULL WHERE workout_type = 0")
     conn.executemany(

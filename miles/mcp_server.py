@@ -652,7 +652,10 @@ def get_easy_hr_trend(months: int = 36) -> str:
     Monthly average HR and pace for easy runs — the primary long-term aerobic fitness signal.
     A declining HR trend at stable or faster paces indicates improving aerobic efficiency
     accumulated across builds, not attributable to any single cycle.
-    Returns months with avg_hr, avg_pace_min_mi, run_count. Filtered to easy-tagged runs only.
+    Returns months with avg_hr, avg_pace_min_mi, run_count. When the athlete has a configured
+    max HR, each month also carries avg_pct_max (avg_hr as % of max HR) — conventionally,
+    easy running sits around 70-80% of max. Omitted entirely when no max HR is configured.
+    Filtered to easy-tagged runs only.
     """
     conn = _conn()
     type_clause, type_params = _run_type_filter()
@@ -677,7 +680,15 @@ def get_easy_hr_trend(months: int = 36) -> str:
         ORDER BY month
     """, type_params + [cutoff]).fetchall()
 
-    return json.dumps(_fmt_paces([dict(r) for r in rows]))
+    results = [dict(r) for r in rows]
+    athlete = db.get_athlete(conn)
+    max_hr = athlete["max_hr"] if athlete else None
+    if max_hr:
+        for r in results:
+            if r["avg_hr"] is not None:
+                r["avg_pct_max"] = round(100 * r["avg_hr"] / max_hr, 1)
+
+    return json.dumps(_fmt_paces(results))
 
 
 @mcp.tool()
@@ -839,6 +850,11 @@ def run_sql(query: str) -> str:
 
     Table: meta  (key-value; derived-layer bookkeeping, rebuilt each sync)
       key, value — see derive_version, derived_at
+
+    Table: athlete  (single row, id = 1; athlete-entered, not derived)
+      max_hr, long_run_floor_miles, updated_at — set via `miles-sync --max-hr` /
+      `--long-run-floor`, or the one-time interactive prompt on first sync. Either
+      field may be NULL if never set.
     """
     stripped = query.strip().upper().lstrip("(")
     if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):

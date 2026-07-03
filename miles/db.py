@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
 
@@ -42,6 +43,12 @@ class ActivityRow(TypedDict):
     start_lat: float | None
     start_lng: float | None
     raw_json: str
+
+
+class AthleteRow(TypedDict):
+    max_hr: int | None
+    long_run_floor_miles: float | None
+    updated_at: str | None
 
 
 DB_PATH = Path(__file__).parent.parent / "data" / "activities.db"
@@ -163,6 +170,14 @@ def init_db(conn: sqlite3.Connection) -> None:
             value TEXT
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS athlete (
+            id                   INTEGER PRIMARY KEY CHECK (id = 1),
+            max_hr               INTEGER,
+            long_run_floor_miles REAL,
+            updated_at           TEXT
+        )
+    """)
     conn.commit()
 
 
@@ -228,3 +243,35 @@ def upsert_laps(conn: sqlite3.Connection, laps: list[LapRow]) -> None:
 def last_synced_date(conn: sqlite3.Connection) -> str | None:
     row = conn.execute("SELECT MAX(start_date) FROM activities").fetchone()
     return row[0] if row and row[0] else None
+
+
+def get_athlete(conn: sqlite3.Connection) -> AthleteRow | None:
+    """Single-row athlete profile, or None if never set."""
+    row = conn.execute(
+        "SELECT max_hr, long_run_floor_miles, updated_at FROM athlete WHERE id = 1"
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "max_hr": int(row["max_hr"]) if row["max_hr"] is not None else None,
+        "long_run_floor_miles": float(row["long_run_floor_miles"]) if row["long_run_floor_miles"] is not None else None,
+        "updated_at": row["updated_at"],
+    }
+
+
+def upsert_athlete(conn: sqlite3.Connection, *, max_hr: int | None, long_run_floor_miles: float | None) -> None:
+    """Writes both fields as given (NULL means unset) plus updated_at. Callers wanting to
+    preserve a field read it first via get_athlete and pass it back through."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO athlete (id, max_hr, long_run_floor_miles, updated_at)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            max_hr = excluded.max_hr,
+            long_run_floor_miles = excluded.long_run_floor_miles,
+            updated_at = excluded.updated_at
+        """,
+        (max_hr, long_run_floor_miles, now),
+    )
+    conn.commit()

@@ -45,6 +45,10 @@ Force a full re-sync if needed:
 uv run miles-sync --full
 ```
 
+The first sync prompts once for your max heart rate (Enter to skip); set it later, or set a
+personal long-run distance floor, with `uv run miles-sync --max-hr 185` / `--long-run-floor 14`
+(exits after updating, no Strava calls).
+
 ### 5. Configure the MCP server
 
 Copy the example config and update the path:
