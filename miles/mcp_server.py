@@ -10,7 +10,7 @@ from .builds import RaceRef, detect_builds
 from .derive import ensure_derived
 from .format import fmt_time
 from .periods import WeekAgg, _is_active, detect_periods
-from .races import MARATHON_MAX_M, MARATHON_MIN_M, classify_race_distance
+from .races import MARATHON_MAX_M, MARATHON_MIN_M, NOMINAL_METERS, classify_race_distance
 
 mcp = FastMCP("miles")
 
@@ -320,7 +320,8 @@ def _race_rows(
                  ELSE NULL END AS pace_min_per_mile,
             ROUND(a.average_heartrate, 1) AS avg_hr,
             CASE WHEN a.workout_type = 0 AND a.run_type_inferred IS NOT NULL
-                 THEN 'inferred' ELSE 'strava' END AS run_type_source
+                 THEN 'inferred' ELSE 'strava' END AS run_type_source,
+            a.strava_url
         FROM activities a
         {where}
         ORDER BY date ASC
@@ -356,6 +357,7 @@ def _race_rows(
             "avg_hr": r["avg_hr"],
             "run_type_source": r["run_type_source"],
             "is_pr": is_pr,
+            "strava_url": r["strava_url"],
         })
     return out
 
@@ -437,6 +439,78 @@ def get_race_history(distance_category: str | None = None, start_date: str | Non
         }
 
     return json.dumps(_fmt_paces(rows))
+
+
+@mcp.tool()
+def get_personal_bests() -> str:
+    """
+    Personal bests per race distance category, each with its full
+    chronological progression — the direct answer to "what are my PRs?"
+
+    Each entry: category, nominal_miles, best ({date, name, finish_time,
+    finish_time_s, pace_min_per_mile, activity_id, strava_url}), attempts
+    (race count in that category), and progression — every race in the
+    category in date order, each {date, name, finish_time,
+    delta_s_vs_prior_best}. delta_s_vs_prior_best is vs. the best time set
+    *before* that race: negative means that race set a new PR (seconds
+    faster), positive means seconds behind the standing PR, null for the
+    first race in a category. "other"-category races and races with no
+    recorded finish time are excluded entirely (missing from attempts too).
+    Sorted by nominal distance ascending. Returns [] if no races.
+
+    Caveat: casual-effort races (a 5K jogged with friends) count toward
+    PRs the same as all-out efforts until effort classification exists —
+    cross-check a suspiciously fast or slow PR against its pace before
+    taking it at face value.
+    """
+    conn = _conn()
+    rows = _race_rows(conn)
+
+    by_category: dict[str, list[dict[str, object]]] = {}
+    for r in rows:
+        if r["distance_category"] == "other" or r["finish_time_s"] is None:
+            continue
+        category = str(r["distance_category"])
+        by_category.setdefault(category, []).append(r)
+
+    out: list[dict[str, object]] = []
+    for category in sorted(by_category, key=lambda c: NOMINAL_METERS.get(c, float("inf"))):
+        races = by_category[category]  # already ascending by date via _race_rows
+        progression: list[dict[str, object]] = []
+        prior_best_s: int | None = None
+        best_row: dict[str, object] | None = None
+        for r in races:
+            finish_time_s = r["finish_time_s"]
+            assert isinstance(finish_time_s, int)
+            delta = None if prior_best_s is None else finish_time_s - prior_best_s
+            progression.append({
+                "date": r["date"],
+                "name": r["name"],
+                "finish_time": r["finish_time"],
+                "delta_s_vs_prior_best": delta,
+            })
+            if prior_best_s is None or finish_time_s < prior_best_s:
+                prior_best_s = finish_time_s
+                best_row = r
+
+        assert best_row is not None
+        out.append({
+            "category": category,
+            "nominal_miles": round(NOMINAL_METERS[category] / 1609.34, 2),
+            "best": {
+                "date": best_row["date"],
+                "name": best_row["name"],
+                "finish_time": best_row["finish_time"],
+                "finish_time_s": best_row["finish_time_s"],
+                "pace_min_per_mile": best_row["pace_min_per_mile"],
+                "activity_id": best_row["activity_id"],
+                "strava_url": best_row["strava_url"],
+            },
+            "attempts": len(races),
+            "progression": progression,
+        })
+
+    return json.dumps(_fmt_paces(out))
 
 
 @mcp.tool()
