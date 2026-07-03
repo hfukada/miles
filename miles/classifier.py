@@ -1,4 +1,5 @@
 import re
+from typing import Literal
 
 # Coarse keyword patterns — match workout *type*, not rep count or duration.
 # "3x3min LT" and "6x3min LT" both → "LT"; the per-rep structure lives in laps.
@@ -20,3 +21,119 @@ def classify_workout(name: str) -> str | None:
         if re.search(pattern, name, re.IGNORECASE):
             return label
     return None
+
+
+LapType = Literal["warmup", "work", "recovery", "float", "cooldown", "steady"]
+
+
+def _median(vals: list[float]) -> float:
+    s = sorted(vals)
+    return s[len(s) // 2]
+
+
+def _gap_split(
+    idx: list[int],
+    speeds: list[float],
+    distances_m: list[float],
+    min_gap: float = 0.08,
+) -> set[int] | None:
+    """
+    Split laps (by index) at the largest relative speed gap; None if no meaningful gap.
+    The fast side must be at least 2 laps or 25% of the distance — otherwise a single
+    outlier lap (e.g. a closing stride) would swallow the whole session as "slow",
+    so such gaps are skipped in favor of the next largest.
+    """
+    order = sorted(idx, key=lambda i: speeds[i])
+    total_dist = sum(distances_m[i] for i in idx)
+    gaps: list[tuple[float, int]] = []
+    for k in range(len(order) - 1):
+        lo, hi = speeds[order[k]], speeds[order[k + 1]]
+        gaps.append(((hi - lo) / hi, k))
+    for gap, k in sorted(gaps, reverse=True):
+        if gap < min_gap:
+            return None
+        fast = order[k + 1:]
+        if len(fast) >= 2 or sum(distances_m[i] for i in fast) >= 0.25 * total_dist:
+            return set(order[: k + 1])  # the slow side
+    return None
+
+
+def classify_laps(
+    speeds: list[float],
+    distances_m: list[float],
+    heartrates: list[float | None],
+) -> list[LapType]:
+    """
+    Classify each lap of a session as warmup / work / recovery / float / cooldown.
+
+    Positional "work block" approach: warmup and cooldown are defined by where they
+    sit relative to the fast laps, not by pace — so warmup miles are separated from
+    interval recoveries even when their paces overlap.
+
+    1. Split fast/slow at the largest relative speed gap ("steady" if no gap >= 6%).
+    2. The work block spans first to last fast lap; laps before/after are
+       warmup/cooldown, slow laps inside are recovery.
+    3. A second gap split inside the block separates jog recoveries from reps when
+       the session-level gap landed at the cooldown instead.
+    4. Block-edge laps with HR far below the work median, pace materially slower,
+       and a non-modal distance are trimmed to warmup/cooldown (catches warmup
+       miles that pace alone can't separate, e.g. before MP flux).
+    5. In-block recovery laps at near-work HR become "float" (continuous work,
+       e.g. flux slow halves), distinct from true jog recoveries.
+
+    Known limitation: uphill reps invert the pace signal (slow pace, high HR) and
+    classify as float rather than work.
+    """
+    n = len(speeds)
+    if n == 0:
+        return []
+
+    # Session level uses a lower gap floor: warmup-to-work contrast can be modest
+    # (e.g. flux with a brisk warmup), while the 8% inner floor keeps intentional
+    # alternation (flux fast/slow halves, ~7% apart) intact as one work block.
+    slow_set = _gap_split(list(range(n)), speeds, distances_m, min_gap=0.06)
+    if slow_set is None:
+        return ["steady"] * n
+
+    fast_idx = [i for i in range(n) if i not in slow_set]
+    first, last = fast_idx[0], fast_idx[-1]
+    types: list[LapType] = [
+        "warmup" if i < first else "cooldown" if i > last
+        else ("recovery" if i in slow_set else "work")
+        for i in range(n)
+    ]
+
+    block_idx = list(range(first, last + 1))
+    if len(block_idx) >= 3:
+        inner_slow = _gap_split(block_idx, speeds, distances_m)
+        if inner_slow is not None:
+            for i in block_idx:
+                if i in inner_slow and types[i] == "work":
+                    types[i] = "recovery"
+
+    work_i = [i for i in block_idx if types[i] == "work"]
+    work_hrs = [h for i in work_i if (h := heartrates[i]) is not None]
+    if work_i and work_hrs and len(block_idx) >= 3:
+        hr_cut = _median(work_hrs) - 15
+        speed_cut = _median([speeds[i] for i in work_i]) * 0.95
+        med_dist = _median([distances_m[i] for i in block_idx])
+
+        def is_edge_noise(i: int) -> bool:
+            h = heartrates[i]
+            return (h is not None and h < hr_cut
+                    and speeds[i] < speed_cut
+                    and abs(distances_m[i] - med_dist) / med_dist > 0.3)
+
+        i = first
+        while i <= last and is_edge_noise(i):
+            types[i] = "warmup"
+            i += 1
+        i = last
+        while i >= first and is_edge_noise(i):
+            types[i] = "cooldown"
+            i -= 1
+
+    rec_hrs = [h for i in range(n) if types[i] == "recovery" and (h := heartrates[i]) is not None]
+    if work_hrs and rec_hrs and _median(rec_hrs) > _median(work_hrs) - 12:
+        types = ["float" if t == "recovery" else t for t in types]
+    return types

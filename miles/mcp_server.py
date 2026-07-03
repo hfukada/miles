@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from mcp.server.fastmcp import FastMCP
 
 from . import db
+from .classifier import LapType, classify_laps
 
 mcp = FastMCP("miles")
 
@@ -18,18 +19,14 @@ def _conn() -> sqlite3.Connection:
     return conn
 
 
-def _filter_to_rep_laps(laps: list[sqlite3.Row]) -> list[sqlite3.Row]:
-    """
-    From a list of non-trivial laps for one session, return only the interval reps.
-    Uses pace-based clustering: keeps laps within 80% of the session's fastest lap speed.
-    Reps and recovery/warmup/cooldown are separated by a 30–60% speed gap, so this
-    boundary is far more stable than duration-based approaches.
-    """
-    if not laps:
-        return []
-    max_speed = max(float(row["average_speed_mps"]) for row in laps)
-    threshold = max_speed * 0.80
-    return [row for row in laps if float(row["average_speed_mps"]) >= threshold]
+def _classify_lap_rows(laps: list[sqlite3.Row]) -> list[LapType]:
+    """Run the lap classifier over sqlite rows (need average_speed_mps, distance_m, average_heartrate)."""
+    return classify_laps(
+        speeds=[float(row["average_speed_mps"]) for row in laps],
+        distances_m=[float(row["distance_m"]) for row in laps],
+        heartrates=[float(row["average_heartrate"]) if row["average_heartrate"] is not None else None
+                    for row in laps],
+    )
 
 
 _PACE_KEYS = frozenset({
@@ -312,7 +309,9 @@ def get_workout_laps(
     name_contains: substring match on activity name (fallback if no label set).
     Returns newest-first up to `limit` sessions. Each session includes:
       activity_id, name, date, workout_label,
-      laps: [{lap_index, distance_miles, pace_min_per_mile, avg_hr, max_hr}]
+      laps: [{lap_index, lap_type, distance_miles, pace_min_per_mile, avg_hr, max_hr}]
+    lap_type: warmup | work | recovery | float | cooldown | steady (see get_workout_session).
+    Trivial laps (< 200m or < 45s) get lap_type null.
     """
     conn = _conn()
     _, sport_params = _run_type_filter()
@@ -348,6 +347,10 @@ def get_workout_laps(
         laps = conn.execute("""
             SELECT
                 lap_index,
+                distance_m,
+                moving_time_s,
+                average_speed_mps,
+                average_heartrate,
                 ROUND(distance_m / 1609.34, 3) AS distance_miles,
                 CASE WHEN average_speed_mps > 0
                      THEN ROUND(26.8224 / average_speed_mps, 2)
@@ -358,6 +361,19 @@ def get_workout_laps(
             WHERE activity_id = ?
             ORDER BY lap_index
         """, [act["activity_id"]]).fetchall()
+
+        # Classify only non-trivial laps; trivial ones get lap_type None.
+        classifiable = [
+            i for i, lap in enumerate(laps)
+            if float(lap["distance_m"]) >= 200 and int(lap["moving_time_s"]) >= 45
+            and lap["average_speed_mps"] is not None and float(lap["average_speed_mps"]) > 0
+        ]
+        sub_types = _classify_lap_rows([laps[i] for i in classifiable])
+        lap_types: list[LapType | None] = [None] * len(laps)
+        for i, t in zip(classifiable, sub_types):
+            lap_types[i] = t
+
+        keep = ("lap_index", "distance_miles", "pace_min_per_mile", "avg_hr", "max_hr")
         out.append({
             "activity_id": act["activity_id"],
             "name": act["name"],
@@ -368,7 +384,10 @@ def get_workout_laps(
             "apparent_temp_c_max": act["apparent_temp_c_max"],
             "humidity_avg": act["humidity_avg"],
             "wind_kph_avg": act["wind_kph_avg"],
-            "laps": [dict(lap) for lap in laps],
+            "laps": [
+                {**{k: lap[k] for k in keep}, "lap_type": t}
+                for lap, t in zip(laps, lap_types)
+            ],
         })
 
     return json.dumps(_fmt_paces(out))
@@ -497,9 +516,11 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
 @mcp.tool()
 def get_workout_session(activity_id: int) -> str:
     """
-    Detailed view of a single workout: reps only, in sequence.
-    Non-rep laps (< 200m or < 45s) are filtered out.
-    Each rep: rep_num, distance_miles, duration_s, pace_min_mi, avg_hr, max_hr.
+    Detailed view of a single workout: all laps in sequence, each classified by lap_type:
+      warmup | work | recovery (jog between reps) | float (slow-but-still-work laps,
+      e.g. MP flux slow halves) | cooldown | steady (no interval structure detected).
+    Trivial laps (< 200m or < 45s) are filtered out.
+    Each lap: lap_num, lap_type, distance_miles, duration_s, pace_min_mi, avg_hr, max_hr.
     Use this to inspect within-session structure — whether reps held even, drifted,
     or fell apart — rather than relying solely on session averages.
     activity_id comes from get_build_snapshot, compare_workouts_by_build, or get_activities.
@@ -516,9 +537,12 @@ def get_workout_session(activity_id: int) -> str:
     if not activity:
         return json.dumps({"error": f"Activity {activity_id} not found."})
 
-    reps = conn.execute("""
+    laps = conn.execute("""
         SELECT
             lap_index,
+            distance_m,
+            average_speed_mps,
+            average_heartrate,
             ROUND(distance_m / 1609.34, 3) AS distance_miles,
             moving_time_s AS duration_s,
             CASE WHEN average_speed_mps > 0
@@ -533,9 +557,14 @@ def get_workout_session(activity_id: int) -> str:
         ORDER BY lap_index
     """, [activity_id]).fetchall()
 
+    lap_types = _classify_lap_rows(laps)
+    keep = ("lap_index", "distance_miles", "duration_s", "pace_min_mi", "avg_hr", "max_hr")
     return json.dumps(_fmt_paces({
         **dict(activity),
-        "reps": [{"rep_num": i + 1, **dict(r)} for i, r in enumerate(reps)],
+        "laps": [
+            {"lap_num": i + 1, "lap_type": t, **{k: r[k] for k in keep}}
+            for i, (r, t) in enumerate(zip(laps, lap_types))
+        ],
     }))
 
 
@@ -580,11 +609,13 @@ def compare_workouts_by_build(
 ) -> str:
     """
     Compare workout sessions (by label) across marathon builds.
-    Non-rep laps are filtered out (distance < 200m or duration < 45s), so stats
-    reflect actual work intervals only — not warmup, recovery jogs, or GPS artifacts.
+    Laps are classified (warmup/work/recovery/float/cooldown) and stats reflect
+    work laps only — warmup miles, jog recoveries, and cooldowns are excluded.
+    For flux-style sessions both alternating halves count as work.
     Returns builds chronologically, each with per-session:
       date, name, rep_count, avg_rep_pace_min_mi, avg_rep_hr, best_rep_pace_min_mi
     Use this for cross-build quality questions: "Did my LT pace drop at lower HR over time?"
+    Drill into a single session's lap-by-lap structure with get_workout_session.
     """
     conn = _conn()
 
@@ -611,7 +642,7 @@ def compare_workouts_by_build(
     id_list = [int(row["activity_id"]) for row in session_rows]
     placeholders = ",".join("?" * len(id_list))
     lap_rows = conn.execute(f"""
-        SELECT activity_id, moving_time_s, average_speed_mps, average_heartrate
+        SELECT activity_id, distance_m, moving_time_s, average_speed_mps, average_heartrate
         FROM laps
         WHERE activity_id IN ({placeholders})
           AND distance_m >= 200 AND moving_time_s >= 45
@@ -624,10 +655,11 @@ def compare_workouts_by_build(
     for lap in lap_rows:
         laps_by_id[int(lap["activity_id"])].append(lap)
 
-    # Compute per-session rep stats using median-duration clustering
+    # Compute per-session rep stats over classified work laps
     session_stats: dict[int, dict[str, object]] = {}
     for activity_id, laps in laps_by_id.items():
-        rep_laps = _filter_to_rep_laps(laps)
+        lap_types = _classify_lap_rows(laps)
+        rep_laps = [lap for lap, t in zip(laps, lap_types) if t == "work"]
         if not rep_laps:
             continue
         paces = [26.8224 / float(l["average_speed_mps"]) for l in rep_laps]
