@@ -6,10 +6,10 @@ from datetime import date, timedelta
 from mcp.server.fastmcp import FastMCP
 
 from . import db
-from .builds import RaceRef, detect_builds
+from .builds import Build, RaceRef, detect_builds
 from .derive import ensure_derived
 from .format import fmt_time
-from .periods import WeekAgg, _is_active, detect_periods
+from .periods import Period, WeekAgg, _is_active, detect_periods
 from .races import MARATHON_MAX_M, MARATHON_MIN_M, NOMINAL_METERS, classify_race_distance
 
 mcp = FastMCP("miles")
@@ -207,6 +207,8 @@ def get_marathon_comparison(build_weeks: int = 12) -> str:
       name, date, finish_time_s, distance_miles, pace_min_per_mile,
       build: { start, end, weeks, total_miles, avg_mpw,
                by_type: { easy, workout, long_run, race? } }
+
+    For non-marathon races or effective-type awareness, see get_race_comparison.
     """
     conn = _conn()
     type_clause, type_params = _run_type_filter()
@@ -287,6 +289,132 @@ def get_marathon_comparison(build_weeks: int = 12) -> str:
                     if row["run_type"] is not None
                 },
             },
+        })
+
+    return json.dumps(_fmt_paces(out))
+
+
+@mcp.tool()
+def get_race_comparison(distance_category: str | None = None, build_weeks: int = 12) -> str:
+    """
+    Cross-race comparison of pre-race training windows — get_marathon_comparison's shape,
+    generalized to any race distance. For every effective-race activity (optionally
+    filtered to one distance_category: 5K, 10K, half, marathon, ...), returns the result
+    alongside stats for the build_weeks-week window that preceded it. Ascending by date.
+
+    Each entry: name, date, distance_category, run_type_source, finish_time_s,
+    distance_miles, pace_min_per_mile,
+    build: { start, end, weeks, total_miles, avg_mpw,
+             by_type: { easy, workout, long_run, race? } } (by_type keyed on the
+    effective run type, so untagged rows still bucket correctly),
+    window_coverage: { weeks_total, active_weeks, period, detected_build } — same shape
+    and caveats as get_build_snapshot's: active_weeks well below weeks_total means the
+    fixed window wasn't a real build.
+
+    Deltas across distance_category are not comparable times — a faster half than 10K
+    build says nothing about fitness change. Use get_race_equivalents or the
+    personal-best tools for cross-distance comparison, not this tool's raw numbers.
+
+    Returns [] if no races found.
+    """
+    conn = _conn()
+    effective_run_type = db.effective_run_type_sql()
+    type_clause, type_params = _run_type_filter()
+
+    races = conn.execute(f"""
+        SELECT
+            name,
+            DATE(start_date) AS race_date,
+            distance_m,
+            ROUND(distance_m / 1609.34, 2) AS distance_miles,
+            moving_time_s,
+            CASE WHEN average_speed_mps > 0
+                 THEN ROUND(26.8224 / average_speed_mps, 2)
+                 ELSE NULL END AS pace_min_per_mile,
+            CASE WHEN workout_type = 0 AND run_type_inferred IS NOT NULL
+                 THEN 'inferred' ELSE 'strava' END AS run_type_source
+        FROM activities
+        WHERE {type_clause} AND {effective_run_type} = 'race'
+        ORDER BY race_date
+    """, type_params).fetchall()
+
+    periods, builds = _full_periods_and_builds(conn)
+
+    out = []
+    for race in races:
+        category = classify_race_distance(race["distance_m"]) or "other"
+        if distance_category is not None and category != distance_category:
+            continue
+
+        race_date: str = race["race_date"]
+        # Matches get_marathon_comparison's day-based window exactly (not Monday-aligned)
+        # so the two tools' build stats agree; window_coverage below stays Monday-aligned
+        # like the rest of the codebase.
+        build_start: str = conn.execute(
+            "SELECT DATE(?, ?)", (race_date, f"-{build_weeks * 7} days")
+        ).fetchone()[0]
+
+        by_type = conn.execute(f"""
+            SELECT
+                {effective_run_type} AS run_type,
+                COUNT(*) AS runs,
+                ROUND(SUM(distance_m) / 1609.34, 2)         AS total_miles,
+                ROUND(AVG(distance_m) / 1609.34, 2)         AS avg_miles,
+                ROUND(AVG(average_heartrate), 1)             AS avg_hr,
+                CASE WHEN AVG(average_speed_mps) > 0
+                     THEN ROUND(26.8224 / AVG(average_speed_mps), 2)
+                     ELSE NULL END                           AS avg_pace_min_per_mile
+            FROM activities
+            WHERE {type_clause}
+              AND DATE(start_date) >= ?
+              AND DATE(start_date) < ?
+            GROUP BY {effective_run_type}
+            ORDER BY {effective_run_type}
+        """, type_params + [build_start, race_date]).fetchall()
+
+        totals = conn.execute(f"""
+            SELECT
+                COUNT(*) AS runs,
+                ROUND(SUM(distance_m) / 1609.34, 2) AS total_miles
+            FROM activities
+            WHERE {type_clause}
+              AND DATE(start_date) >= ?
+              AND DATE(start_date) < ?
+        """, type_params + [build_start, race_date]).fetchone()
+
+        total_miles: float = totals["total_miles"] or 0.0
+
+        race_dt = date.fromisoformat(race_date)
+        race_week_monday = race_dt - timedelta(days=race_dt.weekday())
+        window_coverage = _window_coverage(conn, race_date, race_week_monday, build_weeks, periods, builds)
+
+        out.append({
+            "name": race["name"],
+            "date": race_date,
+            "distance_category": category,
+            "run_type_source": race["run_type_source"],
+            "finish_time_s": race["moving_time_s"],
+            "distance_miles": race["distance_miles"],
+            "pace_min_per_mile": race["pace_min_per_mile"],
+            "build": {
+                "start": build_start,
+                "end": race_date,
+                "weeks": build_weeks,
+                "total_miles": total_miles,
+                "avg_mpw": round(total_miles / build_weeks, 1),
+                "by_type": {
+                    row["run_type"]: {
+                        "runs": row["runs"],
+                        "total_miles": row["total_miles"],
+                        "avg_miles": row["avg_miles"],
+                        "avg_hr": row["avg_hr"],
+                        "avg_pace_min_per_mile": row["avg_pace_min_per_mile"],
+                    }
+                    for row in by_type
+                    if row["run_type"] is not None
+                },
+            },
+            "window_coverage": window_coverage,
         })
 
     return json.dumps(_fmt_paces(out))
@@ -696,52 +824,193 @@ def get_workout_laps(
     return json.dumps(_fmt_paces(out))
 
 
+def _full_periods_and_builds(conn: sqlite3.Connection) -> tuple[list[Period], list[Build]]:
+    """
+    Full-history weekly aggregates, detected periods, and race-anchored builds — the
+    same computation get_training_periods exposes over all effective-race activities,
+    reused here to locate the period/build enclosing an arbitrary race date. No
+    start_date filter: the enclosing period must be found from the whole history.
+    """
+    effective_run_type = db.effective_run_type_sql()
+    type_clause, type_params = _run_type_filter()
+
+    week_rows = conn.execute(f"""
+        SELECT
+            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
+            COUNT(*) AS runs,
+            SUM(CASE WHEN {effective_run_type} = 'workout' THEN 1 ELSE 0 END) AS workouts
+        FROM activities
+        WHERE {type_clause}
+        GROUP BY monday
+        ORDER BY monday
+    """, type_params).fetchall()
+
+    weeks: list[WeekAgg] = [
+        {"monday": r["monday"], "miles": r["miles"] or 0.0, "runs": r["runs"], "workouts": r["workouts"] or 0}
+        for r in week_rows
+    ]
+    periods, _gaps = detect_periods(weeks)
+    if not periods:
+        return [], []
+
+    race_rows = conn.execute(f"""
+        SELECT DATE(start_date) AS date, name, distance_m
+        FROM activities
+        WHERE {type_clause} AND {effective_run_type} = 'race'
+        ORDER BY date
+    """, type_params).fetchall()
+
+    race_refs: list[RaceRef] = [
+        {
+            "date": r["date"],
+            "name": r["name"],
+            "distance_category": classify_race_distance(r["distance_m"]) or "other",
+            "distance_m": r["distance_m"],
+        }
+        for r in race_rows
+        if r["distance_m"] is not None
+    ]
+    builds = detect_builds(weeks, race_refs, periods)
+    return periods, builds
+
+
+def _window_active_weeks(conn: sqlite3.Connection, race_week_monday: date, build_weeks: int) -> int:
+    """
+    Count Monday-aligned weeks in [race_week_monday - build_weeks, race_week_monday)
+    meeting the active-week definition (periods._is_active), zero-filling calendar gaps.
+    """
+    window_start = race_week_monday - timedelta(weeks=build_weeks)
+    type_clause, type_params = _run_type_filter()
+
+    week_rows = conn.execute(f"""
+        SELECT
+            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
+            COUNT(*) AS runs
+        FROM activities
+        WHERE {type_clause}
+          AND DATE(start_date) >= ? AND DATE(start_date) < ?
+        GROUP BY monday
+    """, type_params + [window_start.isoformat(), race_week_monday.isoformat()]).fetchall()
+
+    by_monday = {r["monday"]: r for r in week_rows}
+    active = 0
+    d = window_start
+    while d < race_week_monday:
+        wr = by_monday.get(d.isoformat())
+        week: WeekAgg = {
+            "monday": d.isoformat(),
+            "miles": (wr["miles"] or 0.0) if wr else 0.0,
+            "runs": (wr["runs"] or 0) if wr else 0,
+            "workouts": 0,
+        }
+        if _is_active(week):
+            active += 1
+        d += timedelta(weeks=1)
+    return active
+
+
+def _window_coverage(
+    conn: sqlite3.Connection,
+    race_date_str: str,
+    race_week_monday: date,
+    build_weeks: int,
+    periods: list[Period],
+    builds: list[Build],
+) -> dict[str, object]:
+    """Assemble the window_coverage block shared by get_build_snapshot and get_race_comparison."""
+    period = next((p for p in periods if p["start"] <= race_date_str <= p["end"]), None)
+    detected_build = next((b for b in builds if b["race"]["date"] == race_date_str), None)
+    return {
+        "weeks_total": build_weeks,
+        "active_weeks": _window_active_weeks(conn, race_week_monday, build_weeks),
+        "period": {"start": period["start"], "end": period["end"]} if period else None,
+        "detected_build": (
+            {
+                "start": detected_build["start"],
+                "end": detected_build["end"],
+                "weeks": detected_build["weeks"],
+                "bounded_by": detected_build["bounded_by"],
+                "thin": detected_build["thin"],
+            }
+            if detected_build else None
+        ),
+    }
+
+
 @mcp.tool()
 def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> str:
     """
-    Week-by-week breakdown of a marathon build.
-    race_date: YYYY-MM-DD of the target race. If omitted, uses the most recent marathon in the DB.
-    Returns: race info, weeks_to_race (negative = past race), week-by-week mileage with
-    workout/long-run counts, all workout sessions with rep stats, and long run list.
+    Week-by-week breakdown of a training build for any race distance.
+    race_date: YYYY-MM-DD of the target race. If several races share that date, the
+    longest one is used. If omitted, uses the most recent race of any distance in the DB.
+    Returns: race info (including distance_category and run_type_source), weeks_to_race
+    (negative = past race), week-by-week mileage with workout/long-run counts, all
+    workout sessions with rep stats, and long run list.
+
+    window_coverage reports whether the fixed build_weeks window was actually trained
+    through: active_weeks vs. weeks_total (Monday-aligned), the enclosing detected
+    training period (from get_training_periods), and detected_build — the race-anchored,
+    data-derived preparation window (see get_training_periods) for this exact race, or
+    null when the race is below the anchor floor (shorter than 10K) or no build was
+    detected. When active_weeks is well below weeks_total (roughly under 60%), the fixed
+    window wasn't a real build — describe the detected period/build instead.
+    detected_build is the honest answer for a consistent year-round runner, for whom a
+    fixed calendar window is otherwise arbitrary.
+
     Use this to orient at the start of any build-specific conversation.
     """
     conn = _conn()
     type_clause, type_params = _run_type_filter()
+    effective_run_type = db.effective_run_type_sql()
 
     if race_date:
         race_date_str = race_date
-        race_row = conn.execute("""
-            SELECT name FROM activities
-            WHERE run_type = 'race' AND distance_m BETWEEN ? AND ?
+        race_row = conn.execute(f"""
+            SELECT name, distance_m, moving_time_s, average_speed_mps,
+                   workout_type, run_type_inferred
+            FROM activities
+            WHERE {type_clause} AND {effective_run_type} = 'race'
               AND DATE(start_date) = ?
-        """, [MARATHON_MIN_M, MARATHON_MAX_M, race_date]).fetchone()
-        race_name: str | None = race_row["name"] if race_row else None
+            ORDER BY distance_m DESC LIMIT 1
+        """, type_params + [race_date]).fetchone()
     else:
-        race_row = conn.execute("""
-            SELECT name, DATE(start_date) AS race_date FROM activities
-            WHERE run_type = 'race' AND distance_m BETWEEN ? AND ?
+        race_row = conn.execute(f"""
+            SELECT name, DATE(start_date) AS race_date, distance_m, moving_time_s, average_speed_mps,
+                   workout_type, run_type_inferred
+            FROM activities
+            WHERE {type_clause} AND {effective_run_type} = 'race'
             ORDER BY start_date DESC LIMIT 1
-        """, [MARATHON_MIN_M, MARATHON_MAX_M]).fetchone()
+        """, type_params).fetchone()
         if not race_row:
-            return json.dumps({"error": "No marathon found in the database."})
+            return json.dumps({"error": "No race found in the database."})
         race_date_str = race_row["race_date"]
-        race_name = race_row["name"]
+
+    race_name: str | None = race_row["name"] if race_row else None
+    distance_m: float | None = race_row["distance_m"] if race_row else None
+    distance_category = classify_race_distance(distance_m) or "other"
+    run_type_source: str | None = None
+    race_result: dict[str, object] | None = None
+    if race_row:
+        run_type_source = (
+            "inferred" if race_row["workout_type"] == 0 and race_row["run_type_inferred"] is not None
+            else "strava"
+        )
+        avg_speed = race_row["average_speed_mps"]
+        race_result = {
+            "moving_time_s": race_row["moving_time_s"],
+            "distance_miles": round(distance_m / 1609.34, 2) if distance_m is not None else None,
+            "pace_min_per_mile": round(26.8224 / avg_speed, 2) if avg_speed and avg_speed > 0 else None,
+        }
 
     race_dt = date.fromisoformat(race_date_str)
     race_week_monday = race_dt - timedelta(days=race_dt.weekday())
     build_start = (race_week_monday - timedelta(weeks=build_weeks)).isoformat()
     weeks_to_race = (race_dt - date.today()).days // 7
 
-    race_result_row = conn.execute("""
-        SELECT moving_time_s, ROUND(distance_m / 1609.34, 2) AS distance_miles,
-               CASE WHEN average_speed_mps > 0
-                    THEN ROUND(26.8224 / average_speed_mps, 2)
-                    ELSE NULL END AS pace_min_per_mile
-        FROM activities
-        WHERE run_type = 'race' AND distance_m BETWEEN ? AND ?
-          AND DATE(start_date) = ?
-    """, [MARATHON_MIN_M, MARATHON_MAX_M, race_date_str]).fetchone()
-    race_result: dict[str, object] | None = dict(race_result_row) if race_result_row else None
+    periods, builds = _full_periods_and_builds(conn)
+    window_coverage = _window_coverage(conn, race_date_str, race_week_monday, build_weeks, periods, builds)
 
     weeks = conn.execute(f"""
         SELECT
@@ -808,11 +1077,14 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
         "race": race_name,
         "race_date": race_date_str,
         "race_result": race_result,
+        "distance_category": distance_category,
+        "run_type_source": run_type_source,
         "build_start": build_start,
         "weeks_to_race": weeks_to_race,
         "weeks": [dict(w) for w in weeks],
         "workouts": [dict(w) for w in workouts],
         "long_runs": [dict(lr) for lr in long_runs],
+        "window_coverage": window_coverage,
     }))
 
 
