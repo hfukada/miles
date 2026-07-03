@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from mcp.server.fastmcp import FastMCP
 
 from . import db
+from .builds import RaceRef, detect_builds
 from .derive import ensure_derived
 from .periods import WeekAgg, detect_periods
 from .races import MARATHON_MAX_M, MARATHON_MIN_M, classify_race_distance
@@ -308,8 +309,22 @@ def get_training_periods(start_date: str | None = None) -> str:
     Each period also carries `races`: races (effective run type, including
     inferred) that fall within it, each as
     {date, name, distance_category, distance_miles}.
+
+    Each period also carries `builds`: race-anchored preparation windows
+    within it, distinct from the period itself. A build is capped at 18
+    weeks and trimmed back to where training volume actually ramped up, so
+    it never balloons into the whole period. Only races 10K and up anchor a
+    build (shorter races still appear in `races` but anchor nothing).
+    `bounded_by` says why each build starts where it does: `cap` (hit the
+    18-week ceiling), `prior_race` (too close to a previous anchor race),
+    `period_start` (the period itself is shorter than the cap), or `ramp`
+    (volume before that point was too low to count as preparation).
+    `thin: true` flags a build under 4 weeks. For a consistent, year-round
+    runner the enclosing period is just continuity — the builds within it
+    are the meaningful analysis windows for "what led into this race."
     """
     conn = _conn()
+    effective_run_type = db.effective_run_type_sql()
     type_clause, type_params = _run_type_filter()
     where = f"WHERE {type_clause}"
     params = list(type_params)
@@ -321,7 +336,8 @@ def get_training_periods(start_date: str | None = None) -> str:
         SELECT
             DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
             ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
-            COUNT(*) AS runs
+            COUNT(*) AS runs,
+            SUM(CASE WHEN {effective_run_type} = 'workout' THEN 1 ELSE 0 END) AS workouts
         FROM activities
         {where}
         GROUP BY monday
@@ -329,14 +345,13 @@ def get_training_periods(start_date: str | None = None) -> str:
     """, params).fetchall()
 
     weeks: list[WeekAgg] = [
-        {"monday": r["monday"], "miles": r["miles"] or 0.0, "runs": r["runs"]}
+        {"monday": r["monday"], "miles": r["miles"] or 0.0, "runs": r["runs"], "workouts": r["workouts"] or 0}
         for r in week_rows
     ]
     periods, gaps = detect_periods(weeks)
     if not periods:
         return json.dumps({"periods": [], "gaps": []})
 
-    effective_run_type = db.effective_run_type_sql()
     race_type_clause, race_type_params = _run_type_filter()
     race_rows = conn.execute(f"""
         SELECT DATE(start_date) AS date, name, distance_m,
@@ -355,9 +370,24 @@ def get_training_periods(start_date: str | None = None) -> str:
         }
         for r in race_rows
     ]
+    race_refs: list[RaceRef] = [
+        {
+            "date": r["date"],
+            "name": r["name"],
+            "distance_category": classify_race_distance(r["distance_m"]) or "other",
+            "distance_m": r["distance_m"],
+        }
+        for r in race_rows
+        if r["distance_m"] is not None
+    ]
+    builds = detect_builds(weeks, race_refs, periods)
 
     out_periods = [
-        {**p, "races": [r for r in races if p["start"] <= r["date"] <= p["end"]]}
+        {
+            **p,
+            "races": [r for r in races if p["start"] <= r["date"] <= p["end"]],
+            "builds": [b for b in builds if p["start"] <= b["race"]["date"] <= p["end"]],
+        }
         for p in periods
     ]
     return json.dumps({"periods": out_periods, "gaps": gaps})

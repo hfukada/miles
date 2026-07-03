@@ -25,6 +25,7 @@ class WeekAgg(TypedDict):
     monday: str
     miles: float
     runs: int
+    workouts: int
 
 
 class Period(TypedDict):
@@ -65,7 +66,7 @@ def _zero_fill(weeks: list[WeekAgg]) -> list[WeekAgg]:
     d = start
     while d <= end:
         iso = d.isoformat()
-        filled.append(given.get(iso, {"monday": iso, "miles": 0.0, "runs": 0}))
+        filled.append(given.get(iso, {"monday": iso, "miles": 0.0, "runs": 0, "workouts": 0}))
         d += timedelta(weeks=1)
     return filled
 
