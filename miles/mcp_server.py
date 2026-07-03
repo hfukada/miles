@@ -32,6 +32,34 @@ def _filter_to_rep_laps(laps: list[sqlite3.Row]) -> list[sqlite3.Row]:
     return [row for row in laps if float(row["average_speed_mps"]) >= threshold]
 
 
+_PACE_KEYS = frozenset({
+    "pace_min_per_mile", "avg_pace_min_per_mile", "avg_pace",
+    "avg_rep_pace", "best_rep_pace", "pace_min_mi", "avg_pace_min_mi",
+})
+
+
+def _pace_str(v: float) -> str:
+    """Convert decimal minutes-per-mile (e.g. 6.56) to MM:SS string (e.g. '6:34')."""
+    mins = int(v)
+    secs = round((v - mins) * 60)
+    if secs == 60:
+        mins += 1
+        secs = 0
+    return f"{mins}:{secs:02d}"
+
+
+def _fmt_paces(obj: object) -> object:
+    """Recursively convert known pace keys from decimal float to MM:SS string."""
+    if isinstance(obj, dict):
+        return {
+            k: (_pace_str(float(v)) if k in _PACE_KEYS and isinstance(v, (int, float)) else _fmt_paces(v))
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_fmt_paces(item) for item in obj]
+    return obj
+
+
 def _run_type_filter(sport_types: tuple[str, ...] = RUN_TYPES) -> tuple[str, list[str]]:
     placeholders = ",".join("?" * len(sport_types))
     return f"sport_type IN ({placeholders})", list(sport_types)
@@ -111,7 +139,7 @@ def get_activities(
         ORDER BY start_date DESC
         LIMIT ?
     """, params + [limit]).fetchall()
-    return json.dumps([dict(r) for r in rows])
+    return json.dumps(_fmt_paces([dict(r) for r in rows]))
 
 
 @mcp.tool()
@@ -151,11 +179,11 @@ def get_training_block(start_date: str, end_date: str) -> str:
         WHERE {type_clause} {date_clause}
     """, base_params + date_params).fetchone()
 
-    return json.dumps({
+    return json.dumps(_fmt_paces({
         "period": {"start": start_date, "end": end_date},
         "total": dict(totals),
         "by_type": [dict(r) for r in by_type],
-    })
+    }))
 
 
 MARATHON_MIN_M = 42000.0
@@ -255,7 +283,7 @@ def get_marathon_comparison(build_weeks: int = 12) -> str:
             },
         })
 
-    return json.dumps(out)
+    return json.dumps(_fmt_paces(out))
 
 
 @mcp.tool()
@@ -321,7 +349,7 @@ def get_workout_laps(
             "laps": [dict(lap) for lap in laps],
         })
 
-    return json.dumps(out)
+    return json.dumps(_fmt_paces(out))
 
 
 @mcp.tool()
@@ -418,7 +446,7 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
         ORDER BY start_date
     """, type_params + [build_start, race_date_str]).fetchall()
 
-    return json.dumps({
+    return json.dumps(_fmt_paces({
         "race": race_name,
         "race_date": race_date_str,
         "race_result": race_result,
@@ -427,7 +455,7 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
         "weeks": [dict(w) for w in weeks],
         "workouts": [dict(w) for w in workouts],
         "long_runs": [dict(lr) for lr in long_runs],
-    })
+    }))
 
 
 @mcp.tool()
@@ -469,10 +497,10 @@ def get_workout_session(activity_id: int) -> str:
         ORDER BY lap_index
     """, [activity_id]).fetchall()
 
-    return json.dumps({
+    return json.dumps(_fmt_paces({
         **dict(activity),
         "reps": [{"rep_num": i + 1, **dict(r)} for i, r in enumerate(reps)],
-    })
+    }))
 
 
 @mcp.tool()
@@ -506,7 +534,7 @@ def get_easy_hr_trend(months: int = 36) -> str:
         ORDER BY month
     """, type_params + [cutoff]).fetchall()
 
-    return json.dumps([dict(r) for r in rows])
+    return json.dumps(_fmt_paces([dict(r) for r in rows]))
 
 
 @mcp.tool()
@@ -595,7 +623,7 @@ def compare_workouts_by_build(
                 "sessions": build_sessions,
             })
 
-    return json.dumps(builds)
+    return json.dumps(_fmt_paces(builds))
 
 
 @mcp.tool()
