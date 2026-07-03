@@ -53,6 +53,22 @@ WORKOUT_TYPE_MAP: dict[int, str] = {
     3: "workout",
 }
 
+# Effective run type: prefer the inferred label over Strava's default "easy" bucket,
+# but only when the athlete never tagged the activity (workout_type == 0 is "unset").
+# Explicit athlete tags (workout_type 1-3) always win.
+EFFECTIVE_RUN_TYPE_SQL: str = (
+    "COALESCE(CASE WHEN workout_type = 0 THEN run_type_inferred END, run_type)"
+)
+
+
+def effective_run_type_sql(alias: str = "") -> str:
+    """Same as EFFECTIVE_RUN_TYPE_SQL, with column names qualified by a table alias (e.g. "a")."""
+    prefix = f"{alias}." if alias else ""
+    return (
+        f"COALESCE(CASE WHEN {prefix}workout_type = 0 THEN {prefix}run_type_inferred END, "
+        f"{prefix}run_type)"
+    )
+
 
 def connect(path: Path = DB_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,7 +136,13 @@ def init_db(conn: sqlite3.Connection) -> None:
             raw_json           TEXT
         )
     """)
-    for col in ("workout_label TEXT", "start_lat REAL", "start_lng REAL", "raw_json TEXT"):
+    for col in (
+        "workout_label TEXT",
+        "start_lat REAL",
+        "start_lng REAL",
+        "raw_json TEXT",
+        "run_type_inferred TEXT",
+    ):
         try:
             conn.execute(f"ALTER TABLE activities ADD COLUMN {col}")
         except sqlite3.OperationalError:

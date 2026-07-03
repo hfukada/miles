@@ -8,6 +8,7 @@ from stravalib.exc import Fault
 
 from . import db, strava_client, weather as weather_module
 from .classifier import classify_workout
+from .inference import apply_inference
 
 
 def _wait_for_rate_limit() -> None:
@@ -126,12 +127,31 @@ def _run(conn: sqlite3.Connection, full: bool) -> None:
 
         print(f"Weather done. {fetched_w} new records.")
 
+    # Rebuild inferred run types (untagged activities) from the full history.
+    counts = apply_inference(conn)
+    if counts:
+        summary = ", ".join(f"{run_type}={n}" for run_type, n in sorted(counts.items()))
+        print(f"Inference done. {summary}")
+    else:
+        print("Inference done. No rows inferred.")
+
 
 @click.command()
 @click.option("--full", is_flag=True, help="Ignore last sync date and fetch everything.")
-def main(full: bool) -> None:
+@click.option("--reinfer", is_flag=True, help="Recompute run_type_inferred only; no Strava API calls.")
+def main(full: bool, reinfer: bool) -> None:
     conn = db.connect()
     db.init_db(conn)
+
+    if reinfer:
+        counts = apply_inference(conn)
+        if counts:
+            summary = ", ".join(f"{run_type}={n}" for run_type, n in sorted(counts.items()))
+            print(f"Inference done. {summary}")
+        else:
+            print("Inference done. No rows inferred.")
+        return
+
     while True:
         try:
             _run(conn, full)

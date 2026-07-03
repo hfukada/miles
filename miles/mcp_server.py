@@ -102,18 +102,21 @@ def get_activities(
 ) -> str:
     """
     List individual runs with key stats, including weather conditions when available.
-    run_type: 'easy' | 'workout' | 'long_run' | 'race' | None for all.
+    run_type: 'easy' | 'workout' | 'long_run' | 'race' | None for all. Matched against the
+    effective run type — the athlete's explicit Strava tag when set, else an inferred type
+    for untagged (workout_type=0) activities (see run_type_source in each row).
     Dates are YYYY-MM-DD. Returns up to `limit` rows, newest first.
     Weather fields (temp_c_start, temp_c_max, apparent_temp_c_max, humidity_avg,
     precip_mm, wind_kph_avg) are null if not yet synced for that activity.
     """
     conn = _conn()
+    effective_run_type = db.effective_run_type_sql("a")
     _, sport_params = _run_type_filter()
     placeholders = ",".join("?" * len(sport_params))
     conditions = [f"a.sport_type IN ({placeholders})"]
     params: list[str | int] = list(sport_params)
     if run_type:
-        conditions.append("a.run_type = ?")
+        conditions.append(f"{effective_run_type} = ?")
         params.append(run_type)
     if start_date:
         conditions.append("a.start_date >= ?")
@@ -128,7 +131,9 @@ def get_activities(
             a.activity_id,
             a.name,
             a.start_date,
-            a.run_type,
+            {effective_run_type} AS run_type,
+            CASE WHEN a.workout_type = 0 AND a.run_type_inferred IS NOT NULL
+                 THEN 'inferred' ELSE 'strava' END AS run_type_source,
             ROUND(a.distance_m / 1609.34, 2) AS miles,
             a.moving_time_s,
             CASE WHEN a.average_speed_mps > 0
@@ -159,13 +164,14 @@ def get_training_block(start_date: str, end_date: str) -> str:
     Dates are YYYY-MM-DD. Good for comparing base vs. build phases.
     """
     conn = _conn()
+    effective_run_type = db.effective_run_type_sql()
     type_clause, base_params = _run_type_filter()
     date_clause = "AND start_date >= ? AND start_date <= ?"
     date_params = [start_date, end_date]
 
     by_type = conn.execute(f"""
         SELECT
-            run_type,
+            {effective_run_type} AS run_type,
             COUNT(*) AS runs,
             ROUND(SUM(distance_m) / 1609.34, 2)  AS total_miles,
             ROUND(AVG(distance_m) / 1609.34, 2)  AS avg_miles,
@@ -176,8 +182,8 @@ def get_training_block(start_date: str, end_date: str) -> str:
             ROUND(SUM(total_elevation_gain_m) * 3.28084, 0) AS total_elevation_ft
         FROM activities
         WHERE {type_clause} {date_clause}
-        GROUP BY run_type
-        ORDER BY run_type
+        GROUP BY {effective_run_type}
+        ORDER BY {effective_run_type}
     """, base_params + date_params).fetchall()
 
     totals = conn.execute(f"""
@@ -743,10 +749,12 @@ def run_sql(query: str) -> str:
     Use this for ad-hoc questions the other tools don't cover.
 
     Table: activities
-      activity_id, name, sport_type, start_date, workout_type, run_type, workout_label,
-      distance_m, moving_time_s, elapsed_time_s, total_elevation_gain_m,
+      activity_id, name, sport_type, start_date, workout_type, run_type, run_type_inferred,
+      workout_label, distance_m, moving_time_s, elapsed_time_s, total_elevation_gain_m,
       average_speed_mps, max_speed_mps, average_heartrate, max_heartrate,
       average_cadence, gear_id, strava_url, synced_at, start_lat, start_lng
+      (run_type_inferred is inferred for untagged rows; COALESCE with run_type via
+      workout_type=0 for the effective type — see EFFECTIVE_RUN_TYPE_SQL in db.py)
 
     Table: laps  (one row per lap; only workout activities are synced)
       lap_id, activity_id, lap_index, distance_m, moving_time_s, average_speed_mps,
