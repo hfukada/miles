@@ -2,7 +2,7 @@ import sqlite3
 import uvicorn
 from datetime import date, timedelta
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
@@ -10,9 +10,10 @@ from fastapi.staticfiles import StaticFiles
 from . import db
 from .builds import Build, RaceRef, detect_builds
 from .derive import ensure_derived
+from .format import fmt_pace as _fmt_pace
 from .format import fmt_time as _fmt_time
 from .periods import Gap, Period, WeekAgg, _zero_fill, detect_periods
-from .races import MARATHON_MAX_M, MARATHON_MIN_M, classify_race_distance
+from .races import MARATHON_MAX_M, MARATHON_MIN_M, classify_race_distance, race_rows
 
 app = FastAPI(title="miles")
 
@@ -325,6 +326,46 @@ def get_weekly_history() -> WeeklyHistory:
         builds=builds,
         races=races,
     )
+
+
+class RaceRow(TypedDict):
+    date: str
+    name: str | None
+    distance_category: str
+    distance_miles: float | None
+    finish_time_s: int | None
+    finish_time: str
+    pace_min_per_mile: str | None
+    is_pr: bool
+    effort: str | None
+    activity_id: int
+    strava_url: str | None
+
+
+@app.get("/api/races")
+def get_races() -> list[RaceRow]:
+    """
+    Every effective race at every distance, ascending by date, with
+    per-category PR flags computed over the full history.
+    """
+    conn = _conn()
+    out: list[RaceRow] = []
+    for r in race_rows(conn):
+        pace = r["pace_min_per_mile"]
+        out.append(RaceRow(
+            date=cast(str, r["date"]),
+            name=cast(str | None, r["name"]),
+            distance_category=cast(str, r["distance_category"]),
+            distance_miles=cast(float | None, r["distance_miles"]),
+            finish_time_s=cast(int | None, r["finish_time_s"]),
+            finish_time=cast(str, r["finish_time"]),
+            pace_min_per_mile=_fmt_pace(pace) if isinstance(pace, (int, float)) else None,
+            is_pr=cast(bool, r["is_pr"]),
+            effort=cast(str | None, r["effort"]),
+            activity_id=cast(int, r["activity_id"]),
+            strava_url=cast(str | None, r["strava_url"]),
+        ))
+    return out
 
 
 app.mount("/", StaticFiles(directory=str(_STATIC), html=True), name="static")

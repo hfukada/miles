@@ -11,7 +11,14 @@ from .derive import ensure_derived
 from .fitness import WINDOW_DAYS, estimate_fitness
 from .format import fmt_time
 from .periods import GAP_WEEKS_TO_SPLIT, Period, WeekAgg, _is_active, _sunday, detect_periods
-from .races import MARATHON_MAX_M, MARATHON_MIN_M, NOMINAL_METERS, classify_race_distance, riegel_time
+from .races import (
+    MARATHON_MAX_M,
+    MARATHON_MIN_M,
+    NOMINAL_METERS,
+    classify_race_distance,
+    race_rows,
+    riegel_time,
+)
 
 mcp = FastMCP("miles")
 
@@ -422,81 +429,8 @@ def get_race_comparison(distance_category: str | None = None, build_weeks: int =
     return json.dumps(_fmt_paces(out))
 
 
-def _race_rows(
-    conn: sqlite3.Connection,
-    distance_category: str | None = None,
-    start_date: str | None = None,
-    activity_id: int | None = None,
-) -> list[dict[str, object]]:
-    """
-    All effective-race activities, ascending by date. PR flags are computed over
-    the athlete's full race history first; distance_category/start_date/activity_id
-    filter the returned rows afterward, so filtering never changes an is_pr verdict.
-    """
-    effective_run_type = db.effective_run_type_sql("a")
-    _, sport_params = _run_type_filter()
-    placeholders = ",".join("?" * len(sport_params))
-    where = f"WHERE a.sport_type IN ({placeholders}) AND {effective_run_type} = 'race'"
-
-    rows = conn.execute(f"""
-        SELECT
-            a.activity_id,
-            a.name,
-            DATE(a.start_date) AS date,
-            a.distance_m,
-            ROUND(a.distance_m / 1609.34, 2) AS distance_miles,
-            a.moving_time_s,
-            CASE WHEN a.average_speed_mps > 0
-                 THEN ROUND(26.8224 / a.average_speed_mps, 2)
-                 ELSE NULL END AS pace_min_per_mile,
-            ROUND(a.average_heartrate, 1) AS avg_hr,
-            CASE WHEN a.workout_type = 0 AND a.run_type_inferred IS NOT NULL
-                 THEN 'inferred' ELSE 'strava' END AS run_type_source,
-            a.race_effort,
-            a.effort_ratio,
-            a.strava_url
-        FROM activities a
-        {where}
-        ORDER BY date ASC
-    """, sport_params).fetchall()
-
-    best_finish_s: dict[str, int] = {}
-    out: list[dict[str, object]] = []
-    for r in rows:
-        category: str = classify_race_distance(r["distance_m"]) or "other"
-        finish_time_s: int | None = r["moving_time_s"]
-        is_pr = False
-        if category != "other" and finish_time_s is not None:
-            best = best_finish_s.get(category)
-            if best is None or finish_time_s < best:
-                is_pr = True
-                best_finish_s[category] = finish_time_s
-
-        if distance_category is not None and category != distance_category:
-            continue
-        race_date: str = r["date"]
-        if start_date is not None and race_date < start_date:
-            continue
-        if activity_id is not None and r["activity_id"] != activity_id:
-            continue
-
-        out.append({
-            "activity_id": r["activity_id"],
-            "name": r["name"],
-            "date": race_date,
-            "distance_category": category,
-            "distance_miles": r["distance_miles"],
-            "finish_time_s": finish_time_s,
-            "finish_time": fmt_time(finish_time_s),
-            "pace_min_per_mile": r["pace_min_per_mile"],
-            "avg_hr": r["avg_hr"],
-            "run_type_source": r["run_type_source"],
-            "effort": r["race_effort"],
-            "effort_ratio": r["effort_ratio"],
-            "is_pr": is_pr,
-            "strava_url": r["strava_url"],
-        })
-    return out
+# Shared with the web API; lives in races.py.
+_race_rows = race_rows
 
 
 @mcp.tool()
