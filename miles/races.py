@@ -37,3 +37,8 @@ def classify_race_distance(distance_m: float | None) -> str | None:
         if min_m <= distance_m <= max_m:
             return category
     return None
+
+
+def riegel_time(t_s: float, from_m: float, to_m: float, exponent: float = 1.06) -> float:
+    """Riegel formula: predicted time at to_m given a time at from_m."""
+    return t_s * (to_m / from_m) ** exponent

@@ -10,7 +10,7 @@ from .builds import Build, RaceRef, detect_builds
 from .derive import ensure_derived
 from .format import fmt_time
 from .periods import GAP_WEEKS_TO_SPLIT, Period, WeekAgg, _is_active, _sunday, detect_periods
-from .races import MARATHON_MAX_M, MARATHON_MIN_M, NOMINAL_METERS, classify_race_distance
+from .races import MARATHON_MAX_M, MARATHON_MIN_M, NOMINAL_METERS, classify_race_distance, riegel_time
 
 mcp = FastMCP("miles")
 
@@ -639,6 +639,84 @@ def get_personal_bests() -> str:
         })
 
     return json.dumps(_fmt_paces(out))
+
+
+_EQUIV_CATEGORIES: tuple[str, ...] = ("5K", "10K", "half", "marathon")
+
+
+@mcp.tool()
+def get_race_equivalents(exponent: float = 1.06) -> str:
+    """
+    Cross-distance comparison via Riegel scaling: every race's actual result
+    plus predicted-equivalent times at 5K/10K/half/marathon, so "was my recent
+    10K better than last year's half?" has a common answer. `marathon_equiv_s`
+    is the ranking key. Races are grouped by year, best marathon-equivalent
+    first within each year; `best_ever` is the single best entry overall.
+    "other"-category races and races with no recorded finish time are excluded.
+
+    Caveats the coach must relay whenever citing this: Riegel assumes
+    equivalent training specificity across distances — a marathon-trained
+    runner's 5K equivalent may be soft, and vice versa. Recreational athletes
+    typically underperform the prediction as distance goes up (endurance,
+    not just fitness, gates the longer distances). The exponent is a tunable
+    knob, not a physical constant — treat its output as an estimate, not
+    truth. Effort is not yet classified here, so an easy-effort race inflates
+    or deflates its equivalents same as an all-out one; cross-check a
+    suspicious ranking against the race's actual pace before citing it.
+    """
+    conn = _conn()
+    rows = _race_rows(conn)
+
+    entries: list[tuple[float, dict[str, object]]] = []
+    for r in rows:
+        category = str(r["distance_category"])
+        finish_time_s = r["finish_time_s"]
+        if category == "other" or not isinstance(finish_time_s, (int, float)):
+            continue
+        from_m = NOMINAL_METERS[category]
+
+        equivalents: dict[str, object] = {}
+        marathon_equiv_s = 0.0
+        for target in _EQUIV_CATEGORIES:
+            to_m = NOMINAL_METERS[target]
+            t_s = riegel_time(float(finish_time_s), from_m, to_m, exponent)
+            miles = to_m / 1609.34
+            equivalents[target] = {
+                "time_s": round(t_s, 1),
+                "time": fmt_time(round(t_s)),
+                "pace_min_per_mile": (t_s / 60) / miles,
+            }
+            if target == "marathon":
+                marathon_equiv_s = t_s
+
+        entries.append((marathon_equiv_s, {
+            "date": r["date"],
+            "name": r["name"],
+            "distance_category": category,
+            "finish_time": r["finish_time"],
+            "marathon_equiv": fmt_time(round(marathon_equiv_s)),
+            "marathon_equiv_s": round(marathon_equiv_s, 1),
+            "equivalents": equivalents,
+            "is_pr": r["is_pr"],
+            "run_type_source": r["run_type_source"],
+        }))
+
+    races_by_year: dict[str, list[tuple[float, dict[str, object]]]] = {}
+    for key, e in entries:
+        year = str(e["date"])[:4]
+        races_by_year.setdefault(year, []).append((key, e))
+
+    out_by_year: dict[str, list[dict[str, object]]] = {
+        year: [e for _, e in sorted(pairs, key=lambda p: p[0])]
+        for year, pairs in races_by_year.items()
+    }
+    best_ever = min(entries, key=lambda p: p[0])[1] if entries else None
+
+    return json.dumps(_fmt_paces({
+        "races": out_by_year,
+        "best_ever": best_ever,
+        "exponent": exponent,
+    }))
 
 
 @mcp.tool()
