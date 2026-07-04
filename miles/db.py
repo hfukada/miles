@@ -151,12 +151,13 @@ def init_db(conn: sqlite3.Connection) -> None:
         "run_type_inferred TEXT",
         "race_effort TEXT",
         "effort_ratio REAL",
+        "dominant_intensity TEXT",
     ):
         try:
             conn.execute(f"ALTER TABLE activities ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass
-    for col in ("raw_json TEXT", "lap_type TEXT"):
+    for col in ("raw_json TEXT", "lap_type TEXT", "intensity TEXT"):
         try:
             conn.execute(f"ALTER TABLE laps ADD COLUMN {col}")
         except sqlite3.OperationalError:

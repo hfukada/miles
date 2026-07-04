@@ -1082,10 +1082,16 @@ def get_workout_laps(
     workout_label: classifier label e.g. 'LT', 'MP Flux', 'Tempo', 'Strides'.
     name_contains: substring match on activity name (fallback if no label set).
     Returns newest-first up to `limit` sessions. Each session includes:
-      activity_id, name, date, workout_label,
-      laps: [{lap_index, lap_type, distance_miles, pace_min_per_mile, avg_hr, max_hr}]
+      activity_id, name, date, workout_label, dominant_intensity,
+      laps: [{lap_index, lap_type, intensity, distance_miles, pace_min_per_mile, avg_hr, max_hr}]
     lap_type: warmup | work | recovery | float | cooldown | steady (see get_workout_session).
     Trivial laps (< 200m or < 45s) get lap_type null.
+    intensity: what a work/float lap was run at relative to the athlete's estimated
+    fitness at the time — MP | threshold | interval | repetition | aerobic | sprint |
+    sub-<zone>, or null for a non-work lap, a trivial lap, or a month with no reliable
+    fitness estimate. dominant_intensity is the session-level rollup (the intensity
+    holding >=60% of work-lap time); null when mixed or unavailable. Both stand in for
+    workout_label on unlabeled sessions — see run_sql for querying by dominant_intensity.
     """
     conn = _conn()
     _, sport_params = _run_type_filter()
@@ -1108,6 +1114,7 @@ def get_workout_laps(
 
     activities = conn.execute(f"""
         SELECT a.activity_id, a.name, DATE(a.start_date) AS date, a.workout_label,
+               a.dominant_intensity,
                w.temp_c_start, w.temp_c_max, w.apparent_temp_c_max, w.humidity_avg, w.wind_kph_avg
         FROM activities a
         LEFT JOIN weather w ON w.activity_id = a.activity_id
@@ -1122,6 +1129,7 @@ def get_workout_laps(
             SELECT
                 lap_index,
                 lap_type,
+                intensity,
                 ROUND(distance_m / 1609.34, 3) AS distance_miles,
                 CASE WHEN average_speed_mps > 0
                      THEN ROUND(26.8224 / average_speed_mps, 2)
@@ -1133,12 +1141,13 @@ def get_workout_laps(
             ORDER BY lap_index
         """, [act["activity_id"]]).fetchall()
 
-        keep = ("lap_index", "distance_miles", "pace_min_per_mile", "avg_hr", "max_hr", "lap_type")
+        keep = ("lap_index", "distance_miles", "pace_min_per_mile", "avg_hr", "max_hr", "lap_type", "intensity")
         out.append({
             "activity_id": act["activity_id"],
             "name": act["name"],
             "date": act["date"],
             "workout_label": act["workout_label"],
+            "dominant_intensity": act["dominant_intensity"],
             "temp_c_start": act["temp_c_start"],
             "temp_c_max": act["temp_c_max"],
             "apparent_temp_c_max": act["apparent_temp_c_max"],
@@ -1421,7 +1430,13 @@ def get_workout_session(activity_id: int) -> str:
       warmup | work | recovery (jog between reps) | float (slow-but-still-work laps,
       e.g. MP flux slow halves) | cooldown | steady (no interval structure detected).
     Trivial laps (< 200m or < 45s) are filtered out.
-    Each lap: lap_num, lap_type, distance_miles, duration_s, pace_min_mi, avg_hr, max_hr.
+    Each lap: lap_num, lap_type, intensity, distance_miles, duration_s, pace_min_mi, avg_hr, max_hr.
+    intensity names what a work/float lap was run at relative to the athlete's estimated
+    fitness at the time — MP | threshold | interval | repetition | aerobic | sprint |
+    sub-<zone>; null for a non-work lap, a trivial lap, or a month with no reliable
+    fitness estimate. dominant_intensity (session level) is the intensity holding >=60%
+    of work-lap time, null when mixed or unavailable — it can stand in for workout_label
+    on unlabeled sessions.
     Use this to inspect within-session structure — whether reps held even, drifted,
     or fell apart — rather than relying solely on session averages.
     activity_id comes from get_build_snapshot, compare_workouts_by_build, or get_activities.
@@ -1429,7 +1444,7 @@ def get_workout_session(activity_id: int) -> str:
     conn = _conn()
 
     activity = conn.execute("""
-        SELECT activity_id, name, DATE(start_date) AS date, workout_label,
+        SELECT activity_id, name, DATE(start_date) AS date, workout_label, dominant_intensity,
                ROUND(distance_m / 1609.34, 2) AS total_miles,
                moving_time_s AS total_time_s, strava_url
         FROM activities WHERE activity_id = ?
@@ -1442,6 +1457,7 @@ def get_workout_session(activity_id: int) -> str:
         SELECT
             lap_index,
             lap_type,
+            intensity,
             ROUND(distance_m / 1609.34, 3) AS distance_miles,
             moving_time_s AS duration_s,
             CASE WHEN average_speed_mps > 0
@@ -1456,7 +1472,7 @@ def get_workout_session(activity_id: int) -> str:
         ORDER BY lap_index
     """, [activity_id]).fetchall()
 
-    keep = ("lap_index", "distance_miles", "duration_s", "pace_min_mi", "avg_hr", "max_hr")
+    keep = ("lap_index", "distance_miles", "duration_s", "pace_min_mi", "avg_hr", "max_hr", "intensity")
     return json.dumps(_fmt_paces({
         **dict(activity),
         "laps": [
@@ -1866,18 +1882,27 @@ def run_sql(query: str) -> str:
       workout_label, distance_m, moving_time_s, elapsed_time_s, total_elevation_gain_m,
       average_speed_mps, max_speed_mps, average_heartrate, max_heartrate,
       average_cadence, gear_id, strava_url, synced_at, start_lat, start_lng,
-      race_effort, effort_ratio
+      race_effort, effort_ratio, dominant_intensity
       (run_type_inferred is inferred for untagged rows; COALESCE with run_type via
       workout_type=0 for the effective type — see EFFECTIVE_RUN_TYPE_SQL in db.py.
       race_effort/effort_ratio are derived, rebuilt each sync — raced/hard/casual
       judged against the fitness checkpoint for the race's month plus HR; null
-      when no checkpoint prediction was available for that category)
+      when no checkpoint prediction was available for that category.
+      dominant_intensity is derived, rebuilt each sync — the work-lap intensity
+      (see laps.intensity) holding >=60% of a workout's work-lap time, else NULL;
+      stands in for workout_label on unlabeled sessions, e.g. "all my threshold
+      sessions regardless of naming" is
+      WHERE dominant_intensity = 'threshold')
 
     Table: laps  (one row per lap; only workout activities are synced)
       lap_id, activity_id, lap_index, distance_m, moving_time_s, average_speed_mps,
       average_heartrate, max_heartrate, average_cadence, total_elevation_gain_m, pace_zone,
       lap_type (derived, rebuilt each sync — warmup/work/recovery/float/cooldown/steady;
       NULL for trivial laps under the 200m/45s floor)
+      intensity (derived, rebuilt each sync — MP/threshold/interval/repetition/aerobic/
+      sprint/sub-<zone> for work/float laps, judged against the fitness checkpoint for
+      the month before the activity; NULL for other lap_types, trivial laps, or months
+      with no reliable fitness estimate)
 
     Table: weather  (one row per activity; populated by miles-sync)
       activity_id, fetched_at, temp_c_start, temp_c_end, temp_c_avg, temp_c_max,

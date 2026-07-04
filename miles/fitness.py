@@ -270,6 +270,80 @@ def _tier3_envelope(conn: sqlite3.Connection, as_of: date) -> _Candidate | None:
     }
 
 
+def zones_from_predicted(marathon_pace: float, fivek_pace: float) -> dict[str, float | str]:
+    """MP/threshold/interval/repetition zone anchors (decimal min/mi) plus an
+    easy_range string, from marathon and 5K predicted paces via Riegel. Same math
+    estimate_fitness uses for its zones field, factored out so a persisted
+    fitness checkpoint (which stores only the four headline paces) can
+    reconstruct identical anchors for a past month."""
+    marathon_time_s = marathon_pace * (NOMINAL_METERS["marathon"] / MILE_M) * 60.0
+    threshold_time_s = riegel_time(marathon_time_s, NOMINAL_METERS["marathon"], NOMINAL_METERS["15K"])
+    threshold_pace = (threshold_time_s / 60.0) / (NOMINAL_METERS["15K"] / MILE_M)
+
+    fivek_time_s = fivek_pace * (NOMINAL_METERS["5K"] / MILE_M) * 60.0
+    repetition_time_s = riegel_time(fivek_time_s, NOMINAL_METERS["5K"], MILE_M)
+    repetition_pace = repetition_time_s / 60.0
+
+    return {
+        "easy_range": f"{_pace_str(marathon_pace + 1.0)}–{_pace_str(marathon_pace + 1.75)}/mi",
+        "marathon": round(marathon_pace, 2),
+        "threshold": round(threshold_pace, 2),
+        "interval": round(fivek_pace, 2),
+        "repetition": round(repetition_pace, 2),
+    }
+
+
+# Lap-intensity zone tolerances: relative distance from a zone anchor that still
+# counts as running "at" that effort.
+MP_TOLERANCE = 0.03
+THRESHOLD_TOLERANCE = 0.03
+INTERVAL_TOLERANCE = 0.025
+REPETITION_TOLERANCE = 0.03
+
+_ZONE_KEYS = ("marathon", "threshold", "interval", "repetition")  # slow -> fast pace
+_ZONE_LABEL: dict[str, str] = {
+    "marathon": "MP", "threshold": "threshold", "interval": "interval", "repetition": "repetition",
+}
+_ZONE_TOLERANCE: dict[str, float] = {
+    "marathon": MP_TOLERANCE, "threshold": THRESHOLD_TOLERANCE,
+    "interval": INTERVAL_TOLERANCE, "repetition": REPETITION_TOLERANCE,
+}
+
+
+def intensity_for_pace(pace_min_mi: float, zones: dict[str, float | str]) -> str | None:
+    """Nearest zone anchor within tolerance for a lap's pace (decimal min/mi),
+    from a FitnessEstimate's zones dict. Anchors run slow-to-fast: MP, threshold,
+    interval (5K), repetition (mile). Between two anchors with neither in
+    tolerance, returns the slower anchor's name prefixed 'sub-' (e.g.
+    'sub-threshold' between threshold and interval). Slower than MP's tolerance
+    band -> 'aerobic'; faster than repetition's -> 'sprint'. Confidence gating
+    (no label from a low-confidence estimate) is the caller's job, not this
+    function's — it only does the geometric match."""
+    anchors = [(key, float(zones[key])) for key in _ZONE_KEYS]
+
+    nearest_key: str | None = None
+    nearest_rel: float | None = None
+    for key, anchor in anchors:
+        rel = abs(pace_min_mi - anchor) / anchor
+        if nearest_rel is None or rel < nearest_rel:
+            nearest_key, nearest_rel = key, rel
+    assert nearest_key is not None and nearest_rel is not None
+    if nearest_rel <= _ZONE_TOLERANCE[nearest_key]:
+        return _ZONE_LABEL[nearest_key]
+
+    mp_pace = anchors[0][1]
+    repetition_pace = anchors[-1][1]
+    if pace_min_mi > mp_pace * (1 + MP_TOLERANCE):
+        return "aerobic"
+    if pace_min_mi < repetition_pace * (1 - REPETITION_TOLERANCE):
+        return "sprint"
+
+    for (slow_key, slow_pace), (_, fast_pace) in zip(anchors, anchors[1:]):
+        if fast_pace <= pace_min_mi <= slow_pace:
+            return f"sub-{_ZONE_LABEL[slow_key]}"
+    return None
+
+
 def estimate_fitness(
     conn: sqlite3.Connection, as_of: date, *, exclude_casual: bool = False
 ) -> FitnessEstimate | None:
@@ -312,14 +386,7 @@ def estimate_fitness(
         chosen = lower
 
     paces = chosen["paces"]
-    marathon_pace = paces["marathon"]
-    zones: dict[str, float | str] = {
-        "easy_range": f"{_pace_str(marathon_pace + 1.0)}–{_pace_str(marathon_pace + 1.75)}/mi",
-        "marathon": round(marathon_pace, 2),
-        "threshold": round(paces["15K"], 2),
-        "interval": round(paces["5K"], 2),
-        "repetition": round(paces["mile"], 2),
-    }
+    zones = zones_from_predicted(paces["marathon"], paces["5K"])
     estimate: FitnessEstimate = {
         "as_of": as_of.isoformat(),
         "confidence": chosen["confidence"],

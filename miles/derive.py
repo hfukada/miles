@@ -29,6 +29,8 @@ from .fitness import (
     estimate_fitness,
     hr_ceiling,
     hr_raced_fraction,
+    intensity_for_pace,
+    zones_from_predicted,
 )
 from .inference import apply_inference
 from .races import NOMINAL_METERS, classify_race_distance
@@ -37,7 +39,11 @@ _CONFIDENCE_VALUES = get_args(Confidence)
 
 # Bump whenever any classifier or threshold feeding a derived value changes, so
 # ensure_derived() knows stale rows need a full recompute.
-DERIVE_VERSION = "5"
+DERIVE_VERSION = "6"
+
+# A single intensity must hold at least this share of a session's work-lap moving
+# time to count as the session's dominant_intensity; below it the session is mixed.
+DOMINANT_INTENSITY_MIN_SHARE = 0.60
 
 # Checkpoint pace columns per race category — only these four are tracked; races in
 # other buckets (15K, 10M, 30K, 50K) have no checkpoint prediction and are skipped.
@@ -269,6 +275,74 @@ def _pace_based_race_inference(conn: sqlite3.Connection) -> int:
     return count
 
 
+def _lap_intensity_pass(conn: sqlite3.Connection) -> dict[str, int]:
+    """Tag work/float laps with intensity (MP/threshold/interval/repetition/
+    aerobic/sprint/sub-*) using the zone anchors from the fitness checkpoint of
+    the month *before* each activity's month — never that activity's own month,
+    which could include itself. Skips activities with no earlier checkpoint or a
+    low-confidence one: a wrong label is worse than none. Rolls each session's
+    work-lap intensities up into dominant_intensity when one intensity holds
+    >= DOMINANT_INTENSITY_MIN_SHARE of work-lap moving time."""
+    conn.execute("UPDATE laps SET intensity = NULL")
+    conn.execute("UPDATE activities SET dominant_intensity = NULL")
+
+    activity_ids = [
+        int(row["activity_id"])
+        for row in conn.execute("""
+            SELECT DISTINCT activity_id FROM laps WHERE lap_type IN ('work', 'float')
+        """).fetchall()
+    ]
+
+    laps_intensity = 0
+    sessions_dominant = 0
+    for activity_id in activity_ids:
+        row = conn.execute(
+            "SELECT DATE(start_date) AS date FROM activities WHERE activity_id = ?", [activity_id]
+        ).fetchone()
+        if row is None or row["date"] is None:
+            continue
+        activity_date = date.fromisoformat(row["date"])
+        checkpoint = _checkpoint_row(conn, _prior_month_str(activity_date.year, activity_date.month))
+        if checkpoint is None or checkpoint["confidence"] == "low":
+            continue
+        zones = zones_from_predicted(float(checkpoint["pace_marathon"]), float(checkpoint["pace_5k"]))
+
+        laps = conn.execute("""
+            SELECT lap_id, lap_index, lap_type, moving_time_s, average_speed_mps
+            FROM laps
+            WHERE activity_id = ? AND lap_type IN ('work', 'float')
+              AND average_speed_mps IS NOT NULL AND average_speed_mps > 0
+            ORDER BY lap_index
+        """, [activity_id]).fetchall()
+        if not laps:
+            continue
+
+        work_time_by_intensity: dict[str, int] = {}
+        total_work_s = 0
+        for lap in laps:
+            pace = 26.8224 / float(lap["average_speed_mps"])
+            intensity = intensity_for_pace(pace, zones)
+            conn.execute("UPDATE laps SET intensity = ? WHERE lap_id = ?", (intensity, int(lap["lap_id"])))
+            if intensity is None:
+                continue
+            laps_intensity += 1
+            if lap["lap_type"] == "work":
+                t = int(lap["moving_time_s"] or 0)
+                work_time_by_intensity[intensity] = work_time_by_intensity.get(intensity, 0) + t
+                total_work_s += t
+
+        if total_work_s > 0:
+            dom_intensity, dom_s = max(work_time_by_intensity.items(), key=lambda kv: kv[1])
+            if dom_s / total_work_s >= DOMINANT_INTENSITY_MIN_SHARE:
+                conn.execute(
+                    "UPDATE activities SET dominant_intensity = ? WHERE activity_id = ?",
+                    (dom_intensity, activity_id),
+                )
+                sessions_dominant += 1
+
+    return {"laps_intensity": laps_intensity, "sessions_dominant": sessions_dominant}
+
+
 def derive_all(conn: sqlite3.Connection) -> dict[str, int]:
     """Full recompute of every derived value from raw synced data. Never incremental."""
     counts: dict[str, int] = {}
@@ -291,6 +365,8 @@ def derive_all(conn: sqlite3.Connection) -> dict[str, int]:
         counts["inferred_race"] = counts.get("inferred_race", 0) + pace_inferred
 
     counts["fitness_months"] = _fitness_checkpoints(conn, exclude_casual=True)  # pass 2, final
+
+    counts.update(_lap_intensity_pass(conn))
 
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
