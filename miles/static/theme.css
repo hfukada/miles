@@ -18,12 +18,12 @@
   --good: #006300;
 
   --series-1: #2a78d6; /* blue */
-  --series-2: #1baf7a; /* aqua */
-  --series-3: #eda100; /* yellow */
+  --series-2: #12986a; /* aqua */
+  --series-3: #d99400; /* yellow */
   --series-4: #008300; /* green */
   --series-5: #4a3aa7; /* violet */
   --series-6: #e34948; /* red */
-  --series-7: #e87ba4; /* magenta */
+  --series-7: #d4527e; /* magenta */
   --series-8: #eb6834; /* orange */
 
   --pr-bg: #f0fdf4;
@@ -48,7 +48,7 @@
     --series-1: #3987e5;
     --series-2: #199e70;
     --series-3: #c98500;
-    --series-4: #008300;
+    --series-4: #0f7a0f;
     --series-5: #9085e9;
     --series-6: #e66767;
     --series-7: #d55181;

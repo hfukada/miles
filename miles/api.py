@@ -8,6 +8,8 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from . import db
+from .build_paces import PaceClaim, pace_claims
+from .distance_builds import router as distance_builds_router
 from .builds import Build, RaceRef, detect_builds
 from .derive import ensure_derived
 from .format import fmt_pace, fmt_time
@@ -37,6 +39,7 @@ class BuildStat(TypedDict):
     peak_week: float | None
     peak_3wk_avg: float | None
     by_type: dict[str, RunTypeStat]
+    pace_claims: dict[str, PaceClaim | None]
 
 
 class MarathonRow(TypedDict):
@@ -167,6 +170,7 @@ def get_marathons(build_weeks: int = _BUILD_WEEKS) -> list[MarathonRow]:
                     for row in by_type_rows
                     if row["run_type"] is not None
                 },
+                pace_claims=pace_claims(conn, build_start, race_date),
             ),
         ))
 
@@ -521,6 +525,9 @@ def get_years() -> list[YearRow]:
         ))
     return out
 
+
+# Must precede the catch-all static mount below.
+app.include_router(distance_builds_router)
 
 app.mount("/", StaticFiles(directory=str(_STATIC), html=True), name="static")
 

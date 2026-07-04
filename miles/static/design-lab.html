@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Miles · Design Lab</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎨</text></svg>">
+  <link rel="stylesheet" href="/theme.css">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <style>
+    /* Lab chrome only — variant styles live in each variant file, scoped to .lab-root.v-<id> */
+    .lab-bar {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0.625rem 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+    .lab-bar .lab-title {
+      font-size: 0.8125rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+    .lab-tabs { display: flex; gap: 0.25rem; flex-wrap: wrap; }
+    .lab-tab {
+      padding: 0.3rem 0.75rem;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg);
+      color: var(--text-secondary);
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    .lab-tab.active {
+      background: var(--text);
+      color: var(--surface);
+      border-color: var(--text);
+    }
+    .lab-tab:hover:not(.active) { background: var(--gridline); }
+    .lab-blurb {
+      font-size: 0.75rem;
+      color: var(--muted);
+      flex-basis: 100%;
+    }
+    .lab-root { min-height: 60vh; }
+    #lab-status { padding: 2rem; color: var(--muted); font-size: 0.8125rem; }
+  </style>
+</head>
+<body>
+<script src="/nav.js"></script>
+
+<div class="lab-bar">
+  <span class="lab-title">design lab</span>
+  <div class="lab-tabs" id="lab-tabs"></div>
+  <span class="lab-blurb" id="lab-blurb"></span>
+</div>
+
+<div id="lab-status">Loading data…</div>
+<div class="lab-root" id="lab-root"></div>
+
+<script>
+  // ---------------------------------------------------------------------
+  // Variant contract
+  // ---------------------------------------------------------------------
+  // Each variant file calls:
+  //
+  //   LAB.register({
+  //     id: 'b',                    // single letter, used in hash + CSS scope
+  //     name: 'Refined utility',    // switcher label
+  //     blurb: 'One-line summary of what to evaluate in this variant.',
+  //     render(root, data, theme) { // build DOM inside root; return optional cleanup fn
+  //       ...
+  //       return () => { /* dispose charts, remove listeners */ };
+  //     },
+  //   });
+  //
+  // - root is an empty <div class="lab-root v-<id>">; variants own everything inside.
+  // - Scope all injected CSS to `.v-<id>` (inject one <style> per variant file at load).
+  // - data = { marathons, weeks } — see /api/marathons and /api/marathon-weeks.
+  // - theme = chartTheme() from nav.js plus { withAlpha }.
+  // - ECharts: containers must be <div>; always set animation:false; call
+  //   echarts.dispose in the cleanup fn; charts should resize via the shared
+  //   ResizeObserver the lab attaches (nothing to do — lab calls chart.resize
+  //   through the returned cleanup contract only; register resize listeners
+  //   yourself if needed and remove them in cleanup).
+
+  const LAB = {
+    variants: [],
+    register(v) { this.variants.push(v); },
+  };
+
+  // Shared formatting helpers — variants use these, don't reimplement.
+  const fmt = {
+    // seconds -> "2:54:00"
+    time(s) {
+      if (s == null) return null;
+      const h = Math.floor(s / 3600);
+      const m = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+      const sec = String(Math.round(s % 60)).padStart(2, '0');
+      return `${h}:${m}:${sec}`;
+    },
+    // seconds -> "2:54" (h:mm, for tight spots)
+    timeShort(s) {
+      if (s == null) return null;
+      return `${Math.floor(s / 3600)}:${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}`;
+    },
+    // decimal minutes per mile (7.82) -> "7:49"
+    pace(dec) {
+      if (dec == null) return null;
+      const m = Math.floor(dec);
+      const s = String(Math.round((dec - m) * 60)).padStart(2, '0');
+      return `${m}:${s}`;
+    },
+    // "Grandma's Marathon 2023" -> "Grandma's '23"; virtual -> "(v)"
+    shortName(name, date) {
+      const nameYear = (name.match(/\d{4}/) ?? [])[0];
+      const year = nameYear ?? (date ? date.slice(0, 4) : null);
+      const yr = year ? `'${year.slice(2)}` : '';
+      let short = name
+        .replace("Grandma's Marathon", "Grandma's")
+        .replace('Marathon', '')
+        .replace('Virtual', '(v)')
+        .replace(/\s+/g, ' ').trim();
+      if (nameYear) short = short.replace(nameYear, yr).replace(/\s+/g, ' ').trim();
+      else if (year) short = `${short} ${yr}`;
+      return short;
+    },
+    isVirtual(m) { return m.name?.includes('Virtual') ?? false; },
+  };
+
+  // ECharts labelLayout.moveOverlap ignores endLabels, so converging lines
+  // stack their labels. Re-space them in pixel space after setOption:
+  // sort by final-value y, push apart to minGap, apply per-series offsets.
+  function staggerEndLabels(chart, minGap = 15) {
+    const series = chart.getOption().series ?? [];
+    const items = [];
+    series.forEach((s, i) => {
+      if (!s.endLabel?.show) return;
+      const v = s.data[s.data.length - 1];
+      const y = chart.convertToPixel({ yAxisIndex: 0 }, v);
+      if (Number.isFinite(y)) items.push({ i, y0: y, y });
+    });
+    if (items.length < 2) return;
+    items.sort((a, b) => a.y - b.y);
+    for (let k = 1; k < items.length; k++) {
+      if (items[k].y - items[k - 1].y < minGap) items[k].y = items[k - 1].y + minGap;
+    }
+    const patch = series.map(() => ({}));
+    for (const it of items) {
+      patch[it.i] = { endLabel: { offset: [4, it.y - it.y0] } };
+    }
+    chart.setOption({ series: patch });
+  }
+
+  let cleanup = null;
+  let labData = null;
+
+  function show(id) {
+    const v = LAB.variants.find(x => x.id === id) ?? LAB.variants[0];
+    if (!v || !labData) return;
+    if (cleanup) { try { cleanup(); } catch (e) { console.error(e); } cleanup = null; }
+
+    const root = document.getElementById('lab-root');
+    root.innerHTML = '';
+    root.className = `lab-root v-${v.id}`;
+
+    document.querySelectorAll('.lab-tab').forEach(b =>
+      b.classList.toggle('active', b.dataset.id === v.id));
+    document.getElementById('lab-blurb').textContent = v.blurb;
+    history.replaceState(null, '', `#${v.id}`);
+
+    const theme = Object.assign(chartTheme(), { withAlpha });
+    cleanup = v.render(root, labData, theme) ?? null;
+  }
+
+  async function boot() {
+    const [mRes, wRes] = await Promise.all([
+      fetch('/api/marathons'),
+      fetch('/api/marathon-weeks'),
+    ]);
+    if (!mRes.ok || !wRes.ok) throw new Error('API error');
+    labData = { marathons: await mRes.json(), weeks: await wRes.json() };
+
+    LAB.variants.sort((a, b) => a.id.localeCompare(b.id));
+    const tabs = document.getElementById('lab-tabs');
+    for (const v of LAB.variants) {
+      const b = document.createElement('button');
+      b.className = 'lab-tab';
+      b.dataset.id = v.id;
+      b.textContent = `${v.id.toUpperCase()} · ${v.name}`;
+      b.addEventListener('click', () => show(v.id));
+      tabs.appendChild(b);
+    }
+
+    document.getElementById('lab-status').remove();
+    show(location.hash.replace('#', '') || LAB.variants[0]?.id);
+  }
+
+  window.addEventListener('DOMContentLoaded', () =>
+    boot().catch(err => {
+      document.getElementById('lab-status').textContent = `Error: ${err.message}`;
+    }));
+</script>
+
+<script src="/lab/variant-a.js"></script>
+<script src="/lab/variant-b.js"></script>
+<script src="/lab/variant-c.js"></script>
+<script src="/lab/variant-d.js"></script>
+<script src="/lab/variant-e.js"></script>
+<script src="/lab/variant-f.js"></script>
+<script src="/lab/variant-g.js"></script>
+</body>
+</html>

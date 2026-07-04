@@ -2,7 +2,6 @@
 // Include with a single <script src="/nav.js"></script> right after <body>.
 
 const NAV_LINKS = [
-  { href: "/", label: "Marathons" },
   { href: "/races.html", label: "Races" },
   { href: "/training.html", label: "Training" },
   { href: "/years.html", label: "Years" },
@@ -24,7 +23,9 @@ function renderNav() {
     const a = document.createElement("a");
     a.href = href;
     a.textContent = label;
-    const isActive = path === href || (href === "/" && path === "/index.html");
+    const isActive = href === "/races.html"
+      ? (path === "/races.html" || path === "/" || path === "/index.html")
+      : path === href;
     if (isActive) a.classList.add("active");
     nav.appendChild(a);
   }

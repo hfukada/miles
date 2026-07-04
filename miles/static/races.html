@@ -7,67 +7,182 @@
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏃</text></svg>">
   <link rel="stylesheet" href="/theme.css">
   <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <style>
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.25rem;
+    }
+    .subtitle { font-size: 0.8125rem; color: var(--muted); margin-bottom: 1.25rem; }
+
+    #primary-tabs { margin-bottom: 1.5rem; }
+
+    .dist-empty { font-size: 0.8125rem; color: var(--muted); padding: 1rem 0; }
+
+    /* Stat strip — ported from lab/variant-c.js, scoped to distance tabs. */
+    .dist-view .stat-strip {
+      display: flex;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 1.25rem;
+    }
+    .dist-view .stat { padding: 0.625rem 1.25rem; }
+    .dist-view .stat + .stat { border-left: 1px solid var(--border); }
+    .dist-view .stat-label {
+      font-size: 0.625rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 0.1875rem;
+    }
+    .dist-view .stat-value {
+      display: flex;
+      align-items: baseline;
+      gap: 0.375rem;
+      font-size: 1.0625rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .dist-view .stat-sub { font-size: 0.6875rem; font-weight: 400; color: var(--muted); }
+
+    .dist-view .mode-tabs { margin-bottom: 0.75rem; }
+    .dist-view .chart-wrap { height: 380px; margin-bottom: 1.25rem; }
+
+    /* Dense table — ported from lab/variant-c.js, scoped to distance tabs. */
+    .dist-view tbody td { padding: 0.25rem 0.75rem; font-size: 0.75rem; }
+    .dist-view thead th { padding: 0.375rem 0.75rem; font-size: 0.625rem; }
+    .dist-view .spark { display: block; }
+  </style>
 </head>
 <body>
 <script src="/nav.js"></script>
+<script src="/charts.js"></script>
 
 <main>
-  <p class="lede">race history across all distances</p>
-  <div id="status">Loading…</div>
+  <h1>Races</h1>
+  <p class="subtitle" id="subtitle">Loading…</p>
 
-  <div id="content" hidden>
-    <section>
-      <h2>Race Paces Over Time</h2>
-      <p class="desc">Each point is a race · faster is up · PRs labeled · casual efforts hollow</p>
-      <div class="chart-wrap">
-        <div id="chart-races" style="width:100%;height:100%"></div>
-      </div>
-    </section>
-
-    <section>
-      <h2>Personal Bests</h2>
-      <p class="desc">Fastest finish per distance</p>
-      <div class="scroll">
-        <table>
-          <thead>
-            <tr>
-              <th>Distance</th>
-              <th class="r">Time</th>
-              <th class="r">Pace</th>
-              <th>Date</th>
-              <th>Race</th>
-              <th class="r">Attempts</th>
-            </tr>
-          </thead>
-          <tbody id="body-pbs"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section>
-      <h2>All Races</h2>
-      <p class="desc">Newest first · PRs flagged as of the day they were run · click a row to open on Strava</p>
-      <div class="scroll">
-        <table>
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Distance</th>
-              <th>Race</th>
-              <th class="r">Time</th>
-              <th class="r">Pace</th>
-              <th>Effort</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="body-races"></tbody>
-        </table>
-      </div>
-    </section>
+  <div class="mode-tabs" id="primary-tabs">
+    <button class="mode-tab dist-tab active" data-tab="overview">Overview</button>
+    <button class="mode-tab dist-tab" data-tab="5k">5K</button>
+    <button class="mode-tab dist-tab" data-tab="10k">10K</button>
+    <button class="mode-tab dist-tab" data-tab="half">Half</button>
+    <button class="mode-tab dist-tab" data-tab="marathon">Marathon</button>
+    <button class="mode-tab dist-tab" data-tab="50k">50K</button>
+    <button class="mode-tab dist-tab" data-tab="other">Other</button>
   </div>
+
+  <div id="tab-overview" class="tab-panel">
+    <div id="overview-body" hidden>
+      <section>
+        <h2>Race Paces Over Time</h2>
+        <p class="desc">Each point is a race · faster is up · PRs labeled · casual efforts hollow</p>
+        <div class="chart-wrap">
+          <div id="chart-races" style="width:100%;height:100%"></div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Personal Bests</h2>
+        <p class="desc">Fastest finish per distance</p>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Distance</th>
+                <th class="r">Time</th>
+                <th class="r">Pace</th>
+                <th>Date</th>
+                <th>Race</th>
+                <th class="r">Attempts</th>
+              </tr>
+            </thead>
+            <tbody id="body-pbs"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>All Races</h2>
+        <p class="desc">Newest first · PRs flagged as of the day they were run · click a row to open on Strava</p>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Distance</th>
+                <th>Race</th>
+                <th class="r">Time</th>
+                <th class="r">Pace</th>
+                <th>Effort</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="body-races"></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <div id="tab-5k" class="tab-panel dist-view" hidden></div>
+  <div id="tab-10k" class="tab-panel dist-view" hidden></div>
+  <div id="tab-half" class="tab-panel dist-view" hidden></div>
+  <div id="tab-marathon" class="tab-panel dist-view" hidden></div>
+  <div id="tab-50k" class="tab-panel dist-view" hidden></div>
+  <div id="tab-other" class="tab-panel dist-view" hidden></div>
 </main>
 
 <script>
+  // -----------------------------------------------------------------------
+  // Shared helpers (used by both Overview and the distance tabs)
+  // -----------------------------------------------------------------------
+
+  function td(val, cls = 'r', title = '') {
+    if (val == null) return `<td class="dash">—</td>`;
+    const titleAttr = title ? ` title="${title}"` : '';
+    return `<td class="${cls}"${titleAttr}>${val}</td>`;
+  }
+
+  // -----------------------------------------------------------------------
+  // Tab routing
+  // -----------------------------------------------------------------------
+
+  const TABS = ['overview', '5k', '10k', 'half', 'marathon', '50k', 'other'];
+  const BUCKET_API   = { '5k': '5K', '10k': '10K', half: 'Half', marathon: 'Marathon', '50k': '50K', other: 'Other' };
+  const BUCKET_LABEL = BUCKET_API; // display label matches the API bucket name verbatim
+
+  let racesData = null;       // rows from /api/races, fetched once at page load
+  let overviewInited = false;
+  const distCache  = new Map(); // tabKey -> { builds, weeks }
+  const distInited = new Set();
+
+  function activateTab(key) {
+    if (!TABS.includes(key)) key = 'overview';
+    document.querySelectorAll('.dist-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === key));
+    document.querySelectorAll('.tab-panel').forEach(el => { el.hidden = el.id !== `tab-${key}`; });
+    history.replaceState(null, '', `#${key}`);
+
+    if (key === 'overview') {
+      if (!overviewInited && racesData) initOverview(racesData);
+    } else if (!distInited.has(key)) {
+      distInited.add(key);
+      loadDistanceTab(key);
+    }
+  }
+
+  document.querySelectorAll('.dist-tab').forEach(btn => {
+    btn.addEventListener('click', () => activateTab(btn.dataset.tab));
+  });
+
+  // -----------------------------------------------------------------------
+  // Overview tab — ported from the previous races.html verbatim
+  // -----------------------------------------------------------------------
+
   // Canonical category order; index = fixed palette slot so colors never
   // depend on which categories happen to be present.
   const CATEGORIES = ['5K', '10K', '15K', '10M', 'half', '30K', 'marathon', '50K'];
@@ -91,11 +206,6 @@
     const m = Math.floor(dec);
     const s = String(Math.round((dec - m) * 60)).padStart(2, '0');
     return `${m}:${s}`;
-  }
-
-  function td(val, cls = 'r') {
-    if (val == null) return `<td class="dash">—</td>`;
-    return `<td class="${cls}">${val}</td>`;
   }
 
   function renderPbTable(rows) {
@@ -146,7 +256,7 @@
     });
   }
 
-  function renderChart(rows) {
+  function renderOverviewChart(rows) {
     const theme = chartTheme();
     const present = CATEGORIES.filter(c => rows.some(r => r.distance_category === c));
     if (rows.some(r => r.distance_category === 'other')) present.push('other');
@@ -235,30 +345,393 @@
     window.addEventListener('resize', () => chart.resize());
   }
 
-  async function load() {
-    const res = await fetch('/api/races');
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const rows = await res.json();
-
+  function initOverview(rows) {
+    overviewInited = true;
     if (rows.length === 0) {
-      document.getElementById('status').textContent =
-        'No races found — tag races in Strava or run a sync.';
+      document.getElementById('tab-overview').innerHTML =
+        '<p class="dist-empty">No races found — tag races in Strava or run a sync.</p>';
       return;
     }
-
-    const prs = rows.filter(r => r.is_pr).length;
-    document.getElementById('status').textContent =
-      `${rows.length} races · ${prs} PRs when run`;
-    document.getElementById('content').hidden = false;
-
-    renderChart(rows);
+    document.getElementById('overview-body').hidden = false;
+    renderOverviewChart(rows);
     renderPbTable(rows);
     renderRaceTable(rows);
   }
 
-  load().catch(err => {
-    document.getElementById('status').textContent = `Error: ${err.message}`;
-  });
+  // -----------------------------------------------------------------------
+  // Distance tabs — shared implementation, parameterized by bucket
+  // -----------------------------------------------------------------------
+
+  // seconds -> "+M:SS" (or "+H:MM:SS" past an hour); negative deltas get "-".
+  function fmtDelta(s) {
+    if (s == null) return null;
+    const sign = s < 0 ? '-' : '+';
+    const abs = Math.abs(s);
+    const h = Math.floor(abs / 3600);
+    const m = String(Math.floor((abs % 3600) / 60)).padStart(h ? 2 : 1, '0');
+    const sec = String(Math.round(abs % 60)).padStart(2, '0');
+    return h ? `${sign}${h}:${m}:${sec}` : `${sign}${m}:${sec}`;
+  }
+
+  // Chart end-label result: sub-hour finishes read as "M:SS" (5K/10K), else
+  // fmt.timeShort's "h:mm".
+  function fmtResult(s) {
+    if (s == null) return '';
+    if (s < 3600) {
+      const m = Math.floor(s / 60);
+      const sec = String(Math.round(s % 60)).padStart(2, '0');
+      return `${m}:${sec}`;
+    }
+    return fmt.timeShort(s);
+  }
+
+  function rowClass(isVirtual, isPR, isMarathon, finishTimeS) {
+    if (isVirtual) return 'virt';
+    if (isPR) return 'pr';
+    if (isMarathon && finishTimeS != null && finishTimeS < 10800) return 'sub3';
+    return '';
+  }
+
+  function renderDistanceTab(container, key, builds, weeks) {
+    const label = BUCKET_LABEL[key];
+    if (builds.length === 0) {
+      container.innerHTML = `<p class="dist-empty">No ${label} races yet.</p>`;
+      return;
+    }
+
+    const isMarathon = key === 'marathon';
+    const real = builds.filter(m => !fmt.isVirtual(m));
+    const virt = builds.filter(m => fmt.isVirtual(m));
+    const sortedReal = [...real].sort((a, b) => (a.finish_time_s ?? Infinity) - (b.finish_time_s ?? Infinity));
+    const sorted = [...sortedReal, ...virt];
+    const pr = sortedReal[0];
+    const latest = [...real].sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''))[0];
+    const buildWeeks = builds[0]?.build_weeks ?? 8;
+    const showChart = sortedReal.length >= 2;
+
+    const avgVals = real.map(m => m.build?.avg_mpw).filter(v => v != null);
+    const peakVals = real.map(m => m.build?.peak_week).filter(v => v != null);
+    const bestAvg = avgVals.length ? Math.max(...avgVals) : null;
+    const bestPeak = peakVals.length ? Math.max(...peakVals) : null;
+    const sub3Count = real.filter(m => m.finish_time_s != null && m.finish_time_s < 10800).length;
+
+    const weeksByDate = new Map(weeks.map(w => [w.date, w.weeks]));
+    let globalMax = 0;
+    for (const w of weeks) {
+      for (const wk of w.weeks ?? []) {
+        if (wk.offset >= -buildWeeks && wk.offset <= 0 && wk.miles > globalMax) globalMax = wk.miles;
+      }
+    }
+
+    const statSub3 = isMarathon ? `
+      <div class="stat">
+        <div class="stat-label">Sub-3</div>
+        <div class="stat-value">${sub3Count}</div>
+      </div>` : '';
+
+    const chartHtml = showChart ? `
+      <div class="mode-tabs" data-role="chart-tabs">
+        <button class="mode-tab active" data-mode="fastest">Fastest</button>
+        <button class="mode-tab" data-mode="recent">Recent 3</button>
+        <button class="mode-tab" data-mode="focus">PR vs latest</button>
+      </div>
+      <div class="chart-wrap">
+        <div id="chart-${key}" style="width:100%;height:100%"></div>
+      </div>` : '';
+
+    container.innerHTML = `
+      <div class="stat-strip">
+        <div class="stat">
+          <div class="stat-label">PR</div>
+          <div class="stat-value">${pr ? fmt.time(pr.finish_time_s) : '—'}<span class="stat-sub">${pr ? fmt.shortName(pr.name ?? '', pr.date) : ''}</span></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Latest</div>
+          <div class="stat-value">${latest ? fmt.time(latest.finish_time_s) : '—'}<span class="stat-sub">${latest ? fmt.shortName(latest.name ?? '', latest.date) : ''}</span></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Races</div>
+          <div class="stat-value">${real.length}<span class="stat-sub">${virt.length ? `+${virt.length} virtual` : ''}</span></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Best avg</div>
+          <div class="stat-value">${bestAvg != null ? bestAvg.toFixed(1) : '—'}<span class="stat-sub">mpw</span></div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Peak week</div>
+          <div class="stat-value">${bestPeak != null ? bestPeak.toFixed(1) : '—'}<span class="stat-sub">mi</span></div>
+        </div>
+        ${statSub3}
+      </div>
+
+      ${chartHtml}
+
+      <div class="scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Race</th>
+              <th>Date</th>
+              <th class="r">Time</th>
+              <th class="r">Δ</th>
+              <th class="r">${buildWeeks}-wk shape</th>
+              <th class="r">Avg</th>
+              <th class="r">Peak</th>
+              <th class="r">Peak 3wk</th>
+              <th class="r">WOs</th>
+              <th class="r" title="5K-intensity work pace">5K</th>
+              <th class="r" title="Threshold / tempo pace">LT</th>
+              <th class="r" title="Marathon-pace work">MP</th>
+              <th class="r">LRs</th>
+              <th class="r">LR pace</th>
+              <th class="r">HR</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    `;
+
+    const tbody = container.querySelector('tbody');
+    tbody.innerHTML = sorted.map((r, i) => {
+      const isVirtual = fmt.isVirtual(r);
+      const isPR = !isVirtual && i === 0;
+      const rc = rowClass(isVirtual, isPR, isMarathon, r.finish_time_s);
+      const bt = r.build?.by_type ?? {};
+      const wko = bt.workout, lr = bt.long_run, easy = bt.easy;
+      const claims = r.build?.pace_claims ?? {};
+      const claim5k = claims['5k'], claimLt = claims.lt, claimMp = claims.mp;
+      const delta = !isPR && r.finish_time_s != null && pr?.finish_time_s != null
+        ? r.finish_time_s - pr.finish_time_s : null;
+
+      return `<tr class="${rc}">
+        ${td(r.name, '')}
+        ${td(r.date, 'dim')}
+        ${td(r.finish_time, 'r bold')}
+        ${isPR ? `<td class="r dim">—</td>` : td(fmtDelta(delta), 'r dim')}
+        <td class="r">${sparklineSVG(weeksByDate.get(r.date), buildWeeks, globalMax, isPR)}</td>
+        ${td(r.build?.avg_mpw?.toFixed(1))}
+        ${td(r.build?.peak_week?.toFixed(1))}
+        ${td(r.build?.peak_3wk_avg?.toFixed(1))}
+        ${td(wko?.runs)}
+        ${td(fmt.pace(claim5k?.pace_min_per_mile), 'r', claim5k ? `${claim5k.workouts} workout(s)` : '')}
+        ${td(fmt.pace(claimLt?.pace_min_per_mile), 'r', claimLt ? `${claimLt.workouts} workout(s)` : '')}
+        ${td(fmt.pace(claimMp?.pace_min_per_mile), 'r', claimMp ? `${claimMp.workouts} workout(s)` : '')}
+        ${td(lr?.runs)}
+        ${td(fmt.pace(lr?.avg_pace_min_per_mile))}
+        ${td(easy?.avg_hr != null ? Math.round(easy.avg_hr) : null)}
+      </tr>`;
+    }).join('');
+
+    if (!showChart) return;
+
+    // --- Chart: fastest / recent 3 / PR vs latest, adapted from index.html ---
+    const theme = chartTheme();
+    const offsets = Array.from({ length: buildWeeks + 1 }, (_, i) => i - buildWeeks);
+    const labels = offsets.map(o => o === 0 ? 'Race wk' : String(Math.abs(o)));
+
+    const rankMap = new Map(sortedReal.map((m, idx) => [m.date, idx]));
+    const byDateDesc = [...real].sort((a, b) => (b.date ?? '').localeCompare(a.date ?? ''));
+    const recent3Set = new Set(byDateDesc.slice(0, 3).map(m => m.date));
+    const recentRank = new Map(byDateDesc.slice(0, 3).map((m, i) => [m.date, i]));
+    const recentTopDate = latest?.date;
+
+    // Drawn series: everything for a small field, else the union of the 5
+    // fastest and 5 most recent real builds (always contains PR + latest).
+    const drawAll = builds.length <= 10;
+    const fastestSet = new Set(sortedReal.slice(0, 5).map(m => m.date));
+    const recentFive = new Set(byDateDesc.slice(0, 5).map(m => m.date));
+    const drawn = drawAll ? sorted : sortedReal.filter(m => fastestSet.has(m.date) || recentFive.has(m.date));
+
+    function makeSeries(mode) {
+      return drawn.map(m => {
+        const isVirtual = fmt.isVirtual(m);
+        const rank = isVirtual ? null : (rankMap.get(m.date) ?? 0);
+        const isPR = !isVirtual && rank === 0;
+        const inRecent3 = !isVirtual && recent3Set.has(m.date ?? '');
+        const isRecent1 = !isVirtual && m.date === recentTopDate;
+        const weekMap = Object.fromEntries((weeksByDate.get(m.date) ?? []).map(w => [w.offset, w.miles]));
+        const shortName = fmt.shortName(m.name ?? '', m.date);
+
+        let color, lineWidth, lineOpacity, highlighted;
+        // Natural color across the full spectrum — emphasis color so
+        // hovering a gray line reveals its identity, per index.html.
+        const naturalColor = isVirtual ? theme.muted : gradientColor(rank, real.length, theme.isDark);
+
+        if (mode === 'fastest') {
+          highlighted = !isVirtual && rank < 5;
+          color       = highlighted ? gradientColor(rank, 5, theme.isDark) : theme.baseline;
+          lineWidth   = isPR ? 3 : highlighted ? 2 : 1;
+          lineOpacity = highlighted || isVirtual ? 1 : 0.45;
+        } else if (mode === 'recent') {
+          highlighted = inRecent3;
+          const rRank = recentRank.get(m.date ?? '') ?? 0;
+          color       = highlighted ? recentColor(rRank, 3, theme.isDark) : isPR ? theme.accent : theme.baseline;
+          lineWidth   = highlighted ? 2.5 : isPR ? 1.5 : 1;
+          lineOpacity = highlighted ? 1 : isPR ? 0.65 : 0.35;
+        } else { // focus: PR vs most recent
+          highlighted = isPR || isRecent1;
+          color       = isPR ? theme.accent : isRecent1 ? theme.series[2] : theme.baseline;
+          lineWidth   = highlighted ? 3 : 1;
+          lineOpacity = highlighted ? 1 : 0.25;
+        }
+
+        const emphasisColor = highlighted ? color : naturalColor;
+
+        const prMark = {
+          markPoint: {
+            symbol: 'roundRect',
+            symbolSize: [20, 12],
+            symbolOffset: [0, -16],
+            itemStyle: { color: theme.accent, borderRadius: 2 },
+            data: [{ type: 'max', label: { show: true, formatter: 'PR', color: theme.surface, fontSize: 9, fontWeight: 700 } }],
+          },
+        };
+        const taper = {
+          markArea: {
+            silent: true,
+            itemStyle: { color: withAlpha(theme.muted, theme.isDark ? 0.12 : 0.07) },
+            label: { show: true, position: 'insideTopLeft', formatter: 'Taper', fontSize: 10, color: theme.muted },
+            data: [[{ xAxis: '2' }, { xAxis: 'Race wk' }]],
+          },
+        };
+
+        return {
+          name: shortName,
+          type: 'line',
+          color,
+          z: isPR ? 10 : highlighted ? 2 : 1,
+          data: offsets.map(o => weekMap[o] ?? 0),
+          connectNulls: false,
+          symbol: 'none',
+          lineStyle: { color, width: lineWidth, opacity: lineOpacity, type: isVirtual ? 'dashed' : 'solid' },
+          emphasis: { focus: 'series', lineStyle: { color: emphasisColor, width: lineWidth + 1.5, opacity: 1 } },
+          blur:     { lineStyle: { opacity: 0.12 } },
+          ...(highlighted ? { endLabel: { show: true, formatter: () => `${shortName} · ${fmtResult(m.finish_time_s)}`, fontSize: 11, color: theme.textSecondary, fontWeight: 600 } } : {}),
+          ...(isPR ? prMark : {}),
+          ...(isPR && isMarathon ? taper : {}),
+        };
+      });
+    }
+
+    const chart = echarts.init(container.querySelector(`#chart-${key}`));
+    chart.setOption({
+      animation: false,
+      grid: { top: 16, right: 140, bottom: 24, left: 44 },
+      labelLayout: { moveOverlap: 'shiftY' },
+      tooltip: {
+        trigger: 'axis',
+        axisPointer: { type: 'line', lineStyle: { color: theme.gridline, width: 1 } },
+        backgroundColor: theme.surface,
+        borderColor: theme.gridline,
+        textStyle: { fontSize: 12, color: theme.text },
+        formatter(params) {
+          const lbl   = params[0].axisValue;
+          const title = lbl === 'Race wk' ? 'Race week'
+                      : `${lbl} week${lbl === '1' ? '' : 's'} before race`;
+          const rows  = params
+            .filter(p => p.value > 0)
+            .sort((a, b) => b.value - a.value)
+            .map(p => `<div style="display:flex;justify-content:space-between;gap:1rem">
+                         <span>${p.marker}${p.seriesName}</span>
+                         <b>${p.value.toFixed(1)} mi</b>
+                       </div>`);
+          const visible = rows.slice(0, 8);
+          const extra   = rows.length - visible.length;
+          const more    = extra > 0
+            ? `<div style="color:${theme.muted};font-size:11px;margin-top:4px">… ${extra} more</div>`
+            : '';
+          return `<div style="font-weight:600;margin-bottom:6px;color:${theme.text}">${title}</div>${visible.join('')}${more}`;
+        },
+      },
+      xAxis: {
+        type: 'category',
+        data: labels,
+        axisLine: { lineStyle: { color: theme.gridline } },
+        axisTick: { show: false },
+        axisLabel: { fontSize: 11, color: theme.muted },
+      },
+      yAxis: {
+        type: 'value',
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { color: theme.gridline } },
+        axisLabel: { fontSize: 11, color: theme.muted },
+        min: val => Math.max(0, Math.floor((val.min - 5) / 5) * 5),
+      },
+      series: makeSeries('fastest'),
+    });
+    staggerEndLabels(chart);
+
+    container.querySelectorAll('[data-role="chart-tabs"] .mode-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        container.querySelectorAll('[data-role="chart-tabs"] .mode-tab').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        chart.setOption({ series: makeSeries(btn.dataset.mode) }, { replaceMerge: ['series'] });
+        staggerEndLabels(chart);
+      });
+    });
+
+    window.addEventListener('resize', () => { chart.resize(); staggerEndLabels(chart); });
+  }
+
+  async function loadDistanceTab(key) {
+    const container = document.getElementById(`tab-${key}`);
+    const label = BUCKET_LABEL[key];
+    container.innerHTML = `<p class="dist-empty">Loading…</p>`;
+
+    const cached = distCache.get(key);
+    if (cached) {
+      renderDistanceTab(container, key, cached.builds, cached.weeks);
+      return;
+    }
+
+    let builds, weeks;
+    try {
+      const [bRes, wRes] = await Promise.all([
+        fetch(`/api/distance-builds?bucket=${encodeURIComponent(BUCKET_API[key])}`),
+        fetch(`/api/distance-build-weeks?bucket=${encodeURIComponent(BUCKET_API[key])}`),
+      ]);
+      if (!bRes.ok || !wRes.ok) {
+        container.innerHTML = `<p class="dist-empty">Error loading ${label}: HTTP ${!bRes.ok ? bRes.status : wRes.status}</p>`;
+        distInited.delete(key);
+        return;
+      }
+      builds = await bRes.json();
+      weeks = await wRes.json();
+    } catch (err) {
+      container.innerHTML = `<p class="dist-empty">Error loading ${label}: ${err.message}</p>`;
+      distInited.delete(key);
+      return;
+    }
+
+    distCache.set(key, { builds, weeks });
+    renderDistanceTab(container, key, builds, weeks);
+  }
+
+  // -----------------------------------------------------------------------
+  // Boot
+  // -----------------------------------------------------------------------
+
+  activateTab((location.hash || '#overview').replace('#', ''));
+
+  fetch('/api/races')
+    .then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    })
+    .then(rows => {
+      racesData = rows;
+      const prs = rows.filter(r => r.is_pr).length;
+      document.getElementById('subtitle').textContent =
+        rows.length === 0
+          ? 'No races found — tag races in Strava or run a sync.'
+          : `${rows.length} races · ${prs} PRs when run`;
+      if (!document.getElementById('tab-overview').hidden && !overviewInited) initOverview(rows);
+    })
+    .catch(err => {
+      document.getElementById('subtitle').textContent = `Error: ${err.message}`;
+    });
 </script>
 </body>
 </html>

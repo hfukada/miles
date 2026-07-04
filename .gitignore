@@ -11,3 +11,4 @@ dist/
 *.png
 eval_results/
 evals.local.md
+roadmap/
