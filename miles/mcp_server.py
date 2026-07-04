@@ -9,7 +9,7 @@ from . import db
 from .builds import Build, RaceRef, detect_builds
 from .derive import ensure_derived
 from .format import fmt_time
-from .periods import Period, WeekAgg, _is_active, detect_periods
+from .periods import GAP_WEEKS_TO_SPLIT, Period, WeekAgg, _is_active, _sunday, detect_periods
 from .races import MARATHON_MAX_M, MARATHON_MIN_M, NOMINAL_METERS, classify_race_distance
 
 mcp = FastMCP("miles")
@@ -741,6 +741,227 @@ def get_training_periods(start_date: str | None = None) -> str:
         for p in periods
     ]
     return json.dumps({"periods": out_periods, "gaps": gaps})
+
+
+def _longest_inactive_run(weeks: list[WeekAgg]) -> tuple[int, int] | None:
+    """Longest run of consecutive inactive weeks as (start_index, length); None if none."""
+    best: tuple[int, int] | None = None
+    run_start = 0
+    run_len = 0
+    for i, week in enumerate(weeks):
+        if _is_active(week):
+            run_len = 0
+            continue
+        if run_len == 0:
+            run_start = i
+        run_len += 1
+        if best is None or run_len > best[1]:
+            best = (run_start, run_len)
+    return best
+
+
+def _months_between(start: date, end: date) -> list[str]:
+    """Inclusive 'YYYY-MM' strings from start's month through end's month."""
+    months: list[str] = []
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        months.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return months
+
+
+@mcp.tool()
+def get_consistency_report(months: int = 12) -> str:
+    """
+    The headline tool for "how consistent has my running been?" — streaks, gaps,
+    and ramp in volume over a trailing window (months x 30 days). For a sporadic
+    athlete this is the primary lens: lead with streaks/gaps/ramp here rather
+    than build language. get_training_periods and get_build_snapshot assume more
+    continuous training and describe preparation, not day-to-day consistency;
+    this tool doesn't attach races or builds — use get_training_periods for that.
+
+    Returns {"error": "No runs found."} if there are no runs in the window at all.
+    Otherwise, a JSON object:
+      last_run: {date, days_ago} — most recent run in the window.
+      current_streak_weeks: consecutive active weeks counting back from the
+        current (possibly partial) week. If the current week isn't active yet,
+        it's skipped rather than treated as a streak-breaker, and counting
+        starts from last week instead.
+      current_gap_weeks: present only when current_streak_weeks is 0 —
+        consecutive inactive weeks ending at last week.
+      longest_gap: {start, end, weeks} — longest run of consecutive inactive
+        weeks inside the window; null if the window has no inactive week.
+      rolling: last_4wk vs prior_4wk ({miles, runs}, last 28 vs prior 28 days),
+        plus ramp_pct (percent change in miles; null when prior_4wk has zero
+        miles, since percent change off zero is undefined rather than 0).
+        `note` is added only when the ramp is large — either ramp_pct > 30, or
+        prior_4wk was completely inactive (an unmeasurable but clearly large
+        ramp) — *and* the 8 weeks before the last-4wk window contain a gap of
+        3+ consecutive inactive weeks. The note is phrased descriptively
+        ("volume is ramping quickly off a break"); relay it as-is, don't turn
+        it into medical or injury-risk advice.
+      monthly: one entry per calendar month intersecting the window, ascending
+        — {month: 'YYYY-MM', runs, miles, longest_run_miles, active_weeks}.
+        active_weeks counts Monday-aligned weeks whose Monday falls in that
+        month (so a week can only ever count toward one month).
+      periods: detect_periods (periods.py) run over just this window's weeks,
+        fragments included — continuity only, no races/builds attached.
+
+    An active week clears periods.ACTIVE_WEEK_MIN_RUNS runs or
+    periods.ACTIVE_WEEK_MIN_MILES miles (periods._is_active).
+    """
+    conn = _conn()
+    effective_run_type = db.effective_run_type_sql()
+    type_clause, type_params = _run_type_filter()
+
+    today = date.today()
+    window_start = today - timedelta(days=months * 30)
+
+    last_row = conn.execute(f"""
+        SELECT DATE(start_date) AS date FROM activities
+        WHERE {type_clause} AND DATE(start_date) >= ?
+        ORDER BY start_date DESC LIMIT 1
+    """, type_params + [window_start.isoformat()]).fetchone()
+    if last_row is None:
+        return json.dumps({"error": "No runs found."})
+    last_run_date = date.fromisoformat(last_row["date"])
+
+    # Monday-aligned weekly aggregates, zero-filled from the window start's week
+    # through the current week (not just through the last activity), so a
+    # trailing gap up to today shows up rather than being silently dropped.
+    week_rows = conn.execute(f"""
+        SELECT
+            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
+            COUNT(*) AS runs,
+            SUM(CASE WHEN {effective_run_type} = 'workout' THEN 1 ELSE 0 END) AS workouts
+        FROM activities
+        WHERE {type_clause} AND DATE(start_date) >= ?
+        GROUP BY monday
+        ORDER BY monday
+    """, type_params + [window_start.isoformat()]).fetchall()
+    by_monday = {r["monday"]: r for r in week_rows}
+
+    first_monday = window_start - timedelta(days=window_start.weekday())
+    this_week_monday = today - timedelta(days=today.weekday())
+    weeks: list[WeekAgg] = []
+    d = first_monday
+    while d <= this_week_monday:
+        iso = d.isoformat()
+        r = by_monday.get(iso)
+        weeks.append({
+            "monday": iso,
+            "miles": (r["miles"] or 0.0) if r else 0.0,
+            "runs": (r["runs"] or 0) if r else 0,
+            "workouts": (r["workouts"] or 0) if r else 0,
+        })
+        d += timedelta(weeks=1)
+
+    # Streak: count back from the current week; if it's not active yet, skip
+    # it (not a streak-breaker) and start counting from last week instead.
+    idx = len(weeks) - 1
+    if not _is_active(weeks[idx]):
+        idx -= 1
+    streak = 0
+    j = idx
+    while j >= 0 and _is_active(weeks[j]):
+        streak += 1
+        j -= 1
+
+    result: dict[str, object] = {
+        "last_run": {"date": last_run_date.isoformat(), "days_ago": (today - last_run_date).days},
+        "current_streak_weeks": streak,
+    }
+    if streak == 0:
+        gap = 0
+        k = idx
+        while k >= 0 and not _is_active(weeks[k]):
+            gap += 1
+            k -= 1
+        result["current_gap_weeks"] = gap
+
+    inactive_run = _longest_inactive_run(weeks)
+    if inactive_run is None:
+        result["longest_gap"] = None
+    else:
+        start_i, length = inactive_run
+        result["longest_gap"] = {
+            "start": weeks[start_i]["monday"],
+            "end": _sunday(weeks[start_i + length - 1]["monday"]),
+            "weeks": length,
+        }
+
+    # Rolling 4-week ramp: last 28 calendar days vs. the prior 28.
+    last_start = today - timedelta(days=27)
+    prior_end = last_start - timedelta(days=1)
+    prior_start = prior_end - timedelta(days=27)
+
+    def _range_stats(start: date, end: date) -> tuple[float, int]:
+        row = conn.execute(f"""
+            SELECT ROUND(SUM(distance_m) / 1609.34, 2) AS miles, COUNT(*) AS runs
+            FROM activities
+            WHERE {type_clause} AND DATE(start_date) >= ? AND DATE(start_date) <= ?
+        """, type_params + [start.isoformat(), end.isoformat()]).fetchone()
+        return (row["miles"] or 0.0), (row["runs"] or 0)
+
+    last_miles, last_runs = _range_stats(last_start, today)
+    prior_miles, prior_runs = _range_stats(prior_start, prior_end)
+    ramp_pct = None if prior_miles == 0 else round((last_miles - prior_miles) / prior_miles * 100, 1)
+
+    rolling: dict[str, object] = {
+        "last_4wk": {"miles": last_miles, "runs": last_runs},
+        "prior_4wk": {"miles": prior_miles, "runs": prior_runs},
+        "ramp_pct": ramp_pct,
+    }
+    # A completely inactive prior_4wk is an unmeasurable (undefined) ramp_pct,
+    # not a non-ramp -- treat it as large for the note, same as ramp_pct > 30.
+    is_large_ramp = (ramp_pct is not None and ramp_pct > 30) or (prior_miles == 0 and last_miles > 0)
+    if is_large_ramp:
+        lookback_end = last_start - timedelta(days=last_start.weekday())
+        lookback_start = lookback_end - timedelta(weeks=8)
+        lookback_weeks = [
+            w for w in weeks
+            if lookback_start.isoformat() <= w["monday"] < lookback_end.isoformat()
+        ]
+        lookback_gap = _longest_inactive_run(lookback_weeks)
+        if lookback_gap is not None and lookback_gap[1] >= GAP_WEEKS_TO_SPLIT:
+            rolling["note"] = "Volume is ramping quickly off a break in training."
+    result["rolling"] = rolling
+
+    month_rows = conn.execute(f"""
+        SELECT strftime('%Y-%m', start_date) AS month,
+               COUNT(*) AS runs,
+               ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
+               ROUND(MAX(distance_m) / 1609.34, 2) AS longest_run_miles
+        FROM activities
+        WHERE {type_clause} AND DATE(start_date) >= ?
+        GROUP BY month
+        ORDER BY month
+    """, type_params + [window_start.isoformat()]).fetchall()
+    month_data = {r["month"]: r for r in month_rows}
+
+    active_weeks_by_month: dict[str, int] = {}
+    for w in weeks:
+        if _is_active(w):
+            month = w["monday"][:7]
+            active_weeks_by_month[month] = active_weeks_by_month.get(month, 0) + 1
+
+    monthly: list[dict[str, object]] = []
+    for month in _months_between(window_start, today):
+        r = month_data.get(month)
+        monthly.append({
+            "month": month,
+            "runs": r["runs"] if r else 0,
+            "miles": (r["miles"] or 0.0) if r else 0.0,
+            "longest_run_miles": (r["longest_run_miles"] or 0.0) if r else 0.0,
+            "active_weeks": active_weeks_by_month.get(month, 0),
+        })
+    result["monthly"] = monthly
+
+    window_periods, _window_gaps = detect_periods(weeks)
+    result["periods"] = window_periods
+
+    return json.dumps(_fmt_paces(result))
 
 
 @mcp.tool()
