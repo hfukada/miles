@@ -37,6 +37,7 @@ RACE_DISTANCE_TOKENS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)\b10 ?miler?\b"), "10M"),
     (re.compile(r"(?i)\bhalf\b"), "half"),
     (re.compile(r"(?i)\bmarathon\b"), "marathon"),
+    (re.compile(r"(?i)\b50k\b"), "50K"),
 ]
 
 # A name that says "long run" is the athlete's own word for it; the 70-minute

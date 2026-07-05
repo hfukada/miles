@@ -18,7 +18,7 @@ RACE_BUCKETS: list[tuple[str, float, float]] = [
     ("half", 20700, 22300),
     ("30K", 29300, 31500),
     ("marathon", 42000, 43500),
-    ("50K", 49000, 52000),
+    ("50K", 45000, 52000),
 ]
 
 NOMINAL_METERS: dict[str, float] = {
