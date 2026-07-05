@@ -5,9 +5,9 @@ proposes a type for those rows only — an explicit tag always wins (see
 db.EFFECTIVE_RUN_TYPE_SQL). Pure and deterministic; fully recomputed each sync.
 
 Rules in priority order (first match wins): workout (name), race (distance bucket +
-agreeing name), long_run (long vs. current volume AND above the athlete's learned
-floor). Trailing windows are relative to each activity's own date, not today, so old
-rows are judged against the norms of their era.
+agreeing name), long_run (name, or long vs. current volume AND above the athlete's
+learned floor). Trailing windows are relative to each activity's own date, not today,
+so old rows are judged against the norms of their era.
 """
 
 import re
@@ -39,12 +39,20 @@ RACE_DISTANCE_TOKENS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(?i)\bmarathon\b"), "marathon"),
 ]
 
+# A name that says "long run" is the athlete's own word for it; the 70-minute
+# duration gate still applies (screens out "Not long run"-style negations too).
+LONG_RUN_NAME_RE = re.compile(r"(?i)\blong\s*run\b")
+
 LONG_RUN_MIN_S = 70 * 60
 LONG_RUN_FACTOR = 1.4
 LONG_RUN_RECENT_DAYS = 90
 LONG_RUN_NORM_DAYS = 730
 LONG_RUN_MIN_TAGGED = 10
 LONG_RUN_P95_FRACTION = 0.7
+# Tagged long runs skew toward peak-phase distances, so their raw P25 overshoots
+# the athlete's true long-run floor; scale it down to admit early-build and taper
+# long runs.
+LONG_RUN_TAGGED_P25_SCALE = 0.9
 
 
 class ActivityForInference(TypedDict):
@@ -139,6 +147,10 @@ def infer_run_types(
             result[a["activity_id"]] = "race"
             continue
 
+        if moving_time_s is not None and moving_time_s >= LONG_RUN_MIN_S and LONG_RUN_NAME_RE.search(name):
+            result[a["activity_id"]] = "long_run"
+            continue
+
         if moving_time_s is not None and moving_time_s >= LONG_RUN_MIN_S and distance_m is not None:
             recent_window = window(all_ordinals, all_distances, ordv, LONG_RUN_RECENT_DAYS)
             if recent_window:
@@ -156,7 +168,7 @@ def infer_run_types(
                         if len(tagged_window) < LONG_RUN_MIN_TAGGED:
                             tagged_window = tagged_distances[: bisect_left(tagged_ordinals, ordv)]
                         if len(tagged_window) >= LONG_RUN_MIN_TAGGED:
-                            floor = _percentile(tagged_window, 25)
+                            floor = LONG_RUN_TAGGED_P25_SCALE * _percentile(tagged_window, 25)
                         else:
                             norm_window = window(all_ordinals, all_distances, ordv, LONG_RUN_NORM_DAYS)
                             floor = LONG_RUN_P95_FRACTION * _percentile(norm_window, 95) if norm_window else None

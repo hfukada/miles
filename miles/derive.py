@@ -39,7 +39,7 @@ _CONFIDENCE_VALUES = get_args(Confidence)
 
 # Bump whenever any classifier or threshold feeding a derived value changes, so
 # ensure_derived() knows stale rows need a full recompute.
-DERIVE_VERSION = "7"
+DERIVE_VERSION = "8"
 
 # A single intensity must hold at least this share of a session's work-lap moving
 # time to count as the session's dominant_intensity; below it the session is mixed.
