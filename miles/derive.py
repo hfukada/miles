@@ -19,7 +19,7 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from typing import cast, get_args
 
-from .classifier import classify_laps
+from .classifier import LAP_MIN_DISTANCE_M, LAP_MIN_MOVING_TIME_S, classify_laps
 from .db import effective_run_type_sql
 from .fitness import (
     EFFORT_RACED_MAX,
@@ -39,7 +39,7 @@ _CONFIDENCE_VALUES = get_args(Confidence)
 
 # Bump whenever any classifier or threshold feeding a derived value changes, so
 # ensure_derived() knows stale rows need a full recompute.
-DERIVE_VERSION = "6"
+DERIVE_VERSION = "7"
 
 # A single intensity must hold at least this share of a session's work-lap moving
 # time to count as the session's dominant_intensity; below it the session is mixed.
@@ -50,10 +50,6 @@ DOMINANT_INTENSITY_MIN_SHARE = 0.60
 _CHECKPOINT_PACE_COL: dict[str, str] = {
     "5K": "pace_5k", "10K": "pace_10k", "half": "pace_half", "marathon": "pace_marathon",
 }
-
-# Laps below this floor are never classified (too short/slow to read a speed signal).
-LAP_MIN_DISTANCE_M = 200
-LAP_MIN_MOVING_TIME_S = 45
 
 
 def _type_laps(conn: sqlite3.Connection) -> int:
@@ -72,28 +68,23 @@ def _type_laps(conn: sqlite3.Connection) -> int:
             FROM laps WHERE activity_id = ? ORDER BY lap_index
         """, [activity_id]).fetchall()
 
-        classifiable = [
-            i for i, lap in enumerate(laps)
-            if lap["distance_m"] is not None and float(lap["distance_m"]) >= LAP_MIN_DISTANCE_M
-            and lap["moving_time_s"] is not None and int(lap["moving_time_s"]) >= LAP_MIN_MOVING_TIME_S
-            and lap["average_speed_mps"] is not None and float(lap["average_speed_mps"]) > 0
-        ]
-        if not classifiable:
-            continue
-
-        sub_types = classify_laps(
-            speeds=[float(laps[i]["average_speed_mps"]) for i in classifiable],
-            distances_m=[float(laps[i]["distance_m"]) for i in classifiable],
+        # classify_laps sees every lap (not just floor-passing ones) so it can
+        # backfill sub-floor between-rep rests; missing distance/time/speed values
+        # coerce to 0.0, which never passes the floor, matching prior behavior.
+        types = classify_laps(
+            speeds=[float(lap["average_speed_mps"] or 0.0) for lap in laps],
+            distances_m=[float(lap["distance_m"] or 0.0) for lap in laps],
             heartrates=[
-                float(laps[i]["average_heartrate"]) if laps[i]["average_heartrate"] is not None else None
-                for i in classifiable
+                float(lap["average_heartrate"]) if lap["average_heartrate"] is not None else None
+                for lap in laps
             ],
+            moving_times_s=[float(lap["moving_time_s"] or 0.0) for lap in laps],
         )
         conn.executemany(
             "UPDATE laps SET lap_type = ? WHERE lap_id = ?",
-            [(t, int(laps[i]["lap_id"])) for i, t in zip(classifiable, sub_types)],
+            [(t, int(lap["lap_id"])) for lap, t in zip(laps, types) if t is not None],
         )
-        typed += len(classifiable)
+        typed += sum(1 for t in types if t is not None)
 
     return typed
 

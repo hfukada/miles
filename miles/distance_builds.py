@@ -94,6 +94,8 @@ def get_distance_builds(bucket: Bucket) -> list[DistanceBuildRow]:
     conn = _conn()
     tc, tp = _type_clause()
 
+    effective_run_type = db.effective_run_type_sql()
+
     out: list[DistanceBuildRow] = []
     for race in race_rows(conn, distance_category=_DISTANCE_CATEGORY[bucket]):
         race_date = cast(str, race["date"])
@@ -101,7 +103,7 @@ def get_distance_builds(bucket: Bucket) -> list[DistanceBuildRow]:
 
         by_type_rows = conn.execute(f"""
             SELECT
-                run_type,
+                {effective_run_type} AS run_type,
                 COUNT(*)                                     AS runs,
                 ROUND(SUM(distance_m) / 1609.34, 2)         AS total_miles,
                 ROUND(AVG(distance_m) / 1609.34, 2)         AS avg_miles,
@@ -113,8 +115,8 @@ def get_distance_builds(bucket: Bucket) -> list[DistanceBuildRow]:
             WHERE {tc}
               AND DATE(start_date) >= ?
               AND DATE(start_date) < ?
-            GROUP BY run_type
-            ORDER BY run_type
+            GROUP BY {effective_run_type}
+            ORDER BY 1
         """, tp + [build_start_s, race_date]).fetchall()
 
         totals = conn.execute(f"""

@@ -143,6 +143,7 @@ def get_marathons(build_weeks: int = _BUILD_WEEKS) -> list[MarathonRow]:
     """
     conn = _conn()
     tc, tp = _type_clause()
+    effective_run_type = db.effective_run_type_sql()
 
     races = conn.execute("""
         SELECT
@@ -162,13 +163,11 @@ def get_marathons(build_weeks: int = _BUILD_WEEKS) -> list[MarathonRow]:
     out: list[MarathonRow] = []
     for race in races:
         race_date: str = race["race_date"]
-        build_start: str = conn.execute(
-            "SELECT DATE(?, ?)", (race_date, f"-{build_weeks * 7} days")
-        ).fetchone()[0]
+        build_start: str = _distance_build_start(race_date, build_weeks).isoformat()
 
         by_type_rows = conn.execute(f"""
             SELECT
-                run_type,
+                {effective_run_type} AS run_type,
                 COUNT(*)                                     AS runs,
                 ROUND(SUM(distance_m) / 1609.34, 2)         AS total_miles,
                 ROUND(AVG(distance_m) / 1609.34, 2)         AS avg_miles,
@@ -180,8 +179,8 @@ def get_marathons(build_weeks: int = _BUILD_WEEKS) -> list[MarathonRow]:
             WHERE {tc}
               AND DATE(start_date) >= ?
               AND DATE(start_date) < ?
-            GROUP BY run_type
-            ORDER BY run_type
+            GROUP BY {effective_run_type}
+            ORDER BY 1
         """, tp + [build_start, race_date]).fetchall()
 
         totals = conn.execute(f"""
@@ -685,6 +684,7 @@ class WorkoutGroupSession(TypedDict):
     distance_mi: float | None
     pace_min_per_mile: float | None
     avg_hr: int | None
+    temp_f: int | None
     work: WorkAgg | None
 
 
@@ -710,9 +710,11 @@ def get_build_workout_groups(race_date: str) -> list[WorkoutGroup]:
     session's `work` aggregates its lap_type='work' laps (distance-weighted
     pace, artifact-filtered); null when the activity has no qualifying work
     laps. Long-run sessions always have work=null — their own totals suffice.
-    Labeled groups sorted by session count descending, then Long runs, then
-    Other workouts; sessions within a group are date-ascending. Empty groups
-    are omitted. 404s only for a malformed date or no matching race.
+    `temp_f` is the session's average temperature (weather.temp_c_avg,
+    converted to Fahrenheit and rounded); null when no weather row was synced
+    for the activity. Labeled groups sorted by session count descending, then
+    Long runs, then Other workouts; sessions within a group are date-ascending.
+    Empty groups are omitted. 404s only for a malformed date or no matching race.
     """
     try:
         date.fromisoformat(race_date)
@@ -727,7 +729,7 @@ def get_build_workout_groups(race_date: str) -> list[WorkoutGroup]:
     effective_run_type = db.effective_run_type_sql()
     day_rows = conn.execute(f"""
         SELECT
-            activity_id AS id,
+            activities.activity_id AS id,
             DATE(start_date) AS date,
             name,
             workout_label,
@@ -736,8 +738,10 @@ def get_build_workout_groups(race_date: str) -> list[WorkoutGroup]:
             CASE WHEN average_speed_mps > 0
                  THEN ROUND(26.8224 / average_speed_mps, 2)
                  ELSE NULL END AS pace_min_per_mile,
-            ROUND(average_heartrate) AS avg_hr
+            ROUND(average_heartrate) AS avg_hr,
+            ROUND(weather.temp_c_avg * 9.0 / 5 + 32) AS temp_f
         FROM activities
+        LEFT JOIN weather ON weather.activity_id = activities.activity_id
         WHERE {tc}
           AND DATE(start_date) >= ? AND DATE(start_date) <= ?
           AND {effective_run_type} IN ('workout', 'long_run')
@@ -783,6 +787,7 @@ def get_build_workout_groups(race_date: str) -> list[WorkoutGroup]:
             distance_mi=r["distance_mi"],
             pace_min_per_mile=r["pace_min_per_mile"],
             avg_hr=int(r["avg_hr"]) if r["avg_hr"] is not None else None,
+            temp_f=int(r["temp_f"]) if r["temp_f"] is not None else None,
             work=work_by_id.get(aid) if r["run_type"] == "workout" else None,
         )
 

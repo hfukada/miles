@@ -25,6 +25,24 @@ def classify_workout(name: str) -> str | None:
 
 LapType = Literal["warmup", "work", "recovery", "float", "cooldown", "steady"]
 
+# Below this per-lap floor, pace/HR are too noisy to run the work-block algorithm
+# on directly (GPS blips, button-mash laps). classify_laps still recovers a type
+# for these when their neighbors show they're genuine between-rep rests.
+LAP_MIN_DISTANCE_M = 200
+LAP_MIN_MOVING_TIME_S = 45
+
+# Types that mark a lap as belonging to a detected work block (as opposed to
+# warmup/cooldown outside it, or "steady" when no block was detected at all).
+_BLOCK_TYPES = {"work", "recovery", "float"}
+
+
+def _is_classifiable(distance_m: float, moving_time_s: float, speed_mps: float) -> bool:
+    return (
+        distance_m >= LAP_MIN_DISTANCE_M
+        and moving_time_s >= LAP_MIN_MOVING_TIME_S
+        and speed_mps > 0
+    )
+
 
 def _median(vals: list[float]) -> float:
     s = sorted(vals)
@@ -58,13 +76,14 @@ def _gap_split(
     return None
 
 
-def classify_laps(
+def _classify_block(
     speeds: list[float],
     distances_m: list[float],
     heartrates: list[float | None],
 ) -> list[LapType]:
     """
-    Classify each lap of a session as warmup / work / recovery / float / cooldown.
+    Classify each floor-passing lap of a session as warmup / work / recovery /
+    float / cooldown.
 
     Positional "work block" approach: warmup and cooldown are defined by where they
     sit relative to the fast laps, not by pace — so warmup miles are separated from
@@ -136,4 +155,55 @@ def classify_laps(
     rec_hrs = [h for i in range(n) if types[i] == "recovery" and (h := heartrates[i]) is not None]
     if work_hrs and rec_hrs and _median(rec_hrs) > _median(work_hrs) - 12:
         types = ["float" if t == "recovery" else t for t in types]
+    return types
+
+
+def classify_laps(
+    speeds: list[float],
+    distances_m: list[float],
+    heartrates: list[float | None],
+    moving_times_s: list[float],
+) -> list[LapType | None]:
+    """
+    Classify every lap of a session, including those below the classification
+    floor (LAP_MIN_DISTANCE_M / LAP_MIN_MOVING_TIME_S).
+
+    Floor-passing laps run the full work-block algorithm (_classify_block). A
+    sub-floor lap is never fed into that algorithm directly — its pace/HR are too
+    noisy — but if it sits between two floor-passing laps that both landed inside
+    the work block (work/recovery/float), it's a genuine between-rep rest and gets
+    "recovery" too. Sub-floor laps outside any block (warmup fiddling, trailing
+    artifacts, or sessions with no block at all) stay unclassified (None).
+    """
+    n = len(speeds)
+    if n == 0:
+        return []
+
+    classifiable = [
+        i for i in range(n)
+        if _is_classifiable(distances_m[i], moving_times_s[i], speeds[i])
+    ]
+    if not classifiable:
+        return [None] * n
+
+    block_types = _classify_block(
+        [speeds[i] for i in classifiable],
+        [distances_m[i] for i in classifiable],
+        [heartrates[i] for i in classifiable],
+    )
+
+    types: list[LapType | None] = [None] * n
+    for i, t in zip(classifiable, block_types):
+        types[i] = t
+
+    classifiable_set = set(classifiable)
+    base_types = list(types)  # snapshot: neighbor lookups ignore laps backfilled below
+    for i in range(n):
+        if i in classifiable_set:
+            continue
+        prev_t = next((base_types[j] for j in range(i - 1, -1, -1) if base_types[j] is not None), None)
+        next_t = next((base_types[j] for j in range(i + 1, n) if base_types[j] is not None), None)
+        if prev_t in _BLOCK_TYPES and next_t in _BLOCK_TYPES:
+            types[i] = "recovery"
+
     return types
