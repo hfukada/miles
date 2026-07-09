@@ -73,6 +73,15 @@ The same command works in PowerShell on Windows. Note the endpoint has no
 authentication — expose it only on a network you trust (LAN, Tailscale, etc.),
 never the public internet.
 
+The endpoint ships with DNS-rebinding protection that accepts only localhost
+`Host` headers by default, so remote clients get `421 Invalid Host header`
+until you set `MILES_MCP_ALLOWED_HOSTS` on the server (comma-separated, `:*`
+matches any port) listing every name clients connect by:
+
+```bash
+MILES_MCP_ALLOWED_HOSTS='localhost:*,127.0.0.1:*,myhost.example.com:*'
+```
+
 ### 5. Try it
 
 ```

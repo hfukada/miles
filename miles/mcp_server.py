@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import statistics
 from datetime import date, datetime, timedelta
@@ -46,15 +47,24 @@ from .races import (
 # self-contained, so a server restart or dev reload never strands a client
 # holding a dead session id. Nothing here needs cross-request server state.
 #
-# Host-header validation is off: FastMCP's default allows only localhost
-# Hosts, so any remote hostname gets 421 "Invalid Host header". The rest of
-# the HTTP API doesn't validate Host either, and an allowlist would hardcode
-# deployment hostnames here.
-mcp = FastMCP(
-    "miles",
-    stateless_http=True,
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+# MILES_MCP_ALLOWED_HOSTS (comma-separated Host values, e.g.
+# "localhost:*,myhost.example.com:*"; ":*" matches any port) sets the
+# allowlist for the SDK's DNS-rebinding protection (Host-header check).
+# Unset, FastMCP's own default applies: localhost Hosts only — secure for
+# the local case, and any remote client gets 421 "Invalid Host header"
+# until the deployment's hostnames are listed here.
+_allowed_hosts = [
+    h.strip() for h in os.environ.get("MILES_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+_transport_security = (
+    TransportSecuritySettings(
+        allowed_hosts=_allowed_hosts,
+        allowed_origins=[f"{scheme}://{h}" for h in _allowed_hosts for scheme in ("http", "https")],
+    )
+    if _allowed_hosts
+    else None
 )
+mcp = FastMCP("miles", stateless_http=True, transport_security=_transport_security)
 
 RUN_TYPES = ("Run", "TrailRun", "VirtualRun")
 
