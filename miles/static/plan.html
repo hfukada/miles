@@ -6,7 +6,7 @@
   <title>Miles · Plan</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏃</text></svg>">
   <link rel="stylesheet" href="/theme.css">
-  <script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous"></script>
   <style>
     .plan-view h1 {
       font-size: 1.25rem;
@@ -139,11 +139,14 @@
       transform: translateY(-1px);
     }
 
-    /* Calendar — one row per plan week, Monday through Sunday columns. */
-    .plan-view .cal { border: 1px solid var(--gridline); border-radius: 8px; overflow: hidden; }
+    /* Calendar — one row per plan week, Monday through Sunday columns.
+       overflow-x + min-width keep the grid legible on narrow viewports:
+       it scrolls sideways rather than crushing 8 columns into slivers. */
+    .plan-view .cal { border: 1px solid var(--gridline); border-radius: 8px; overflow-x: auto; overflow-y: hidden; }
     .plan-view .cal-header, .plan-view .cal-row {
       display: grid;
       grid-template-columns: 112px repeat(7, minmax(0, 1fr));
+      min-width: 720px;
     }
     .plan-view .cal-header .cal-hcell {
       font-size: 0.625rem;
@@ -612,6 +615,11 @@
 
   const PLAN_TABS = ['today', 'overall'];
 
+  // ECharts measures its container at init, and every Overall chart is built
+  // while #tab-overall is hidden (zero-size) — so each instance registers
+  // here and gets re-measured whenever the tab is shown.
+  const OVERALL_CHARTS = [];
+
   // Every Overall-section render function inserts here — #tab-overall when
   // tabs exist, #root directly when they don't (completed-plan retrospective,
   // no Today to tab away from).
@@ -636,6 +644,7 @@
     if (!PLAN_TABS.includes(key)) key = 'today';
     document.querySelectorAll('#plan-tabs .mode-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === key));
     document.querySelectorAll('.tab-panel').forEach(el => { el.hidden = el.id !== `tab-${key}`; });
+    if (key === 'overall') OVERALL_CHARTS.forEach(c => c.resize());
     history.replaceState(null, '', `#${key}`);
   }
 
@@ -675,7 +684,9 @@
     const runs = PLAN_DATA.actualByDate.get(dateStr) ?? [];
     const logs = PLAN_DATA.logByDate.get(dateStr) ?? [];
     if (!day && !runs.length && !logs.length) return; // nothing to show for this date
-    document.body.insertAdjacentHTML('beforeend', dayPopoverHTML(dateStr, day, runs, logs));
+    // Must land inside main.plan-view — every popover style is scoped under
+    // it, and a body-level insert renders as unstyled text at the page bottom.
+    document.querySelector('main.plan-view').insertAdjacentHTML('beforeend', dayPopoverHTML(dateStr, day, runs, logs));
     const backdrop = document.getElementById('day-popover-backdrop');
     function close() {
       backdrop.remove();
@@ -922,6 +933,7 @@
     const markArea = hasFlags ? { silent: true, data: flagMarkAreas(flags) } : undefined;
 
     const chart = echarts.init(document.getElementById('chart-weekly'));
+    OVERALL_CHARTS.push(chart);
     chart.setOption({
       animation: false,
       grid: { top: 24, right: 24, bottom: 32, left: 48 },
@@ -1199,9 +1211,11 @@
 
     const paceChart = echarts.init(document.getElementById('chart-easy-pace'));
     paceChart.setOption(baseOption('Easy pace', paceData, { inverse: true, axisLabel: { fontSize: 10, color: theme.muted, formatter: fmt.pace } }));
+    OVERALL_CHARTS.push(paceChart);
 
     const hrChart = echarts.init(document.getElementById('chart-easy-hr'));
     hrChart.setOption(baseOption('Easy HR', hrData, {}));
+    OVERALL_CHARTS.push(hrChart);
 
     window.addEventListener('resize', () => { paceChart.resize(); hrChart.resize(); });
   }
@@ -1250,7 +1264,20 @@
     const rangeStart = weeks[0];
     const rangeEnd = addDays(weeks[weeks.length - 1], 6);
 
+    // The invisible band-base bar anchors the value axis at 0, which squashes
+    // 6–7 min/mi paces into a sliver — pin the axis to the data extent
+    // (half-minute snapped) instead.
+    const paceVals = [
+      ...withBand.flatMap(w => [w.pace_lo, w.pace_hi]),
+      ...dotData.map(d => d.value[1]),
+      ...checkpointData.map(c => c[1]),
+    ];
+    const paceExtent = paceVals.length
+      ? { min: Math.floor((Math.min(...paceVals) - 0.25) * 2) / 2, max: Math.ceil((Math.max(...paceVals) + 0.25) * 2) / 2 }
+      : {};
+
     const chart = echarts.init(document.getElementById('chart-workouts'));
+    OVERALL_CHARTS.push(chart);
     chart.setOption({
       animation: false,
       grid: { top: 24, right: 24, bottom: 32, left: 48 },
@@ -1290,6 +1317,7 @@
         axisTick: { show: false },
         splitLine: { lineStyle: { color: theme.gridline } },
         axisLabel: { fontSize: 11, color: theme.muted, formatter: fmt.pace },
+        ...paceExtent,
       },
       series: [
         {

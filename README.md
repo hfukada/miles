@@ -59,6 +59,20 @@ MCP server is picked up automatically.
 (A `.mcp.json.example` is also included if you prefer project-scoped config checked in
 alongside the repo — copy it to `.mcp.json` and set `cwd` to this repo's absolute path.)
 
+#### Remote over HTTP
+
+`miles-api` also serves the same MCP tools over streamable HTTP at `/mcp` on its port.
+If the API runs on another machine (a home server, say), point Claude Code at it — no
+local clone, Python, or uv needed on the client:
+
+```bash
+claude mcp add --transport http --scope user miles http://<host>:8000/mcp
+```
+
+The same command works in PowerShell on Windows. Note the endpoint has no
+authentication — expose it only on a network you trust (LAN, Tailscale, etc.),
+never the public internet.
+
 ### 5. Try it
 
 ```

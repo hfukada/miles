@@ -21,7 +21,8 @@ uv run pyright      # type check
 Strava API → miles-sync → SQLite (data/activities.db)
                                ↓
               miles-mcp  (MCP server over stdio, Claude Code integration)
-              miles-api  (FastAPI on :8000 + vanilla JS UI: Races · Builds · Compare · Training · Years · Plan)
+              miles-api  (FastAPI on :8000 + vanilla JS UI: Races · Builds · Compare · Training · Years · Plan;
+                          also serves the MCP tools over streamable HTTP at /mcp — same process, stateless sessions)
 ```
 
 Key files:
@@ -87,6 +88,8 @@ Laps use the athlete's manual lap button or Garmin auto-lap (1-mile splits). Fil
 `miles/static/theme.css` is the token source (colors, chart palette, type, shared table/tab/nav classes) for every static page — new pages link it rather than redefining styles. `nav.js` injects the shared header and exposes `chartTheme()` for ECharts pages.
 
 ECharts chart container must be `<div>`, not `<canvas>` — ECharts manages its own canvas internally.
+
+ECharts loads from jsdelivr pinned to an exact version with an SRI integrity hash — keep version and hash in lockstep when upgrading (`openssl dgst -sha384 -binary echarts.min.js | openssl base64 -A` on the npm tarball's file), and update all six chart pages together. ECharts also measures its container at init: a chart built inside a `hidden` tab panel comes out zero-size, so register instances for a `resize()` when the panel is revealed (see plan.html's `OVERALL_CHARTS`).
 
 Each races.html distance tab's build chart has three modes (Fastest / Recent 3 / PR vs latest) toggling which builds are highlighted. Set `animation: false` on ECharts instances — draw animations cause screenshot artifacts.
 
