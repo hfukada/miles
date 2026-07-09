@@ -1,4 +1,5 @@
 import logging
+import os
 import sqlite3
 import click
 import subprocess as _subprocess
@@ -14,6 +15,8 @@ from typing_extensions import TypedDict
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import Response
+from starlette.types import Scope
 
 from . import db, plan
 from .build_paces import PaceClaim, pace_claims
@@ -1218,8 +1221,26 @@ app.include_router(plan_api_router)
 # MCP client follows.
 app.router.routes.extend(_mcp_app.routes)
 
-app.mount("/workbooks", StaticFiles(directory=str(_WORKBOOKS)), name="workbooks")
-app.mount("/", StaticFiles(directory=str(_STATIC), html=True), name="static")
+class _NoCacheStaticFiles(StaticFiles):
+    """Static pages are edited live (uvicorn reloads, browser refreshes) —
+    no-cache forces the browser to revalidate every file on every load
+    (cheap 304s locally) instead of heuristically serving stale copies,
+    which otherwise requires a hard reload to pick up UI changes."""
+
+    def file_response(
+        self,
+        full_path: str | os.PathLike[str],
+        stat_result: os.stat_result,
+        scope: Scope,
+        status_code: int = 200,
+    ) -> Response:
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/workbooks", _NoCacheStaticFiles(directory=str(_WORKBOOKS)), name="workbooks")
+app.mount("/", _NoCacheStaticFiles(directory=str(_STATIC), html=True), name="static")
 
 
 @click.command()
