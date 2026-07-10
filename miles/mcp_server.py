@@ -20,6 +20,7 @@ from .plan import (
     WeekInput,
     add_log_entry,
     commit_plan as _plan_commit_plan,
+    compute_week_mileage,
     current_version_for_week,
     delete_draft_days as _plan_delete_draft_days,
     delete_draft_weeks as _plan_delete_draft_weeks,
@@ -2018,16 +2019,23 @@ def _draft_state(conn: sqlite3.Connection, plan_id: int) -> dict[str, object]:
     commit_plan's global validation would reject right now), sanity warnings
     (see _sanity_warnings) computed over whatever weeks exist so far —
     tolerant of a partial draft, since _sanity_warnings already no-ops on an
-    empty or partially-unspecified week list — and sync freshness."""
+    empty or partially-unspecified week list — program-computed per-week
+    mileage consistency (see compute_week_mileage; its per-week messages are
+    also folded into warnings, advisory here — commit_plan is where an
+    inconsistent week is hard-rejected), and sync freshness."""
     bundle = _plan_get_draft(conn, plan_id)
     last_sync_at = db.get_last_sync_at(conn)
+    week_mileage = compute_week_mileage(bundle["weeks"], bundle["days"])
+    warnings = _sanity_warnings(conn, bundle["weeks"], date.today())
+    warnings.extend(cast(str, c["message"]) for c in week_mileage if not c["consistent"])
     return {
         "plan": bundle["plan"],
         "version": bundle["version"],
         "weeks": bundle["weeks"],
         "days": [_day_with_target(d) for d in bundle["days"]],
         "gaps": bundle["gaps"],
-        "warnings": _sanity_warnings(conn, bundle["weeks"], date.today()),
+        "week_mileage": week_mileage,
+        "warnings": warnings,
         "last_sync_at": last_sync_at,
         "days_stale": _days_stale(last_sync_at),
     }
@@ -2112,10 +2120,17 @@ def get_draft() -> str:
       would reject right now ("weeks 6-20 unauthored", "week of 2026-08-03
       has days but no week row", "weeks don't reach race week..."). Narrate
       these honestly rather than assuming a batch landed clean.
+    week_mileage: program-computed per-week day-mileage sum (day_miles_total,
+      days_missing_miles) against the authored target_miles/target_miles_hi
+      band, with a consistent flag and message — never hand-sum the days
+      yourself, read this. commit_plan hard-rejects any week where
+      consistent is false; this is the same check run early so you can catch
+      it before proposing a commit.
     warnings: advisory sanity checks (week-1 target vs. recent volume, peak
       week vs. all-time peak, sustained aggressive ramp — see commit_plan),
       computed over whatever weeks exist so far — never blocking, and never
       raised for a subset of weeks that simply hasn't been authored yet.
+      Also includes week_mileage's own inconsistency messages, advisory here.
     last_sync_at / days_stale: whole days since the last miles-sync (null if
       never synced). Stale means the pipeline hasn't seen recent training
       yet — missing data, not missing training — check this before
@@ -2156,9 +2171,10 @@ def set_draft_weeks(weeks: list[WeekInput]) -> str:
     the edit immediately (see derive_all) — matters most for a revision that
     touches an already-elapsed week.
 
-    Returns the full draft state (see get_draft) plus `written: {"weeks":
-    [...week_starts...]}` on success, or {"error": "..."} naming the
-    offending week/field — never a traceback.
+    Returns the full draft state (see get_draft, including week_mileage —
+    the program-computed day-mileage sum per week checked against this
+    week's band) plus `written: {"weeks": [...week_starts...]}` on success,
+    or {"error": "..."} naming the offending week/field — never a traceback.
     """
     conn = _conn()
     try:
@@ -2203,8 +2219,10 @@ def set_draft_days(days: list[DayInput]) -> str:
 
     Finishes by re-running the full derive pass (see derive_all).
 
-    Returns the full draft state (see get_draft) plus `written: {"days":
-    [[date, seq], ...]}` on success, or {"error": "..."} naming the
+    Returns the full draft state (see get_draft, including week_mileage —
+    the program-computed day-mileage sum per week checked against this
+    week's band, since editing days shifts that sum) plus `written:
+    {"days": [[date, seq], ...]}` on success, or {"error": "..."} naming the
     offending day/field — never a traceback.
     """
     conn = _conn()
@@ -2289,13 +2307,23 @@ def delete_draft_days(dates: list[str]) -> str:
 def commit_plan(note: str) -> str:
     """
     Commits the in-progress draft: runs full global validation (contiguous
-    Mondays, ends at the race week, every day falls in a committed week),
-    re-freezes every zone-anchored day target as of today (commit IS
-    "authoring" for the freeze rule, even for weeks authored earlier), stamps
-    committed_at, and flips the plan to status='active'. Requires a
-    non-empty `note` — the athlete-approval record; there is no commit
-    without one, and the plan is never live until the athlete has seen it
-    and said go.
+    Mondays, ends at the race week, every day falls in a committed week,
+    every week's authored mileage band agrees with the program-computed sum
+    of its mileage-slot days — see week_mileage below), re-freezes every
+    zone-anchored day target as of today (commit IS "authoring" for the
+    freeze rule, even for weeks authored earlier), stamps committed_at, and
+    flips the plan to status='active'. Requires a non-empty `note` — the
+    athlete-approval record; there is no commit without one, and the plan is
+    never live until the athlete has seen it and said go.
+
+    HARD-REJECTS (returns {"error": ...}, writes nothing) any week whose
+    authored days sum to something inconsistent with its target_miles/
+    target_miles_hi band, beyond WEEK_MILEAGE_TOLERANCE_MI — a week with
+    days missing a mileage figure (duration-only) is only rejected if its
+    partial sum already exceeds the ceiling. If rejected, don't hand-sum the
+    days yourself to find the mismatch — call get_draft and read its
+    week_mileage entries, then reconcile the day miles or the week band and
+    retry.
 
     For a revision (the plan already has a prior committed version): any
     week on or before the start of this week — already governing or already
@@ -2318,12 +2346,14 @@ def commit_plan(note: str) -> str:
     nothing until the next sync.
 
     Returns {"plan": ..., "version_n": ..., "week_count": ..., "weeks": [...],
-    "days": [...], "warnings": [...], "past_weeks_preserved": [...]} on
-    success, or {"error": "..."} naming the offending week/day/field/note —
-    never a traceback. warnings are the same advisory sanity checks (see
-    _sanity_warnings): week-1 target > 1.3x recent 4-week average; peak week
-    exceeds the athlete's all-time peak; 3+ consecutive weeks ramping
-    mileage >10%/week.
+    "days": [...], "week_mileage": [...], "warnings": [...],
+    "past_weeks_preserved": [...]} on success, or {"error": "..."} naming the
+    offending week/day/field/note — never a traceback. week_mileage confirms
+    the program-computed per-week day-mileage sum that just passed the hard
+    check above (see compute_week_mileage); warnings are the same advisory
+    sanity checks (see _sanity_warnings): week-1 target > 1.3x recent 4-week
+    average; peak week exceeds the athlete's all-time peak; 3+ consecutive
+    weeks ramping mileage >10%/week.
     """
     conn = _conn()
     try:
@@ -2365,6 +2395,7 @@ def commit_plan(note: str) -> str:
             "week_count": len(bundle["weeks"]),
             "weeks": bundle["weeks"],
             "days": [_day_with_target(d) for d in bundle["days"]],
+            "week_mileage": compute_week_mileage(bundle["weeks"], bundle["days"]),
             "warnings": _sanity_warnings(conn, bundle["weeks"], date.today()),
             "past_weeks_preserved": past_weeks_preserved,
         }

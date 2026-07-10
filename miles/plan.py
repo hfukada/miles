@@ -64,6 +64,12 @@ _DAY_DIFF_FIELDS: tuple[str, ...] = ("slot", "title", "target_miles", "target_js
 # timezone edges where Strava's local start_date lands a day off race_date.
 RACE_MATCH_WINDOW_DAYS = 1
 
+# Run slots contribute mileage; rest/strength never do.
+MILEAGE_SLOTS: frozenset[str] = frozenset({"easy", "workout", "long", "race"})
+# Tolerance (miles) absorbing per-day rounding when checking a week's authored
+# mileage band against the sum of its days — a real drift is far larger.
+WEEK_MILEAGE_TOLERANCE_MI = 0.5
+
 
 class PlanValidationError(Exception):
     """Raised for any plan/version/log validation failure. Messages name the
@@ -141,6 +147,18 @@ class DraftBundle(TypedDict):
     weeks: list[PlanWeekRow]
     days: list[PlanDayRow]
     gaps: list[str]
+
+
+class WeekMileageCheck(TypedDict):
+    """Program-computed day-mileage sum for one week vs. its authored band —
+    see compute_week_mileage."""
+    week_start: str
+    day_miles_total: float
+    days_missing_miles: int
+    target_miles: float | None
+    target_miles_hi: float | None
+    consistent: bool
+    message: str | None
 
 
 class WeekDiff(TypedDict):
@@ -1049,6 +1067,84 @@ def _compress_ranges(indices: list[int]) -> list[tuple[int, int]]:
     return ranges
 
 
+def _fmt_mi(miles: float) -> str:
+    """%g-style mileage for messages: strips a trailing .0 (40 not 40.0) but
+    keeps meaningful decimals (38.5)."""
+    return f"{miles:g}"
+
+
+def compute_week_mileage(weeks: list[PlanWeekRow], days: list[PlanDayRow]) -> list[WeekMileageCheck]:
+    """Single source of truth for week-vs-day mileage consistency: sums each
+    week's mileage-slot (MILEAGE_SLOTS) day targets and compares the sum
+    against that week's authored target_miles/target_miles_hi band, within
+    WEEK_MILEAGE_TOLERANCE_MI. A day belongs to the week whose Monday equals
+    its date minus its weekday offset. A deliberately unspecified week
+    (target_miles is None), a week with no mileage-slot days authored yet, or
+    a lower-bound sum (some days missing target_miles, e.g. duration-only)
+    that hasn't already breached the ceiling all report consistent=True —
+    there's nothing to contradict yet. Never raises; commit_plan is the only
+    caller that turns an inconsistent entry into a hard rejection."""
+    days_by_week: dict[str, list[PlanDayRow]] = {}
+    for d in days:
+        dd = date.fromisoformat(d["date"])
+        wk = (dd - timedelta(days=dd.weekday())).isoformat()
+        days_by_week.setdefault(wk, []).append(d)
+
+    out: list[WeekMileageCheck] = []
+    for w in sorted(weeks, key=lambda w: w["week_start"]):
+        week_start = w["week_start"]
+        mileage_days = [d for d in days_by_week.get(week_start, []) if d["slot"] in MILEAGE_SLOTS]
+        day_miles_total = round(sum(d["target_miles"] or 0.0 for d in mileage_days), 1)
+        days_missing_miles = sum(1 for d in mileage_days if d["target_miles"] is None)
+
+        target_miles = w["target_miles"]
+        target_miles_hi = w["target_miles_hi"]
+        band_lo = target_miles
+        band_hi = target_miles_hi if target_miles_hi is not None else target_miles
+
+        consistent = True
+        message: str | None = None
+
+        if band_lo is None or band_hi is None:
+            pass  # deliberately unspecified week — nothing authored to check against
+        elif not mileage_days:
+            pass  # nothing authored to sum yet
+        elif days_missing_miles > 0:
+            # sum is a lower bound only; the floor isn't verifiable, but an
+            # already-over-ceiling lower bound is a real contradiction.
+            if day_miles_total > band_hi + WEEK_MILEAGE_TOLERANCE_MI:
+                consistent = False
+                message = (
+                    f"week {week_start}: days already sum to {_fmt_mi(day_miles_total)} mi with "
+                    f"{days_missing_miles} day(s) lacking a mileage figure, over the week ceiling "
+                    f"of {_fmt_mi(band_hi)} mi"
+                )
+        else:
+            if day_miles_total < band_lo - WEEK_MILEAGE_TOLERANCE_MI or (
+                day_miles_total > band_hi + WEEK_MILEAGE_TOLERANCE_MI
+            ):
+                consistent = False
+                band_str = (
+                    f"{_fmt_mi(band_lo)}–{_fmt_mi(band_hi)} mi" if band_hi != band_lo
+                    else f"{_fmt_mi(band_lo)} mi"
+                )
+                message = (
+                    f"week {week_start}: days sum to {_fmt_mi(day_miles_total)} mi, but the week "
+                    f"targets {band_str}"
+                )
+
+        out.append({
+            "week_start": week_start,
+            "day_miles_total": day_miles_total,
+            "days_missing_miles": days_missing_miles,
+            "target_miles": target_miles,
+            "target_miles_hi": target_miles_hi,
+            "consistent": consistent,
+            "message": message,
+        })
+    return out
+
+
 def _draft_gap_report(plan: PlanRow, weeks: list[PlanWeekRow], days: list[PlanDayRow]) -> list[str]:
     """Plain-English messages naming what commit_plan's global validation
     would reject right now: unauthored weeks (by ordinal week number from the
@@ -1175,13 +1271,16 @@ def _snapshot_past_weeks(conn: sqlite3.Connection, plan_id: int, version_id: int
 def commit_plan(conn: sqlite3.Connection, plan_id: int, *, note: str) -> int:
     """Runs full global validation on plan_id's draft (Mondays already
     guaranteed by upsert; contiguous, ends at the race week, every day falls
-    in a committed week), snapshots past weeks for a revision (see
-    _snapshot_past_weeks — skipped for a plan's first-ever commit, since
-    backdated week 1 is legitimately authored history, not something to
-    protect from itself), re-freezes every zone-anchored day target as of
-    today (freeze-at-commit — commit IS "authoring" for that rule), stamps
-    committed_at on the draft's own version_id (no new version_id is
-    allocated), and flips the plan to status='active'.
+    in a committed week; every week's authored mileage band agrees with the
+    program-computed sum of its mileage-slot days — see compute_week_mileage
+    — within WEEK_MILEAGE_TOLERANCE_MI, the hard block this function adds),
+    snapshots past weeks for a revision (see _snapshot_past_weeks — skipped
+    for a plan's first-ever commit, since backdated week 1 is legitimately
+    authored history, not something to protect from itself), re-freezes
+    every zone-anchored day target as of today (freeze-at-commit — commit IS
+    "authoring" for that rule), stamps committed_at on the draft's own
+    version_id (no new version_id is allocated), and flips the plan to
+    status='active'.
 
     Rejects committing a brand-new plan (status='draft') while a different
     plan is already active — a draft plan may coexist with one, but only one
@@ -1256,6 +1355,14 @@ def commit_plan(conn: sqlite3.Connection, plan_id: int, *, note: str) -> int:
             raise PlanValidationError(
                 f"day {d['date']} falls in week {wk}, which is not among the committed weeks"
             )
+
+    mileage_checks = compute_week_mileage(weeks, days)
+    inconsistent = [c for c in mileage_checks if not c["consistent"]]
+    if inconsistent:
+        raise PlanValidationError(
+            "plan is internally inconsistent: "
+            + "; ".join(cast(str, c["message"]) for c in inconsistent)
+        )
 
     creation_date = date.today()
     for d in days:

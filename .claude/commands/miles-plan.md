@@ -87,9 +87,21 @@ was once said, wrongly, to an athlete who simply hadn't synced).
    unauthored" is expected mid-draft) and its sanity warnings (week-1 vs. recent average, peak
    vs. all-time peak, sustained ramp >10%/wk) — advisory, relay them, never swallow or block on
    them. `delete_draft_weeks`/`delete_draft_days` retracts a batch that missed the mark.
+
+   The program does the arithmetic, not you: every draft/commit response carries `week_mileage`,
+   one entry per week with the program's own sum of that week's day mileage (`day_miles_total`)
+   against the band you authored (`target_miles`/`target_miles_hi`). Never hand-sum the days —
+   read `day_miles_total` and confirm it's what you intended before moving on. The week band is
+   your stated intent; the day sum is the program's math; they must agree.
 6. **The commit gate.** `commit_plan(note=...)` only once the athlete has *seen the full draft*
    — Plan page or in-chat, every week, not just the last batch — asked for adjustments, and
    explicitly said to start it. `note` records that approval; confirm what was committed.
+
+   `commit_plan` HARD-REJECTS (writes nothing) any week whose authored days are inconsistent with
+   its mileage band, beyond a small rounding tolerance and excepting duration-only days from the
+   floor check. If it rejects for this, don't guess at a fix — read the rejected week's
+   `week_mileage` figures from `get_draft` and reconcile either the day miles or the week band to
+   match, then retry.
 7. `discard_draft` on request, confirmed first.
 
 ## Revision protocol
@@ -102,10 +114,12 @@ responds, and don't write until approved.
 
 `start_revision_draft` copies the current committed weeks/days into a new draft — only the weeks
 that change need a `set_draft_weeks`/`set_draft_days` call. Same incremental authoring,
-`get_draft` narration, and commit gate as a fresh draft; `commit_plan`'s `note` explains the
-revision for future-you. It also silently protects every already-elapsed week
-(`past_weeks_preserved` in the response) against whatever the draft proposed for it — relay that
-whenever non-empty, so the athlete doesn't wonder why their ask didn't touch last week.
+`get_draft` narration, and commit gate as a fresh draft — including `week_mileage`: a revision
+that nudges a week's band or reshuffles its days can just as easily drift the two apart, so check
+it the same way. `commit_plan`'s `note` explains the revision for future-you. It also silently
+protects every already-elapsed week (`past_weeks_preserved` in the response) against whatever the
+draft proposed for it — relay that whenever non-empty, so the athlete doesn't wonder why their ask
+didn't touch last week.
 
 Not every miss is a revision: day-level reality that doesn't change the contract — a skipped
 run, a workout moved to Thursday, "slept badly all week" — is `log_plan_adjustment` (action +
