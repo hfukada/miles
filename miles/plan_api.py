@@ -122,10 +122,12 @@ class TodayOut(TypedDict):
     """Today's slice of the plan — always present for an active plan whose
     window covers today, regardless of sync freshness (the planned session
     itself isn't sync-derived; only the actual-so-far numbers in
-    week_so_far/vs_last_week are). `day` is None when today has no explicit
-    plan_days row — an implied rest day (planners may skip emitting them)."""
+    week_so_far/vs_last_week are). `sessions` is every plan_days row for
+    today, seq order (a double run day, or a run plus a strength day, both
+    surface); empty when today has no explicit plan_days row — an implied
+    rest day (planners may skip emitting them)."""
     date: str
-    day: PlanDayOut | None
+    sessions: list[PlanDayOut]
     is_race_day: bool
     is_race_week: bool
     week_start: str | None  # None when today falls outside the plan's week list entirely
@@ -336,7 +338,7 @@ def _today_blocks(
     race_dt = date.fromisoformat(active["race_date"])
     today_out = TodayOut(
         date=today.isoformat(),
-        day=next((_day_out(d) for d in days_in if d["date"] == today.isoformat()), None),
+        sessions=[_day_out(d) for d in days_in if d["date"] == today.isoformat()],
         is_race_day=race_dt == today,
         is_race_week=monday <= race_dt <= monday + timedelta(days=6),
         week_start=monday_iso if week is not None else None,

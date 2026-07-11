@@ -140,13 +140,23 @@
     }
 
     /* Calendar — one row per plan week, Monday through Sunday columns.
-       overflow-x + min-width keep the grid legible on narrow viewports:
-       it scrolls sideways rather than crushing 8 columns into slivers. */
+       overflow-x + min-width keep the grid legible down to tablet width: it
+       scrolls sideways rather than crushing 8 columns into slivers. Below
+       640px the grid (.cal) gives way entirely to .cal-cards — a second,
+       independently-rendered markup for the same weeks/days (see
+       weekCardMobileHTML) rather than a pure CSS reflow of the grid, since
+       the day content's internal shape (stacked cell vs horizontal row)
+       differs too much for one DOM to serve both cleanly. */
     .plan-view .cal { border: 1px solid var(--gridline); border-radius: 8px; overflow-x: auto; overflow-y: hidden; }
     .plan-view .cal-header, .plan-view .cal-row {
       display: grid;
       grid-template-columns: 112px repeat(7, minmax(0, 1fr));
       min-width: 720px;
+    }
+    .plan-view .cal-cards { display: none; }
+    @media (max-width: 640px) {
+      .plan-view .cal { display: none; }
+      .plan-view .cal-cards { display: flex; flex-direction: column; gap: 0.75rem; }
     }
     .plan-view .cal-header .cal-hcell {
       font-size: 0.625rem;
@@ -178,7 +188,7 @@
     .plan-view .cal-row.current .cal-leader { background: var(--pr-bg); }
     .plan-view .cal-row.current .cal-day { background: var(--pr-bg); }
     .plan-view .cal-day {
-      min-height: 58px;
+      min-height: 68px;
       background: var(--surface);
       border-top: 1px solid var(--gridline);
       border-left: 1px solid var(--gridline);
@@ -190,28 +200,51 @@
     .plan-view .cal-row:first-child .cal-day { border-top: none; margin-top: 0; }
     .plan-view .cal-daynum { position: absolute; top: 0.125rem; right: 0.25rem; font-size: 0.625rem; color: var(--muted); }
 
-    /* Planned slot — muted chip underneath any actual run. */
+    /* Planned slot — muted chip underneath any actual run; one per session on
+       a multi-session day (stacked via block display), number-first so the
+       mileage/duration survives truncation instead of the title. */
     .plan-view .plan-slot {
-      display: inline-block;
-      font-size: 0.6875rem;
-      font-weight: 500;
-      color: var(--muted);
+      display: block;
       background: var(--bg);
       border: 1px dashed var(--border);
       border-radius: 4px;
-      padding: 0.0625rem 0.3125rem;
+      padding: 0.125rem 0.3125rem 0.1875rem;
       margin-top: 0.6875rem;
       max-width: 100%;
+    }
+    .plan-view .plan-slot + .plan-slot { margin-top: 0.25rem; }
+    .plan-view .plan-slot-num {
+      font-weight: 700;
+      font-size: 0.75rem;
+      line-height: 1.15;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .plan-view .plan-slot-label {
+      font-size: 0.625rem;
+      color: var(--muted);
+      line-height: 1.25;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .plan-view .plan-slot.slot-rest { border-style: dotted; }
-    .plan-view .plan-slot.slot-easy { border-color: color-mix(in srgb, var(--muted) 55%, var(--border)); color: var(--text-secondary); }
-    .plan-view .plan-slot.slot-workout { border-color: var(--series-8); color: var(--series-8); }
-    .plan-view .plan-slot.slot-long { border-color: var(--series-1); color: var(--series-1); }
-    .plan-view .plan-slot.slot-race { border-color: var(--good); color: var(--good); }
-    .plan-view .plan-slot.slot-strength { border-color: var(--series-5); color: var(--series-5); }
+    .plan-view .plan-slot.slot-rest {
+      border-style: dotted;
+      font-size: 0.6875rem;
+      font-weight: 500;
+      color: var(--muted);
+      padding: 0.0625rem 0.3125rem;
+    }
+    .plan-view .plan-slot.slot-easy .plan-slot-num { color: var(--text-secondary); }
+    .plan-view .plan-slot.slot-easy { border-color: color-mix(in srgb, var(--muted) 55%, var(--border)); }
+    .plan-view .plan-slot.slot-workout { border-color: var(--series-8); }
+    .plan-view .plan-slot.slot-workout .plan-slot-num { color: var(--series-8); }
+    .plan-view .plan-slot.slot-long { border-color: var(--series-1); }
+    .plan-view .plan-slot.slot-long .plan-slot-num { color: var(--series-1); }
+    .plan-view .plan-slot.slot-race { border-color: var(--good); }
+    .plan-view .plan-slot.slot-race .plan-slot-num { color: var(--good); }
+    .plan-view .plan-slot.slot-strength { border-color: var(--series-5); }
+    .plan-view .plan-slot.slot-strength .plan-slot-num { color: var(--series-5); }
 
     /* Week note on the calendar leader — always-visible affordance (plain
        truncated text with a title for overflow), never hover-only. */
@@ -226,6 +259,56 @@
     }
 
     .plan-view .cal-day { cursor: pointer; }
+
+    /* Mobile calendar — one full-width card per week (see weekCardMobileHTML),
+       leader info as a header, day rows below it. No horizontal scroll: the
+       weekday-column idiom only exists on the grid. */
+    .plan-view .mcal-week { border: 1px solid var(--gridline); border-radius: 8px; overflow: hidden; background: var(--surface); }
+    .plan-view .mcal-week.current { background: var(--pr-bg); }
+    .plan-view .mcal-week-head { padding: 0.5rem 0.75rem; background: var(--bg); border-bottom: 1px solid var(--gridline); }
+    .plan-view .mcal-week.current .mcal-week-head { background: var(--pr-bg-hover); }
+    .plan-view .mcal-week-range { font-size: 0.8125rem; font-weight: 650; color: var(--text); }
+    .plan-view .mcal-week-sub {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      font-size: 0.6875rem;
+      color: var(--muted);
+      margin-top: 0.1875rem;
+    }
+    /* Full note, wrapping — the mobile card's whole point is nothing gets
+       truncated the way the grid leader's title= tooltip does. */
+    .plan-view .mcal-week-note { font-size: 0.6875rem; color: var(--text-secondary); line-height: 1.45; margin-top: 0.25rem; }
+    .plan-view .mcal-day-row {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.4375rem 0.75rem;
+      border-top: 1px solid var(--gridline);
+      position: relative;
+      cursor: pointer;
+    }
+    .plan-view .mcal-day-row:first-of-type { border-top: none; }
+    .plan-view .mcal-day-row.rest { opacity: 0.7; }
+    .plan-view .mcal-day-wd {
+      flex: 0 0 2.125rem;
+      padding-top: 0.0625rem;
+      font-size: 0.625rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      color: var(--muted);
+      display: flex;
+      flex-direction: column;
+    }
+    .plan-view .mcal-daynum { font-size: 0.5625rem; font-weight: 400; color: var(--muted); }
+    .plan-view .mcal-day-body { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+    .plan-view .mcal-rest { font-size: 0.75rem; color: var(--muted); padding-top: 0.0625rem; }
+    /* Session line — number first and never truncated, title after and
+       ellipsized; mirrors the grid chip's number-first rule (see .plan-slot). */
+    .plan-view .mcal-slot { display: flex; align-items: baseline; gap: 0.375rem; min-width: 0; }
+    .plan-view .mcal-slot-num { font-weight: 700; font-size: 0.75rem; white-space: nowrap; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    .plan-view .mcal-slot-label { font-size: 0.75rem; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    .plan-view .mcal-day-row .cal-log-marker { top: 0.375rem; left: 0.125rem; }
 
     /* Today view — one kicker line, then a two-column at-a-glance grid:
        the session card is the hero on the left, the whole week's story
@@ -406,13 +489,20 @@
       cursor: pointer;
     }
     .plan-view .day-popover-date { font-size: 0.75rem; color: var(--muted); margin-bottom: 0.125rem; }
-    .plan-view .day-popover-title { font-size: 1rem; font-weight: 650; color: var(--text); margin-bottom: 0.125rem; }
-    .plan-view .day-popover-slot { font-size: 0.6875rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.625rem; }
+    .plan-view .day-popover-slot { font-size: 0.6875rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.125rem; }
+    .plan-view .day-popover-title { font-size: 1rem; font-weight: 650; color: var(--text); margin-bottom: 0.625rem; }
     .plan-view .day-popover-targets { font-size: 0.8125rem; color: var(--text-secondary); font-variant-numeric: tabular-nums; margin-bottom: 0.5rem; line-height: 1.6; }
     .plan-view .day-popover-note { font-size: 0.8125rem; color: var(--text-secondary); line-height: 1.5; margin-bottom: 0.75rem; }
     .plan-view .day-popover-section { margin-top: 0.625rem; }
     .plan-view .day-popover-log { font-size: 0.8125rem; color: var(--text-secondary); padding: 0.125rem 0; }
     .plan-view .day-popover-empty { font-size: 0.8125rem; color: var(--muted); }
+    /* One block per session on a multi-session day — a hairline between
+       blocks, none before the first. */
+    .plan-view .day-popover-session + .day-popover-session {
+      margin-top: 0.875rem;
+      padding-top: 0.875rem;
+      border-top: 1px solid var(--gridline);
+    }
 
     /* Actual run — solid pill layered under/after the planned slot. */
     .plan-view .cal-run {
@@ -805,37 +895,62 @@
   // in the /api/plan payload.
   // -----------------------------------------------------------------------
 
-  let PLAN_DATA = null; // { dayByDate, actualByDate, logByDate } — set once on load
+  let PLAN_DATA = null; // { dayByDate, actualByDate, logByDate } — set once on load; dayByDate values are seq-ordered session arrays
 
-  function dayPopoverHTML(dateStr, day, runs, logs) {
-    const glyph = day && day.terrain === 'trail' ? TRAIL_GLYPH : '';
-    const title = day ? (day.title ? esc(day.title) : (SLOT_LABEL[day.slot] ?? day.slot)) : 'Rest';
+  // Groups plan_days rows by date, preserving the server's date/seq order —
+  // a date can carry more than one row (a double run, or a run plus a
+  // strength day), so every consumer of dayByDate gets an array, never a
+  // single row that would silently drop the rest.
+  function groupSessionsByDate(days) {
+    const m = new Map();
+    for (const d of days) {
+      const arr = m.get(d.date);
+      if (arr) arr.push(d); else m.set(d.date, [d]);
+    }
+    return m;
+  }
+
+  // One popover block per session: slot label, title, targets, note — in
+  // that order so the colored slot reads first, same as the calendar chip.
+  function daySessionBlockHTML(day) {
+    const glyph = day.terrain === 'trail' ? TRAIL_GLYPH : '';
+    const title = day.title ? esc(day.title) : (SLOT_LABEL[day.slot] ?? day.slot);
     const targetLines = describeDayTarget(day);
+    return `
+      <div class="day-popover-session">
+        <div class="day-popover-slot" style="color:${SLOT_COLOR[day.slot] ?? 'var(--text)'}">${esc(SLOT_LABEL[day.slot] ?? day.slot)}</div>
+        <div class="day-popover-title">${title}${glyph}</div>
+        ${targetLines.length ? `<div class="day-popover-targets">${targetLines.map(l => `<div>${esc(l)}</div>`).join('')}</div>` : ''}
+        ${day.note ? `<p class="day-popover-note">${esc(day.note)}</p>` : ''}
+      </div>`;
+  }
+
+  function dayPopoverHTML(dateStr, sessions, runs, logs) {
+    const body = sessions.length
+      ? sessions.map(daySessionBlockHTML).join('')
+      : `<div class="day-popover-title">Rest</div>`;
     return `
       <div class="day-popover-backdrop" id="day-popover-backdrop">
         <div class="day-popover" role="dialog" aria-modal="true">
           <button class="day-popover-close" id="day-popover-close" aria-label="Close">×</button>
           <div class="day-popover-date">${esc(longDate(dateStr))}</div>
-          <div class="day-popover-title">${title}${glyph}</div>
-          ${day ? `<div class="day-popover-slot" style="color:${SLOT_COLOR[day.slot] ?? 'var(--text)'}">${esc(SLOT_LABEL[day.slot] ?? day.slot)}</div>` : ''}
-          ${targetLines.length ? `<div class="day-popover-targets">${targetLines.map(l => `<div>${esc(l)}</div>`).join('')}</div>` : ''}
-          ${day && day.note ? `<p class="day-popover-note">${esc(day.note)}</p>` : ''}
-          ${runs.length ? `<div class="day-popover-section"><div class="subchart-label">Synced</div>${runs.map(runLine).join('')}</div>` : ''}
+          ${body}
+          ${runs.length ? `<div class="day-popover-section"><div class="subchart-label">Synced</div>${runs.map(r => runLine(r, { showPace: true })).join('')}</div>` : ''}
           ${logs.length ? `<div class="day-popover-section"><div class="subchart-label">Log</div>${logs.map(l => `<div class="day-popover-log">${esc(l.action)}${l.reason ? ': ' + esc(l.reason) : ''}</div>`).join('')}</div>` : ''}
-          ${!day && !runs.length && !logs.length ? `<p class="day-popover-empty">No plan data for this day.</p>` : ''}
+          ${!sessions.length && !runs.length && !logs.length ? `<p class="day-popover-empty">No plan data for this day.</p>` : ''}
         </div>
       </div>`;
   }
 
   function openDayPopover(dateStr) {
     if (!PLAN_DATA) return;
-    const day = PLAN_DATA.dayByDate.get(dateStr) ?? null;
+    const sessions = PLAN_DATA.dayByDate.get(dateStr) ?? [];
     const runs = PLAN_DATA.actualByDate.get(dateStr) ?? [];
     const logs = PLAN_DATA.logByDate.get(dateStr) ?? [];
-    if (!day && !runs.length && !logs.length) return; // nothing to show for this date
+    if (!sessions.length && !runs.length && !logs.length) return; // nothing to show for this date
     // Must land inside main.plan-view — every popover style is scoped under
     // it, and a body-level insert renders as unstyled text at the page bottom.
-    document.querySelector('main.plan-view').insertAdjacentHTML('beforeend', dayPopoverHTML(dateStr, day, runs, logs));
+    document.querySelector('main.plan-view').insertAdjacentHTML('beforeend', dayPopoverHTML(dateStr, sessions, runs, logs));
     const backdrop = document.getElementById('day-popover-backdrop');
     function close() {
       backdrop.remove();
@@ -1439,29 +1554,49 @@
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }
 
-  function runLine(r) {
+  // showPace inlines the pace text rather than leaving it only in the
+  // title= tooltip — the day popover needs it visible on touch, where
+  // tooltips never fire; the calendar's compact pill keeps it tooltip-only.
+  function runLine(r, opts) {
     const color = TYPE_COLOR[r.run_type] ?? 'var(--muted)';
     const titleParts = [esc(r.name ?? '')];
     if (r.pace_min_per_mile != null) titleParts.push(`${fmt.pace(r.pace_min_per_mile)}/mi`);
     const title = titleParts.join(' · ');
+    const paceInline = opts && opts.showPace && r.pace_min_per_mile != null ? ` · ${fmt.pace(r.pace_min_per_mile)}/mi` : '';
     return `<div class="cal-run" title="${title}">
       <span class="cal-dot" style="background:${color}"></span>
-      <span>${r.distance_mi.toFixed(1)} mi</span>
+      <span>${r.distance_mi.toFixed(1)} mi${paceInline}</span>
     </div>`;
   }
 
+  // A rest day carries no number line regardless of whether target_miles is
+  // NULL or an explicit 0 — either way there's nothing to lead with.
+  function isRestSlot(day) {
+    return day.slot === 'rest' && !day.title && (day.target_miles == null || day.target_miles === 0);
+  }
+
+  // Two-line chip: the number (mi or duration) leads, bold and slot-colored,
+  // and never truncates; the title/slot label follows, smaller and muted,
+  // ellipsized if it has to. One call per session on a multi-session day —
+  // callers stack the returned chips, they never collapse to one.
   function plannedSlot(day) {
     if (!day) return '';
     const glyph = day.terrain === 'trail' ? TRAIL_GLYPH : '';
-    if (day.slot === 'rest' && !day.title && day.target_miles == null) {
+    if (isRestSlot(day)) {
       return `<div class="plan-slot slot-rest">Rest${glyph}</div>`;
     }
     const label = day.title ? esc(day.title) : SLOT_LABEL[day.slot] ?? day.slot;
+    const num = day.target_miles != null ? `${trimMiles(day.target_miles)} mi`
+      : day.target_minutes != null ? fmtDuration(day.target_minutes)
+      : null;
     const extras = [];
     if (day.target_miles != null) extras.push(`${day.target_miles.toFixed(1)}mi`);
     if (day.target_minutes != null) extras.push(fmtDuration(day.target_minutes));
-    const suffix = extras.length ? ` · ${extras.join(' · ')}` : '';
-    return `<div class="plan-slot slot-${day.slot}" title="${esc(label)}${suffix}">${label}${glyph}${suffix}</div>`;
+    const titleAttr = `${label}${extras.length ? ' · ' + extras.join(' · ') : ''}`;
+    return `<div class="plan-slot slot-${day.slot}" title="${esc(titleAttr)}">
+      ${num != null ? `<div class="plan-slot-num">${esc(num)}</div>` : ''}
+      <div class="plan-slot-label">${label}${glyph}</div>
+    </div>`;
   }
 
   function logMarker(entries) {
@@ -1471,15 +1606,15 @@
   }
 
   function dayCell(dateStr, dayByDate, actualByDate, logByDate) {
-    const day = dayByDate.get(dateStr);
+    const sessions = dayByDate.get(dateStr) ?? [];
     const runs = actualByDate.get(dateStr) ?? [];
     const logs = logByDate.get(dateStr) ?? [];
     const dayNum = Number(dateStr.slice(8, 10));
     return `<div class="cal-day" data-plan-date="${dateStr}">
       ${logMarker(logs)}
       <div class="cal-daynum">${dayNum}</div>
-      ${plannedSlot(day)}
-      ${runs.map(runLine).join('')}
+      ${sessions.length ? sessions.map(plannedSlot).join('') : plannedSlot(null)}
+      ${runs.map(r => runLine(r)).join('')}
     </div>`;
   }
 
@@ -1503,11 +1638,75 @@
     </div>`;
   }
 
+  // -----------------------------------------------------------------------
+  // Mobile calendar — one full-width card per week, below 640px (see the
+  // .cal-cards media query). Independently rendered from weekRow/dayCell
+  // rather than reusing their grid-cell markup: a day's content reads as a
+  // horizontal row here (weekday, then session number + title, then any
+  // synced pill), not a vertically-stacked cell, and the leader column's
+  // 112px width disappears entirely in favor of a card header.
+  // -----------------------------------------------------------------------
+
+  function weekRangeLabel(weekStart) {
+    return `${shortDate(weekStart)} – ${shortDate(addDays(weekStart, 6))}`;
+  }
+
+  function mobileSessionHTML(day) {
+    const glyph = day.terrain === 'trail' ? TRAIL_GLYPH : '';
+    const label = day.title ? esc(day.title) : (SLOT_LABEL[day.slot] ?? day.slot);
+    const num = day.target_miles != null ? `${trimMiles(day.target_miles)} mi`
+      : day.target_minutes != null ? fmtDuration(day.target_minutes)
+      : null;
+    const color = SLOT_COLOR[day.slot] ?? 'var(--muted)';
+    return `<div class="mcal-slot">
+      ${num != null ? `<span class="mcal-slot-num" style="color:${color}">${esc(num)}</span>` : ''}
+      <span class="mcal-slot-label">${label}${glyph}</span>
+    </div>`;
+  }
+
+  function mobileDayRowHTML(dateStr, dayByDate, actualByDate, logByDate) {
+    const sessions = dayByDate.get(dateStr) ?? [];
+    const runs = actualByDate.get(dateStr) ?? [];
+    const logs = logByDate.get(dateStr) ?? [];
+    const wd = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short' });
+    const dayNum = Number(dateStr.slice(8, 10));
+    const rest = !sessions.length || sessions.every(isRestSlot);
+    const body = rest
+      ? `<div class="mcal-rest">Rest</div>`
+      : sessions.map(mobileSessionHTML).join('');
+    return `<div class="mcal-day-row${rest ? ' rest' : ''}" data-plan-date="${dateStr}">
+      ${logMarker(logs)}
+      <div class="mcal-day-wd">${wd}<span class="mcal-daynum">${dayNum}</span></div>
+      <div class="mcal-day-body">
+        ${body}
+        ${runs.map(r => runLine(r)).join('')}
+      </div>
+    </div>`;
+  }
+
+  function weekCardMobileHTML(week, dayByDate, actualByDate, logByDate, bandByWeek) {
+    const days = Array.from({ length: 7 }, (_, i) => addDays(week.week_start, i));
+    const band = bandByWeek ? bandByWeek.get(week.week_start) : undefined;
+    const cls = week.is_current ? 'mcal-week current' : 'mcal-week';
+    return `<div class="${cls}">
+      <div class="mcal-week-head">
+        <div class="mcal-week-range">${esc(weekRangeLabel(week.week_start))}</div>
+        <div class="mcal-week-sub">
+          <span>${esc(week.phase)}</span>
+          <span>${week.actual_miles.toFixed(1)} of ${esc(targetMilesLabel(week))} mi</span>
+          ${bandChip(band)}
+        </div>
+        ${week.note ? `<div class="mcal-week-note">${esc(week.note)}</div>` : ''}
+      </div>
+      ${days.map(d => mobileDayRowHTML(d, dayByDate, actualByDate, logByDate)).join('')}
+    </div>`;
+  }
+
   function renderCalendar(data, bandByWeek) {
     const { weeks, days, actual, log } = data;
     if (!weeks.length) return;
 
-    const dayByDate = new Map(days.map(d => [d.date, d]));
+    const dayByDate = groupSessionsByDate(days);
     const actualByDate = new Map(Object.entries(actual ?? {}));
     const logByDate = new Map(Object.entries(log ?? {}));
     const weekdayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
@@ -1523,6 +1722,9 @@
             ${weekdayLabels.map(w => `<div class="cal-hcell">${w}</div>`).join('')}
           </div>
           ${weeks.map(w => weekRow(w, dayByDate, actualByDate, logByDate, bandByWeek)).join('')}
+        </div>
+        <div class="cal-cards">
+          ${weeks.map(w => weekCardMobileHTML(w, dayByDate, actualByDate, logByDate, bandByWeek)).join('')}
         </div>
         <div class="cal-legend">
           <span><span class="cal-dot" style="background:var(--muted)"></span>Easy</span>
@@ -1906,36 +2108,66 @@
     return `<div class="race-countdown"><span class="race-countdown-num">${days}</span> day${days === 1 ? '' : 's'} to ${esc(plan.title)} <span class="kicker-sub">${shortDate(plan.race_date)}</span>${synced}</div>`;
   }
 
+  // The card's hero is the first non-strength session (strength supplements
+  // a run, it doesn't lead the card); falls back to the first session when
+  // every session that day is strength.
+  function heroSession(sessions) {
+    return sessions.find(d => d.slot !== 'strength') ?? sessions[0] ?? null;
+  }
+
+  // One compact line per session beyond the hero — same idiom as the
+  // "Up next" footer line (colored dot + title + target), not a second
+  // full session card.
+  function alsoTodayLineHTML(day) {
+    const glyph = day.terrain === 'trail' ? TRAIL_GLYPH : '';
+    const label = day.title ? esc(day.title) : (SLOT_LABEL[day.slot] ?? day.slot);
+    const extras = [];
+    if (day.target_miles != null) extras.push(`${day.target_miles.toFixed(1)} mi`);
+    if (day.target_minutes != null) extras.push(fmtDuration(day.target_minutes));
+    return `<div class="today-next-line">
+      <span class="cal-dot" style="background:${SLOT_COLOR[day.slot] ?? 'var(--muted)'}"></span>
+      <span>${label}${glyph}${extras.length ? ` · ${extras.join(' · ')}` : ''}</span>
+    </div>`;
+  }
+
+  function alsoTodayHTML(others) {
+    if (!others.length) return '';
+    return `<div class="today-done"><div class="panel-label">Also today</div>${others.map(alsoTodayLineHTML).join('')}</div>`;
+  }
+
   function todaySessionHTML(data) {
     const { today, plan } = data;
     if (!today || !today.week_start) {
       return `<div class="today-card"><p class="desc" style="margin:0">Outside the plan window.</p></div>`;
     }
-    const day = today.day;
+    const sessions = today.sessions ?? [];
+    const hero = heroSession(sessions);
+    const others = sessions.filter(d => d !== hero);
     const dateLine = `<div class="panel-label">Today · ${new Date(today.date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}</div>`;
     const parts = [dateLine];
     if (today.is_race_day) {
       parts.push(`<div class="today-race">Race day — ${esc(plan.title)}.</div>`);
-      if (day && day.note) parts.push(`<p class="today-note">${esc(day.note)}</p>`);
+      if (hero && hero.note) parts.push(`<p class="today-note">${esc(hero.note)}</p>`);
     } else {
       if (today.is_race_week) parts.push(`<div class="today-raceweek">Race week — ${esc(plan.title)} is ${shortDate(plan.race_date)}.</div>`);
-      if (!day || day.slot === 'rest') {
+      if (!hero || hero.slot === 'rest') {
         parts.push(`<div class="today-rest">Rest day.</div>`);
-        if (day && day.note) parts.push(`<p class="today-note">${esc(day.note)}</p>`);
+        if (hero && hero.note) parts.push(`<p class="today-note">${esc(hero.note)}</p>`);
       } else {
-        const glyph = day.terrain === 'trail' ? TRAIL_GLYPH : '';
-        const label = day.title ? esc(day.title) : (SLOT_LABEL[day.slot] ?? day.slot);
-        parts.push(`<div class="today-slot" style="color:${SLOT_COLOR[day.slot] ?? 'var(--text)'}">${esc(SLOT_LABEL[day.slot] ?? day.slot)}</div>`);
+        const glyph = hero.terrain === 'trail' ? TRAIL_GLYPH : '';
+        const label = hero.title ? esc(hero.title) : (SLOT_LABEL[hero.slot] ?? hero.slot);
+        parts.push(`<div class="today-slot" style="color:${SLOT_COLOR[hero.slot] ?? 'var(--text)'}">${esc(SLOT_LABEL[hero.slot] ?? hero.slot)}</div>`);
         parts.push(`<div class="today-title">${label}${glyph}</div>`);
-        const lines = describeDayTarget(day);
+        const lines = describeDayTarget(hero);
         if (lines.length) {
           // First line is the session itself ("6.0 mi", "8–10 × 3:00 @ …") —
           // it gets display size; the rest stay secondary.
           parts.push(`<div class="today-targets">${lines.map((l, i) => `<div${i === 0 ? ' class="target-lead"' : ''}>${esc(l)}</div>`).join('')}</div>`);
         }
-        if (day.note) parts.push(`<p class="today-note">${esc(day.note)}</p>`);
+        if (hero.note) parts.push(`<p class="today-note">${esc(hero.note)}</p>`);
       }
     }
+    parts.push(alsoTodayHTML(others));
     parts.push(todaySyncedHTML(today.date));
     parts.push(upNextHTML(today.date));
     return `<div class="today-card" data-plan-date="${today.date}">${parts.join('')}</div>`;
@@ -1957,24 +2189,36 @@
     return `<div class="today-done"><div class="panel-label">Synced today</div>${lines}</div>`;
   }
 
-  // Tomorrow's slot as the card's footer — clicking it opens tomorrow's
-  // popover (the inner data-plan-date wins via closest()).
+  // "+ strength" / "+ 2nd run" — a compact suffix naming what else is on
+  // the date, never a second full line.
+  function sessionSuffixWord(s, primary) {
+    if (s.slot === primary.slot && s.slot !== 'strength' && s.slot !== 'rest') return '2nd run';
+    return (SLOT_LABEL[s.slot] ?? s.slot).toLowerCase();
+  }
+
+  // Tomorrow's primary slot as the card's footer, plus a compact suffix
+  // when tomorrow carries more than one session — clicking it opens
+  // tomorrow's popover (the inner data-plan-date wins via closest()).
   function upNextHTML(todayStr) {
     const tomorrow = addDays(todayStr, 1);
-    const day = PLAN_DATA.dayByDate.get(tomorrow);
-    if (!day) return '';
+    const sessions = PLAN_DATA.dayByDate.get(tomorrow) ?? [];
+    if (!sessions.length) return '';
+    const primary = heroSession(sessions);
+    const others = sessions.filter(d => d !== primary);
     const wd = new Date(tomorrow + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long' });
-    const glyph = day.terrain === 'trail' ? TRAIL_GLYPH : '';
-    const label = day.title ? esc(day.title) : (SLOT_LABEL[day.slot] ?? day.slot);
+    const glyph = primary.terrain === 'trail' ? TRAIL_GLYPH : '';
+    const label = primary.title ? esc(primary.title) : (SLOT_LABEL[primary.slot] ?? primary.slot);
     const extras = [];
-    if (day.target_miles != null) extras.push(`${day.target_miles.toFixed(1)} mi`);
-    if (day.target_minutes != null) extras.push(fmtDuration(day.target_minutes));
+    if (primary.target_miles != null) extras.push(`${primary.target_miles.toFixed(1)} mi`);
+    if (primary.target_minutes != null) extras.push(fmtDuration(primary.target_minutes));
+    const suffix = others.length === 1 ? ` · + ${sessionSuffixWord(others[0], primary)}`
+      : others.length > 1 ? ` · + ${others.length} more` : '';
     return `
       <div class="today-next" data-plan-date="${tomorrow}">
         <div class="panel-label">Up next · ${wd}</div>
         <div class="today-next-line">
-          <span class="cal-dot" style="background:${SLOT_COLOR[day.slot] ?? 'var(--muted)'}"></span>
-          <span>${label}${glyph}${extras.length ? ` · ${extras.join(' · ')}` : ''}</span>
+          <span class="cal-dot" style="background:${SLOT_COLOR[primary.slot] ?? 'var(--muted)'}"></span>
+          <span>${label}${glyph}${extras.length ? ` · ${extras.join(' · ')}` : ''}${suffix}</span>
         </div>
       </div>`;
   }
@@ -1983,30 +2227,43 @@
   // miles once the day has data, planned miles (or duration) ahead of it,
   // "0" for an elapsed planned day with nothing synced — hit/missed reads
   // straight off the row. The done-fill means "a run synced", never just
-  // "the date passed".
+  // "the date passed". On a multi-session day the number sums target_miles
+  // across every non-rest session (an 8+4 double reads "12"); color/label
+  // follow the first non-strength session.
   function dayChip(dateStr, todayStr) {
-    const day = PLAN_DATA.dayByDate.get(dateStr) ?? null;
+    const sessions = PLAN_DATA.dayByDate.get(dateStr) ?? [];
     const runs = PLAN_DATA.actualByDate.get(dateStr) ?? [];
-    const slot = day ? day.slot : 'rest';
+    const primary = heroSession(sessions);
+    const slot = primary ? primary.slot : 'rest';
     const color = SLOT_COLOR[slot] ?? 'var(--muted)';
     const stateClass = [
       runs.length ? 'done' : '',
       dateStr === todayStr ? 'today' : dateStr > todayStr ? 'upcoming' : '',
     ].filter(Boolean).join(' ');
-    const glyph = day && day.terrain === 'trail' ? TRAIL_GLYPH : '';
-    const label = day ? (SLOT_LABEL[day.slot] ?? day.slot) : 'Rest';
+    const glyph = primary && primary.terrain === 'trail' ? TRAIL_GLYPH : '';
+    const label = primary ? (SLOT_LABEL[primary.slot] ?? primary.slot) : 'Rest';
     const wd = new Date(dateStr + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short' });
 
-    const plannedNum = day && day.target_miles != null ? trimMiles(day.target_miles)
-      : day && day.target_minutes != null ? fmtDuration(day.target_minutes)
+    const scheduled = sessions.filter(d => d.slot !== 'rest');
+    const milesTotal = scheduled.reduce((s, d) => s + (d.target_miles ?? 0), 0);
+    const hasMiles = scheduled.some(d => d.target_miles != null);
+    const minutesOnly = !hasMiles ? scheduled.find(d => d.target_minutes != null) : undefined;
+    const plannedNum = hasMiles ? trimMiles(milesTotal)
+      : minutesOnly ? fmtDuration(minutesOnly.target_minutes)
       : null;
+
     const ranMi = runs.reduce((s, r) => s + r.distance_mi, 0);
     const num = runs.length ? trimMiles(ranMi)
       : dateStr < todayStr ? (slot === 'rest' ? '—' : '0')
       : plannedNum ?? (slot === 'rest' ? '—' : '·');
 
-    const titleParts = [`${label}${glyph}`];
-    if (plannedNum != null) titleParts.push(`plan ${plannedNum}${day.target_miles != null ? ' mi' : ''}`);
+    const titleParts = sessions.length
+      ? sessions.map(d => {
+          const dl = d.title ? d.title : (SLOT_LABEL[d.slot] ?? d.slot);
+          const dNum = d.target_miles != null ? `${trimMiles(d.target_miles)} mi` : d.target_minutes != null ? fmtDuration(d.target_minutes) : null;
+          return dNum ? `${dl} (${dNum})` : dl;
+        })
+      : ['Rest'];
     if (runs.length) titleParts.push(`ran ${trimMiles(ranMi)} mi`);
     return `<div class="day-chip ${stateClass}" style="--chip-color:${color}" data-plan-date="${dateStr}" title="${esc(titleParts.join(' · '))}">
       <div class="day-chip-wd">${wd}</div>
@@ -2204,7 +2461,7 @@
       return;
     }
     PLAN_DATA = {
-      dayByDate: new Map(data.days.map(d => [d.date, d])),
+      dayByDate: groupSessionsByDate(data.days),
       actualByDate: new Map(Object.entries(data.actual ?? {})),
       logByDate: new Map(Object.entries(data.log ?? {})),
     };
