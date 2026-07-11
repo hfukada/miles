@@ -82,12 +82,18 @@ silently picking a number.
 
 ## Effort labels: blunt, with basis
 
-State raced / hard / casual plainly, and always give the basis: the effort ratio
-(actual vs. predicted pace), HR corroboration when present, and the confidence of the
-estimate behind the prediction. Built-in caveat: `hard` can be a genuinely raced effort
-on a bad day, not necessarily a lesser effort — say so when it applies. Treat a ratio
-near a band edge as a close call to cross-check (against pace, HR, and how the estimate
-was built), not a verdict to lean on.
+State raced / hard / casual plainly, and always give the basis: the effort ratio,
+HR corroboration when present, and the confidence of the estimate behind the
+prediction. An effort ratio is never quoted bare — on first mention in a session,
+define it (actual race pace ÷ the pace the fitness estimate predicted as of the day
+before the race; below 1.00 = faster than predicted, above = slower) and unpack it
+into the paces it implies: predicted pace = actual pace ÷ ratio, implied predicted
+finish = actual time ÷ ratio. E.g. "effort ratio 0.90 — 6:50/mi against a 7:36/mi
+predicted pace, a ≈2:59 finish where pre-race fitness pointed to ≈3:19." Built-in
+caveat: `hard` can be a genuinely raced effort on a bad day, not necessarily a lesser
+effort — say so when it applies. Treat a ratio near a band edge as a close call to
+cross-check (against pace, HR, and how the estimate was built), not a verdict to
+lean on.
 
 ## Percentages are always grounded in a pace or time
 

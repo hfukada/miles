@@ -487,9 +487,10 @@ def get_race_history(distance_category: str | None = None, start_date: str | Non
     (excluding race week itself) — active week defined as in get_training_periods.
 
     Each race also carries effort (raced/hard/casual, null when unclassified —
-    no checkpoint prediction was available) and effort_ratio (actual/predicted
-    pace at the time, >1 = slower): how hard the race was actually run judged
-    against the athlete's estimated fitness then plus HR, not just its raw pace.
+    no pre-race prediction was available) and effort_ratio (actual pace / pace
+    predicted by the fitness estimate as of the day before the race, >1 =
+    slower than predicted): how hard the race was actually run judged against
+    the athlete's estimated fitness then plus HR, not just its raw pace.
     A hard-day race can legitimately read "hard" even when genuinely raced;
     treat a ratio near a band edge as a close call, not a hard verdict.
     """
@@ -2738,8 +2739,9 @@ def run_sql(query: str) -> str:
       (run_type_inferred is inferred for untagged rows; COALESCE with run_type via
       workout_type=0 for the effective type — see EFFECTIVE_RUN_TYPE_SQL in db.py.
       race_effort/effort_ratio are derived, rebuilt each sync — raced/hard/casual
-      judged against the fitness checkpoint for the race's month plus HR; null
-      when no checkpoint prediction was available for that category.
+      judged against the fitness estimate as of the day before the race plus HR;
+      effort_ratio = actual/predicted pace (>1 = slower than predicted); null
+      when no pre-race prediction was available for that category.
       dominant_intensity is derived, rebuilt each sync — the work-lap intensity
       (see laps.intensity) holding >=60% of a workout's work-lap time, else NULL;
       stands in for workout_label on unlabeled sessions, e.g. "all my threshold
