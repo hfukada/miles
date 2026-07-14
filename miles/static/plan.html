@@ -157,6 +157,7 @@
     @media (max-width: 640px) {
       .plan-view .cal { display: none; }
       .plan-view .cal-cards { display: flex; flex-direction: column; gap: 0.75rem; }
+      .plan-view .day-popover-run { min-height: 44px; padding: 0.625rem 0.5rem; }
     }
     .plan-view .cal-header .cal-hcell {
       font-size: 0.625rem;
@@ -520,6 +521,22 @@
       text-overflow: ellipsis;
     }
     .plan-view .cal-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+
+    /* Popover-only synced-run link — same look as .cal-run plus a hover
+       background and an accent-colored affordance arrow; the whole row is
+       tappable rather than just the text. */
+    .plan-view .day-popover-run {
+      justify-content: space-between;
+      text-decoration: none;
+      color: inherit;
+      border-radius: 6px;
+      padding: 0.4375rem 0.5rem;
+      margin: 0.0625rem -0.5rem;
+    }
+    .plan-view .day-popover-run:hover { background: var(--bg); }
+    .plan-view .day-popover-run-main { display: flex; align-items: center; gap: 0.25rem; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .plan-view .day-popover-run-arrow { color: var(--accent); flex-shrink: 0; margin-left: 0.5rem; }
+    .plan-view .day-popover-run:hover .day-popover-run-arrow { text-decoration: underline; }
 
     /* plan_log annotation marker — small dot, top-left of the cell. */
     .plan-view .cal-log-marker {
@@ -935,7 +952,7 @@
           <button class="day-popover-close" id="day-popover-close" aria-label="Close">×</button>
           <div class="day-popover-date">${esc(longDate(dateStr))}</div>
           ${body}
-          ${runs.length ? `<div class="day-popover-section"><div class="subchart-label">Synced</div>${runs.map(r => runLine(r, { showPace: true })).join('')}</div>` : ''}
+          ${runs.length ? `<div class="day-popover-section"><div class="subchart-label">Synced</div>${runs.map(r => runLine(r, { showPace: true, link: true })).join('')}</div>` : ''}
           ${logs.length ? `<div class="day-popover-section"><div class="subchart-label">Log</div>${logs.map(l => `<div class="day-popover-log">${esc(l.action)}${l.reason ? ': ' + esc(l.reason) : ''}</div>`).join('')}</div>` : ''}
           ${!sessions.length && !runs.length && !logs.length ? `<p class="day-popover-empty">No plan data for this day.</p>` : ''}
         </div>
@@ -1557,16 +1574,24 @@
   // showPace inlines the pace text rather than leaving it only in the
   // title= tooltip — the day popover needs it visible on touch, where
   // tooltips never fire; the calendar's compact pill keeps it tooltip-only.
+  // opts.link renders the row as a link to the activity detail page — only
+  // the popover call site sets it; the calendar cell and mobile week card
+  // own their own click handler on the whole day, so a nested anchor there
+  // would fight it.
   function runLine(r, opts) {
     const color = TYPE_COLOR[r.run_type] ?? 'var(--muted)';
     const titleParts = [esc(r.name ?? '')];
     if (r.pace_min_per_mile != null) titleParts.push(`${fmt.pace(r.pace_min_per_mile)}/mi`);
     const title = titleParts.join(' · ');
     const paceInline = opts && opts.showPace && r.pace_min_per_mile != null ? ` · ${fmt.pace(r.pace_min_per_mile)}/mi` : '';
-    return `<div class="cal-run" title="${title}">
-      <span class="cal-dot" style="background:${color}"></span>
-      <span>${r.distance_mi.toFixed(1)} mi${paceInline}</span>
-    </div>`;
+    const main = `<span class="cal-dot" style="background:${color}"></span><span>${r.distance_mi.toFixed(1)} mi${paceInline}</span>`;
+    if (opts && opts.link) {
+      return `<a class="cal-run day-popover-run" href="/activity.html?id=${r.activity_id}" title="${title}">
+        <span class="day-popover-run-main">${main}</span>
+        <span class="day-popover-run-arrow">&rarr;</span>
+      </a>`;
+    }
+    return `<div class="cal-run" title="${title}">${main}</div>`;
   }
 
   // A rest day carries no number line regardless of whether target_miles is
