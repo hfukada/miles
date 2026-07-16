@@ -1,6 +1,10 @@
 services:
   miles-api:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_HASH: ${GIT_HASH:-latest}
+        BUILD_TIME: ${BUILD_TIME:-}
     ports:
       - "8000:8000"
     volumes:

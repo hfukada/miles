@@ -176,6 +176,18 @@ function renderNav() {
   if (path === "/workbook.html") workbookLink.classList.add("active");
   header.insertBefore(workbookLink, nav);
 
+  // --- build/version info ---
+  const versionEl = document.createElement("span");
+  versionEl.className = "build-version";
+  header.appendChild(versionEl);
+  fetch("/api/version")
+    .then((res) => res.json())
+    .then((data) => {
+      versionEl.textContent = `${data.build_time} · ${data.git_hash}`;
+    })
+    .catch(() => {});
+  // --- end build/version info ---
+
   document.body.insertBefore(header, document.body.firstChild);
 }
 

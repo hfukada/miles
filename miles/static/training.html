@@ -141,6 +141,10 @@
     <h2>Efficiency</h2>
     <p class="desc">Work-lap heart rate vs pace by year · are you faster at the same effort? · click chips to combine years</p>
     <div class="chip-row" id="chip-row-hr"></div>
+    <label class="compare-years-toggle">
+      <input type="checkbox" id="compare-years-toggle">
+      Compare years
+    </label>
     <div class="chart-wrap">
       <div id="chart-hr-pace" style="width:100%;height:100%"></div>
     </div>
@@ -446,6 +450,8 @@
 
   const HR_BUCKET_WIDTH = 5;
   const PACE_BUCKET_WIDTH_S = 20;
+  const HR_FLOOR = 120; // drop laps below this HR
+  const PACE_CEIL_S = 15 * 60; // drop laps slower than this pace
 
   function paceBucketLabel(bucketS) {
     const m = Math.floor(bucketS / 60);
@@ -478,6 +484,7 @@
     let selected = new Set([allYears[allYears.length - 1]]);
 
     const chart = echarts.init(document.getElementById('chart-hr-pace'));
+    const compareToggle = document.getElementById('compare-years-toggle');
 
     function renderChips() {
       const html = allYears.map(y => {
@@ -490,9 +497,28 @@
       document.getElementById('chip-row-hr').innerHTML = html.join('');
     }
 
+    function median(sortedSubset) {
+      const arr = [...sortedSubset].sort((a, b) => a - b);
+      const mid = Math.floor(arr.length / 2);
+      return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+    }
+
+    // Same-cell dots from different years are offset side by side (Olympic
+    // rings style) rather than stacked, so overlapping colors stay visible.
+    // Category axes place data at fixed integer pixel ticks, so the offset
+    // has to be applied in pixel space via symbolOffset, not the data value.
+    const RING_SPREAD_PX = 16;
+    function ringOffsetPx(slot, total) {
+      if (total <= 1) return 0;
+      return (slot - (total - 1) / 2) * (RING_SPREAD_PX / Math.max(total - 1, 1));
+    }
+
     function render() {
       renderChips();
-      const activePoints = allYears.filter(y => selected.has(y)).flatMap(y => pointsByYear.get(y));
+      const compareYears = compareToggle.checked;
+      const activeYears = allYears.filter(y => selected.has(y));
+      const activePoints = activeYears.flatMap(y => pointsByYear.get(y))
+        .filter(p => p.hr_bucket >= HR_FLOOR && p.pace_bucket < PACE_CEIL_S);
 
       if (!activePoints.length) {
         chart.setOption({
@@ -507,44 +533,22 @@
       const hrIndex = new Map(hrBuckets.map((b, i) => [b, i]));
       const paceIndex = new Map(paceBuckets.map((b, i) => [b, i]));
 
-      const counts = new Map();
-      const pacesByHr = new Map();
-      for (const p of activePoints) {
-        const key = `${p.hr_bucket}:${p.pace_bucket}`;
-        counts.set(key, (counts.get(key) ?? 0) + 1);
-        if (!pacesByHr.has(p.hr_bucket)) pacesByHr.set(p.hr_bucket, []);
-        pacesByHr.get(p.hr_bucket).push(p.pace_bucket);
-      }
-
-      // Normalized per HR column, not globally.
-      const maxCountByHr = new Map();
-      for (const [key, count] of counts) {
-        const hr = Number(key.split(':')[0]);
-        maxCountByHr.set(hr, Math.max(maxCountByHr.get(hr) ?? 0, count));
-      }
-      const heatData = [...counts.entries()].map(([key, count]) => {
-        const [hr, pace] = key.split(':').map(Number);
-        return { value: [hrIndex.get(hr), paceIndex.get(pace), count / maxCountByHr.get(hr)], rawCount: count };
-      });
-
-      function median(sortedSubset) {
-        const arr = [...sortedSubset].sort((a, b) => a - b);
-        const mid = Math.floor(arr.length / 2);
-        return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
-      }
-      // Fractional index: median can land between two bucket ticks.
-      const lineData = [...pacesByHr.entries()]
-        .sort((a, b) => a[0] - b[0])
-        .map(([hr, paces]) => [hrIndex.get(hr), (median(paces) - paceBuckets[0]) / PACE_BUCKET_WIDTH_S]);
-
-      chart.setOption({
-        animation: false,
-        grid: { top: 24, right: 24, bottom: 48, left: 64 },
-        tooltip: {
-          backgroundColor: theme.surface,
-          borderColor: theme.gridline,
-          textStyle: { fontSize: 12, color: theme.text },
-          formatter(p) {
+      const tooltipFormatter = compareYears
+        ? (p) => {
+            if (p.seriesType !== 'scatter') {
+              const hr = hrBuckets[Math.round(p.value[0])];
+              return `<div style="font-weight:600;color:${theme.text}">${p.seriesName}</div>
+                <div>${hr}–${hr + HR_BUCKET_WIDTH} bpm · median pace ${fmt.pace((paceBuckets[0] + p.value[1] * PACE_BUCKET_WIDTH_S) / 60)} /mi</div>`;
+            }
+            const hr = hrBuckets[p.data.hrIdx];
+            const pace = paceBuckets[p.data.paceIdx];
+            const count = p.data.rawCount;
+            return `<div style="font-weight:600;margin-bottom:4px;color:${theme.text}">${p.seriesName}</div>
+              <div>${hr}–${hr + HR_BUCKET_WIDTH} bpm</div>
+              <div>Pace ${paceBucketLabel(pace)}–${paceBucketLabel(pace + PACE_BUCKET_WIDTH_S)} /mi</div>
+              <div><b>${count}</b> lap${count === 1 ? '' : 's'}</div>`;
+          }
+        : (p) => {
             if (p.seriesName === 'Laps') {
               const hr = hrBuckets[p.value[0]];
               const pace = paceBuckets[p.value[1]];
@@ -556,7 +560,126 @@
             const hr = hrBuckets[p.value[0]];
             return `<div style="font-weight:600;color:${theme.text}">${hr}–${hr + HR_BUCKET_WIDTH} bpm</div>
               <div>Median pace ${fmt.pace((paceBuckets[0] + p.value[1] * PACE_BUCKET_WIDTH_S) / 60)} /mi</div>`;
+          };
+
+      let series;
+      if (compareYears) {
+        series = [];
+        activeYears.forEach((year, i) => {
+          const color = yearColor(theme, ranks.get(year));
+          const yearPoints = pointsByYear.get(year)
+            .filter(p => p.hr_bucket >= HR_FLOOR && p.pace_bucket < PACE_CEIL_S);
+          const offsetPx = ringOffsetPx(i, activeYears.length);
+
+          const counts = new Map();
+          const pacesByHr = new Map();
+          for (const p of yearPoints) {
+            const key = `${p.hr_bucket}:${p.pace_bucket}`;
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+            if (!pacesByHr.has(p.hr_bucket)) pacesByHr.set(p.hr_bucket, []);
+            pacesByHr.get(p.hr_bucket).push(p.pace_bucket);
+          }
+          // Normalized per HR column, within this year, so sizing reflects
+          // how concentrated that year's laps are at a given effort level.
+          const maxCountByHr = new Map();
+          for (const [key, count] of counts) {
+            const hr = Number(key.split(':')[0]);
+            maxCountByHr.set(hr, Math.max(maxCountByHr.get(hr) ?? 0, count));
+          }
+          const dotData = [...counts.entries()].map(([key, count]) => {
+            const [hr, pace] = key.split(':').map(Number);
+            return {
+              value: [hrIndex.get(hr), paceIndex.get(pace), count / maxCountByHr.get(hr)],
+              hrIdx: hrIndex.get(hr),
+              paceIdx: paceIndex.get(pace),
+              rawCount: count,
+            };
+          });
+
+          const lineData = [...pacesByHr.entries()]
+            .sort((a, b) => a[0] - b[0])
+            .map(([hr, paces]) => [hrIndex.get(hr), (median(paces) - paceBuckets[0]) / PACE_BUCKET_WIDTH_S]);
+
+          series.push({
+            name: String(year),
+            type: 'scatter',
+            symbol: 'circle',
+            symbolSize: value => 5 + value[2] * 14,
+            symbolOffset: [offsetPx, 0],
+            data: dotData,
+            itemStyle: { color: withAlpha(color, theme.isDark ? 0.75 : 0.65), borderColor: theme.surface, borderWidth: 1 },
+            emphasis: { itemStyle: { borderColor: theme.text, borderWidth: 1.5 } },
+          });
+          series.push({
+            name: `${year} median`,
+            type: 'line',
+            data: lineData,
+            symbol: 'circle',
+            symbolSize: 5,
+            connectNulls: true,
+            lineStyle: { color, width: 2 },
+            itemStyle: { color },
+            z: 10,
+          });
+        });
+      } else {
+        const counts = new Map();
+        const pacesByHr = new Map();
+        for (const p of activePoints) {
+          const key = `${p.hr_bucket}:${p.pace_bucket}`;
+          counts.set(key, (counts.get(key) ?? 0) + 1);
+          if (!pacesByHr.has(p.hr_bucket)) pacesByHr.set(p.hr_bucket, []);
+          pacesByHr.get(p.hr_bucket).push(p.pace_bucket);
+        }
+
+        // Normalized per HR column, not globally.
+        const maxCountByHr = new Map();
+        for (const [key, count] of counts) {
+          const hr = Number(key.split(':')[0]);
+          maxCountByHr.set(hr, Math.max(maxCountByHr.get(hr) ?? 0, count));
+        }
+        const heatData = [...counts.entries()].map(([key, count]) => {
+          const [hr, pace] = key.split(':').map(Number);
+          return { value: [hrIndex.get(hr), paceIndex.get(pace), count / maxCountByHr.get(hr)], rawCount: count };
+        });
+
+        // Fractional index: median can land between two bucket ticks.
+        const lineData = [...pacesByHr.entries()]
+          .sort((a, b) => a[0] - b[0])
+          .map(([hr, paces]) => [hrIndex.get(hr), (median(paces) - paceBuckets[0]) / PACE_BUCKET_WIDTH_S]);
+
+        series = [
+          {
+            name: 'Laps',
+            type: 'scatter',
+            symbol: 'circle',
+            symbolSize: value => 6 + value[2] * 18,
+            data: heatData,
+            itemStyle: { color: withAlpha(theme.accent, theme.isDark ? 0.75 : 0.65), borderColor: theme.surface, borderWidth: 1 },
+            emphasis: { itemStyle: { borderColor: theme.text, borderWidth: 1.5 } },
           },
+          {
+            name: 'Median pace',
+            type: 'line',
+            data: lineData,
+            symbol: 'circle',
+            symbolSize: 6,
+            connectNulls: true,
+            lineStyle: { color: theme.series[5], width: 2.5 },
+            itemStyle: { color: theme.series[5] },
+            z: 10,
+          },
+        ];
+      }
+
+      chart.setOption({
+        animation: false,
+        grid: { top: 24, right: 24, bottom: 48, left: 64 },
+        tooltip: {
+          backgroundColor: theme.surface,
+          borderColor: theme.gridline,
+          textStyle: { fontSize: 12, color: theme.text },
+          formatter: tooltipFormatter,
         },
         xAxis: {
           type: 'category',
@@ -583,28 +706,7 @@
           nameGap: 48,
           nameTextStyle: { fontSize: 11, color: theme.muted },
         },
-        series: [
-          {
-            name: 'Laps',
-            type: 'scatter',
-            symbol: 'circle',
-            symbolSize: value => 6 + value[2] * 18,
-            data: heatData,
-            itemStyle: { color: withAlpha(theme.accent, theme.isDark ? 0.75 : 0.65), borderColor: theme.surface, borderWidth: 1 },
-            emphasis: { itemStyle: { borderColor: theme.text, borderWidth: 1.5 } },
-          },
-          {
-            name: 'Median pace',
-            type: 'line',
-            data: lineData,
-            symbol: 'circle',
-            symbolSize: 6,
-            connectNulls: true,
-            lineStyle: { color: theme.series[5], width: 2.5 },
-            itemStyle: { color: theme.series[5] },
-            z: 10,
-          },
-        ],
+        series,
       }, { replaceMerge: ['series'] });
     }
 
@@ -620,6 +722,8 @@
       }
       render();
     });
+
+    compareToggle.addEventListener('change', () => render());
 
     render();
     window.addEventListener('resize', () => chart.resize());
