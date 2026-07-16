@@ -1917,13 +1917,16 @@
     if (!progression || !progression.weeks.length) return;
     const { weeks, workouts, checkpoints, captions } = progression;
 
+    // Target bands come from plan versions — the plan-independent
+    // /api/progression payload has none, so don't advertise them.
+    const hasBands = workouts.some(w => w.pace_lo != null && w.pace_hi != null);
     rootEl('trends').insertAdjacentHTML('beforeend', `
       <section id="section-progression-workouts">
         <h2>Workout pace progression</h2>
-        <p class="desc">Each dot is one synced workout's work-lap pace · shaded band is its frozen target range · dashed line is monthly 5K-pace fitness context</p>
+        <p class="desc">Each dot is one synced workout's work-lap pace${hasBands ? ' · shaded band is its frozen target range' : ''} · dashed line is monthly 5K-pace fitness context</p>
         <div class="chart-wrap"><div id="chart-workouts" style="width:100%;height:100%"></div></div>
         <div class="chart-legend">
-          <span class="legend-swatch"><span class="legend-box" style="background:${withAlpha(cssVar('--muted'), 0.35)}"></span>Target band</span>
+          ${hasBands ? `<span class="legend-swatch"><span class="legend-box" style="background:${withAlpha(cssVar('--muted'), 0.35)}"></span>Target band</span>` : ''}
           <span class="legend-swatch"><span class="legend-box" style="background:${cssVar('--series-8')}"></span>Actual pace</span>
           <span class="legend-swatch"><span class="legend-line"></span>5K fitness (monthly)</span>
         </div>
