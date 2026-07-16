@@ -61,6 +61,24 @@ _logger = logging.getLogger(__name__)
 _sync_proc: _subprocess.Popen[bytes] | None = None
 _REPO_ROOT = Path(__file__).parent.parent
 
+# GIT_HASH/BUILD_TIME are baked into the image env at `docker build` time
+# (see Dockerfile, docker-build.sh). Outside Docker, or if unset, fall back
+# to "latest" and this process's actual start time.
+_PROCESS_START_TIME = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class VersionInfo(TypedDict):
+    git_hash: str
+    build_time: str
+
+
+@app.get("/api/version")
+def get_version() -> VersionInfo:
+    return {
+        "git_hash": os.environ.get("GIT_HASH") or "latest",
+        "build_time": os.environ.get("BUILD_TIME") or _PROCESS_START_TIME,
+    }
+
 _BUILD_WEEKS = 12
 _RUN_TYPES = ("Run", "TrailRun", "VirtualRun")
 _STATIC = Path(__file__).parent / "static"
