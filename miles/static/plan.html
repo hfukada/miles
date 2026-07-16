@@ -28,7 +28,8 @@
       line-height: 1.55;
     }
     .plan-view .plan-empty h2 { font-size: 1rem; color: var(--text); margin-bottom: 0.5rem; }
-    .plan-view .plan-empty code {
+    .plan-view .plan-empty code,
+    .plan-view .plan-tab-note code {
       background: var(--bg);
       border: 1px solid var(--border);
       border-radius: 4px;
@@ -869,38 +870,44 @@
   // renders straight into #root with no tabs at all, unchanged from v1.
   // -----------------------------------------------------------------------
 
-  const PLAN_TABS = ['today', 'overall'];
+  const PLAN_TABS = ['today', 'trends', 'plan'];
 
-  // ECharts measures its container at init, and every Overall chart is built
-  // while #tab-overall is hidden (zero-size) — so each instance registers
-  // here and gets re-measured whenever the tab is shown.
-  const OVERALL_CHARTS = [];
+  // ECharts measures its container at init, and every Trends/Plan chart is
+  // built while its panel is hidden (zero-size) — so each instance registers
+  // into the bucket for the tab it lives in and gets re-measured when that
+  // tab is revealed.
+  const TAB_CHARTS = { trends: [], plan: [] };
 
-  // Every Overall-section render function inserts here — #tab-overall when
-  // tabs exist, #root directly when they don't (completed-plan retrospective,
-  // no Today to tab away from).
-  function rootEl() {
-    return document.getElementById('tab-overall') ?? document.getElementById('root');
+  // Every Trends/Plan-section render function inserts here — #tab-{trends,plan}
+  // when tabs exist, #root directly when they don't (completed-plan
+  // retrospective, no Today to tab away from).
+  function rootEl(tab) {
+    return document.getElementById(`tab-${tab}`) ?? document.getElementById('root');
   }
 
   function renderTabs() {
     document.getElementById('root').insertAdjacentHTML('beforeend', `
       <div class="mode-tabs" id="plan-tabs">
         <button class="mode-tab" data-tab="today">Today</button>
-        <button class="mode-tab" data-tab="overall">Overall</button>
+        <button class="mode-tab" data-tab="trends">Trends</button>
+        <button class="mode-tab" data-tab="plan">Plan</button>
       </div>
       <div id="tab-today" class="tab-panel"></div>
-      <div id="tab-overall" class="tab-panel" hidden></div>`);
+      <div id="tab-trends" class="tab-panel" hidden></div>
+      <div id="tab-plan" class="tab-panel" hidden>
+        <p class="desc plan-tab-note">Plans are created, amended, and abandoned in chat with <code>/miles-plan</code>.</p>
+      </div>`);
     document.querySelectorAll('#plan-tabs .mode-tab').forEach(btn => {
       btn.addEventListener('click', () => activatePlanTab(btn.dataset.tab));
     });
   }
 
   function activatePlanTab(key) {
+    if (key === 'overall') key = 'plan'; // legacy bookmark from the old Today/Overall split
     if (!PLAN_TABS.includes(key)) key = 'today';
     document.querySelectorAll('#plan-tabs .mode-tab').forEach(b => b.classList.toggle('active', b.dataset.tab === key));
     document.querySelectorAll('.tab-panel').forEach(el => { el.hidden = el.id !== `tab-${key}`; });
-    if (key === 'overall') OVERALL_CHARTS.forEach(c => c.resize());
+    if (TAB_CHARTS[key]) TAB_CHARTS[key].forEach(c => c.resize());
     history.replaceState(null, '', `#${key}`);
   }
 
@@ -998,7 +1005,7 @@
 
   // -----------------------------------------------------------------------
   // Readiness — "race is in N weeks, am I ready?", the first section of the
-  // Overall tab for an ACTIVE plan (a completed plan renders the
+  // Plan tab for an ACTIVE plan (a completed plan renders the
   // retrospective in this slot instead — the same panel pointed backward).
   // Headline strip + three evidence rows off /api/plan-readiness; execution
   // reads the already-fetched /api/plan-adherence. Everything build-related
@@ -1147,7 +1154,7 @@
     }];
     const chart = echarts.init(el);
     chart.setOption(opt);
-    OVERALL_CHARTS.push(chart);
+    TAB_CHARTS.plan.push(chart);
     window.addEventListener('resize', () => chart.resize());
   }
 
@@ -1176,13 +1183,13 @@
     ];
     const chart = echarts.init(el);
     chart.setOption(opt);
-    OVERALL_CHARTS.push(chart);
+    TAB_CHARTS.plan.push(chart);
     window.addEventListener('resize', () => chart.resize());
   }
 
   // The build row's figure + sentence + strip stat all follow the flipped
   // reference; the chart is a single instance that gets setOption'd on flip,
-  // so the OVERALL_CHARTS resize registration stays valid.
+  // so the TAB_CHARTS.plan resize registration stays valid.
   function initBuildRow(builds, planWeeks) {
     const el = document.getElementById('readiness-fig-build');
     if (!el) return;
@@ -1205,7 +1212,7 @@
     ];
     const chart = echarts.init(el);
     chart.setOption(opt);
-    OVERALL_CHARTS.push(chart);
+    TAB_CHARTS.plan.push(chart);
     window.addEventListener('resize', () => chart.resize());
 
     function applyReference(refDate) {
@@ -1316,7 +1323,7 @@
       </div>` : '';
 
     const rows = fitnessRow + buildRow + sessionsRow;
-    rootEl().insertAdjacentHTML('beforeend', `
+    rootEl('plan').insertAdjacentHTML('beforeend', `
       <section id="section-readiness">
         <h2>Readiness</h2>
         <p class="desc">Goal vs fitness, this block vs a reference build, and session execution — build numbers are cumulative through the same weeks-out point on both sides${builds ? ' · flip the chips to change the reference' : ''}</p>
@@ -1369,7 +1376,7 @@
   function renderRetrospective(data, retro) {
     const { plan } = data;
     if (!retro) {
-      rootEl().insertAdjacentHTML('beforeend', `
+      rootEl('plan').insertAdjacentHTML('beforeend', `
         <div class="stat-strip"><div class="stat">
           <div class="stat-label">Retrospective</div>
           <div class="stat-value">—<span class="stat-sub">loading…</span></div>
@@ -1408,7 +1415,7 @@
         <div class="stat-sub">${goal.predicted_time != null ? `${goal.predicted_time} predicted (${esc(goal.predicted_confidence ?? '')})` : 'no pre-race fitness estimate'}</div>
       </div>` : '';
 
-    rootEl().insertAdjacentHTML('beforeend', `
+    rootEl('plan').insertAdjacentHTML('beforeend', `
       <section id="section-retrospective">
         <h2>Race retrospective</h2>
         <p class="desc">${esc(plan.title)} closed out ${shortDate(plan.race_date)}</p>
@@ -1461,7 +1468,7 @@
     const caption = mileageCaption(weeks);
     const flagTypesPresent = hasFlags ? [...new Set(flags.map(f => f.type))] : [];
 
-    rootEl().insertAdjacentHTML('beforeend', `
+    rootEl('plan').insertAdjacentHTML('beforeend', `
       <section id="section-chart">
         <h2>Weekly mileage</h2>
         <p class="desc">Bars are actual synced miles${hasBands ? ', colored by adherence band' : ''} · dashed line is the planned weekly target · current week is still in progress${hasFlags ? ' · shaded span marks a flagged pattern' : ''}</p>
@@ -1498,7 +1505,7 @@
     const markArea = hasFlags ? { silent: true, data: flagMarkAreas(flags) } : undefined;
 
     const chart = echarts.init(document.getElementById('chart-weekly'));
-    OVERALL_CHARTS.push(chart);
+    TAB_CHARTS.plan.push(chart);
     chart.setOption({
       animation: false,
       grid: { top: 24, right: 24, bottom: 32, left: 48 },
@@ -1737,7 +1744,7 @@
     const weekdayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     const hasBands = bandByWeek && bandByWeek.size > 0;
 
-    rootEl().insertAdjacentHTML('beforeend', `
+    rootEl('plan').insertAdjacentHTML('beforeend', `
       <section id="section-calendar">
         <h2>Calendar</h2>
         <p class="desc">Dashed chip is the planned slot, colored by type · filled pill is the synced run · dot marker is a plan_log note · ▲ marks a trail day · click any day or week for detail${hasBands ? ' · colored chip is the completed week’s adherence band' : ''} · current week highlighted</p>
@@ -1772,7 +1779,7 @@
   function renderFlags(adherence) {
     if (!adherence || !adherence.flags || !adherence.flags.length) return;
 
-    rootEl().insertAdjacentHTML('beforeend', `
+    rootEl('plan').insertAdjacentHTML('beforeend', `
       <section id="section-flags">
         <h2>Flags</h2>
         <p class="desc">Patterns only — 2+ consecutive completed weeks, never a single day or week</p>
@@ -1799,7 +1806,7 @@
     if (!progression || !progression.weeks.length) return;
     const { weeks, easy, captions } = progression;
 
-    rootEl().insertAdjacentHTML('beforeend', `
+    rootEl('trends').insertAdjacentHTML('beforeend', `
       <section id="section-progression-easy">
         <h2>Easy HR/pace progression</h2>
         <p class="desc">Distance-weighted average over each week's easy runs · gaps are weeks with no easy run synced · hover for average apparent temperature</p>
@@ -1871,11 +1878,11 @@
 
     const paceChart = echarts.init(document.getElementById('chart-easy-pace'));
     paceChart.setOption(baseOption('Easy pace', paceData, { inverse: true, axisLabel: { fontSize: 10, color: theme.muted, formatter: fmt.pace } }));
-    OVERALL_CHARTS.push(paceChart);
+    TAB_CHARTS.trends.push(paceChart);
 
     const hrChart = echarts.init(document.getElementById('chart-easy-hr'));
     hrChart.setOption(baseOption('Easy HR', hrData, {}));
-    OVERALL_CHARTS.push(hrChart);
+    TAB_CHARTS.trends.push(hrChart);
 
     window.addEventListener('resize', () => { paceChart.resize(); hrChart.resize(); });
   }
@@ -1893,7 +1900,7 @@
     if (!progression || !progression.weeks.length) return;
     const { weeks, workouts, checkpoints, captions } = progression;
 
-    rootEl().insertAdjacentHTML('beforeend', `
+    rootEl('trends').insertAdjacentHTML('beforeend', `
       <section id="section-progression-workouts">
         <h2>Workout pace progression</h2>
         <p class="desc">Each dot is one synced workout's work-lap pace · shaded band is its frozen target range · dashed line is monthly 5K-pace fitness context</p>
@@ -1937,7 +1944,7 @@
       : {};
 
     const chart = echarts.init(document.getElementById('chart-workouts'));
-    OVERALL_CHARTS.push(chart);
+    TAB_CHARTS.trends.push(chart);
     chart.setOption({
       animation: false,
       grid: { top: 24, right: 24, bottom: 32, left: 48 },
@@ -2099,7 +2106,7 @@
     const ordered = [...versions].reverse();
     const latest = ordered[0];
     const annot = `<span class="version-annot">v${latest.version_n} · ${esc(latest.author)} · revised ${shortDate(latest.created_at.slice(0, 10))}</span>`;
-    rootEl().insertAdjacentHTML('beforeend', `
+    rootEl('plan').insertAdjacentHTML('beforeend', `
       <section id="section-versions">
         <h2>Version history${annot}</h2>
         <p class="desc">Every revision is a full snapshot · click a version with a note to see which weeks changed</p>
@@ -2517,7 +2524,17 @@
 
     document.getElementById('root').addEventListener('click', e => {
       const el = e.target.closest('[data-plan-date]');
-      if (el) openDayPopover(el.dataset.planDate);
+      if (el) { openDayPopover(el.dataset.planDate); return; }
+      // In-page section anchors (e.g. Readiness's "Workout progression" link)
+      // can point into a different, currently-hidden tab — switch tabs before
+      // scrolling, or the browser's default jump lands on a zero-height panel.
+      const jump = e.target.closest('a[href^="#section-"]');
+      if (jump) {
+        e.preventDefault();
+        const targetId = jump.getAttribute('href').slice(1);
+        activatePlanTab('trends');
+        document.getElementById(targetId)?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
     });
   }).catch(err => {
     document.getElementById('subtitle').textContent = `Error: ${err.message}`;
