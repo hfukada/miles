@@ -632,6 +632,24 @@
     .plan-view .retro-link { color: inherit; text-decoration: none; }
     .plan-view .retro-link:hover { text-decoration: underline; }
 
+    /* Retrospective marker — the completed-plan Plan tab's only visual cue
+       that it's showing a closed-out plan rather than an active one, since
+       everything below it (readiness's replacement, chart, calendar) reuses
+       the same layout either way. */
+    .plan-view .retro-marker {
+      display: inline-block;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 0.125rem 0.625rem;
+      margin-bottom: 0.75rem;
+    }
+
     /* Readiness evidence rows — same anatomy as the retrospective (headline
        strip above, then compact evidence), each row a small figure + one
        sentence + a link deeper. Figures are fixed-size sparkline panels;
@@ -865,9 +883,10 @@
   // -----------------------------------------------------------------------
   // View tabs — house idiom (see races.html): buttons toggle .active on
   // click, panels toggle the `hidden` attribute, hash-routed with
-  // history.replaceState so back doesn't step through tabs. Only built for
-  // an active plan with a Today to show; a completed plan's retrospective
-  // renders straight into #root with no tabs at all, unchanged from v1.
+  // history.replaceState so back doesn't step through tabs. Always built,
+  // in every plan state (active, completed-only, or none at all) — Today
+  // and Plan render different content per state, Trends is identical
+  // everywhere (see renderProgressionEasy/Workouts/renderRecentMileage).
   // -----------------------------------------------------------------------
 
   const PLAN_TABS = ['today', 'trends', 'plan'];
@@ -878,9 +897,7 @@
   // tab is revealed.
   const TAB_CHARTS = { trends: [], plan: [] };
 
-  // Every Trends/Plan-section render function inserts here — #tab-{trends,plan}
-  // when tabs exist, #root directly when they don't (completed-plan
-  // retrospective, no Today to tab away from).
+  // Every Trends/Plan-section render function inserts here.
   function rootEl(tab) {
     return document.getElementById(`tab-${tab}`) ?? document.getElementById('root');
   }
@@ -987,12 +1004,12 @@
   }
 
   // -----------------------------------------------------------------------
-  // Empty state
+  // No-plan-at-all card — the Plan tab's content when /api/plan returns
+  // null (no active or completed plan exists at all).
   // -----------------------------------------------------------------------
 
-  function renderEmpty() {
-    document.getElementById('subtitle').textContent = 'No active plan.';
-    document.getElementById('root').innerHTML = `
+  function renderPlanEmptyCard() {
+    rootEl('plan').insertAdjacentHTML('beforeend', `
       <div class="plan-empty">
         <h2>No training plan yet</h2>
         <p>Once a plan is drafted, this page tracks planned vs actual weekly mileage,
@@ -1000,7 +1017,7 @@
         <p style="margin-top:0.75rem">Draft one in conversation with <code>/miles-plan</code> —
         it pulls your fitness estimate, past builds, and historical ramp/workout cadence,
         proposes a week-by-week skeleton, and writes it only once you approve.</p>
-      </div>`;
+      </div>`);
   }
 
   // -----------------------------------------------------------------------
@@ -2032,6 +2049,86 @@
   }
 
   // -----------------------------------------------------------------------
+  // Recent weekly mileage + fitness stat strip — the two Trends sections
+  // that render identically in every plan state (unlike the two chart above,
+  // which read either /api/plan-progression's plan-scoped window or
+  // /api/progression's rolling one depending on state, these two are always
+  // plan-independent). A plain bar chart of the last 16 weeks from
+  // /api/weekly-history — no bands, no ramp line, just "what actually
+  // happened" — and a one-line current-fitness caption reusing whatever
+  // checkpoints the progression payload already fetched, rather than a third
+  // network request.
+  // -----------------------------------------------------------------------
+
+  const RECENT_MILEAGE_WEEKS = 16;
+
+  function renderRecentMileage(weeklyHistory) {
+    if (!weeklyHistory || !weeklyHistory.weeks.length) return;
+    const weeks = weeklyHistory.weeks.slice(-RECENT_MILEAGE_WEEKS);
+
+    rootEl('trends').insertAdjacentHTML('beforeend', `
+      <section id="section-recent-mileage">
+        <h2>Recent weekly mileage</h2>
+        <p class="desc">Last ${weeks.length} weeks of synced running, zero-filled for weeks with no runs</p>
+        <div class="chart-wrap"><div id="chart-recent-mileage" style="width:100%;height:100%"></div></div>
+      </section>`);
+
+    const theme = chartTheme();
+    const chart = echarts.init(document.getElementById('chart-recent-mileage'));
+    TAB_CHARTS.trends.push(chart);
+    chart.setOption({
+      animation: false,
+      grid: { top: 16, right: 24, bottom: 32, left: 48 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: theme.surface,
+        borderColor: theme.gridline,
+        textStyle: { fontSize: 12, color: theme.text },
+        formatter(params) {
+          const w = weeks[params[0].dataIndex];
+          if (!w) return '';
+          return `<div style="font-weight:600;color:${theme.text}">${shortDate(w.monday)}</div>
+            ${w.miles.toFixed(1)} mi · ${w.runs} run${w.runs === 1 ? '' : 's'}`;
+        },
+      },
+      xAxis: {
+        type: 'time',
+        axisLine: { lineStyle: { color: theme.gridline } },
+        axisTick: { show: false },
+        axisLabel: { fontSize: 11, color: theme.muted },
+      },
+      yAxis: {
+        type: 'value',
+        name: 'Miles',
+        nameLocation: 'middle',
+        nameGap: 34,
+        nameTextStyle: { fontSize: 11, color: theme.muted },
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { color: theme.gridline } },
+        axisLabel: { fontSize: 11, color: theme.muted },
+      },
+      series: [{
+        name: 'Miles',
+        type: 'bar',
+        data: weeks.map(w => [w.monday, w.miles]),
+        barMaxWidth: 16,
+        itemStyle: { color: theme.series[1], borderRadius: [2, 2, 0, 0] },
+      }],
+    });
+    window.addEventListener('resize', () => chart.resize());
+  }
+
+  function renderFitnessStrip(progression) {
+    const checkpoints = (progression && progression.checkpoints || []).filter(c => c.pace_5k != null);
+    if (!checkpoints.length) return;
+    const latest = checkpoints[checkpoints.length - 1];
+    rootEl('trends').insertAdjacentHTML('beforeend', `
+      <p class="chart-caption">Current 5K-pace fitness: ${fmt.pace(latest.pace_5k)}/mi as of ${shortDate(`${latest.month}-01`)}
+      · <a class="readiness-link" href="/training.html">Fitness chart →</a></p>`);
+  }
+
+  // -----------------------------------------------------------------------
   // Version history
   // -----------------------------------------------------------------------
 
@@ -2422,6 +2519,91 @@
       </div>`;
   }
 
+  // -----------------------------------------------------------------------
+  // Today dashboard — the Today tab's content whenever there's no active
+  // plan to show targets against (a completed-only plan, or none at all).
+  // Actual-only: synced runs as direct links, and a week-so-far card built
+  // purely from /api/today's numbers — no targets, meter, or ramp, since
+  // there's nothing to compare against. See PLAN_DATA construction in the
+  // load orchestrator: actualByDate merges /api/today's actual map on top of
+  // any plan's own (a completed plan's window rarely reaches "this week"),
+  // so the day-chip popovers below always resolve against fresh data.
+  // -----------------------------------------------------------------------
+
+  function dashboardKickerHTML(today) {
+    const dateLabel = new Date(today.date + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+    const ws = today.week_so_far;
+    const synced = ws.week_started && ws.week_cutoff_date < today.date
+      ? ` <span class="kicker-sub">· synced through ${shortDate(ws.week_cutoff_date)}</span>` : '';
+    return `<div class="race-countdown">${esc(dateLabel)}${synced}</div>`;
+  }
+
+  // The hero card holds real links to activity detail (runLine's link mode)
+  // rather than being itself a popover trigger — unlike the active plan's
+  // today-card, which has nothing clickable inside it to conflict with.
+  function dashboardTodayCardHTML(today) {
+    const runs = today.runs_today;
+    const body = runs.length
+      ? runs.map(r => runLine(r, { showPace: true, link: true })).join('')
+      : `<p class="desc" style="margin:0">No runs synced today yet.</p>`;
+    return `
+      <div class="today-card" style="cursor:default">
+        <div class="panel-label">Synced today</div>
+        ${body}
+      </div>`;
+  }
+
+  // A week-at-a-glance day-chip row with no plan targets behind it — just
+  // actual miles per day, reusing the .day-chip markup so it reads the same
+  // as the active plan's row. This is the dashboard's popover entry point
+  // (each chip carries data-plan-date); pairedBarSVG/vsLastWeekHTML below it
+  // stay exactly as the active Today card uses them, untouched.
+  function dashboardDayChipsHTML(today) {
+    const days = Array.from({ length: 7 }, (_, i) => addDays(today.week_start, i));
+    return `<div class="day-chip-row">${days.map(d => {
+      const runs = PLAN_DATA.actualByDate.get(d) ?? [];
+      const wd = new Date(d + 'T00:00:00').toLocaleDateString('en-US', { weekday: 'short' });
+      const miles = runs.reduce((s, r) => s + r.distance_mi, 0);
+      const stateClass = [runs.length ? 'done' : '', d === today.date ? 'today' : d > today.date ? 'upcoming' : ''].filter(Boolean).join(' ');
+      const num = runs.length ? trimMiles(miles) : (d < today.date ? '0' : '·');
+      return `<div class="day-chip ${stateClass}" style="--chip-color:var(--muted)" data-plan-date="${d}" title="${esc(wd)} ${esc(shortDate(d))}${runs.length ? ` · ${trimMiles(miles)} mi` : ''}">
+        <div class="day-chip-wd">${wd}</div>
+        <div class="day-chip-num">${num}</div>
+        <div class="day-chip-slot">&nbsp;</div>
+      </div>`;
+    }).join('')}</div>`;
+  }
+
+  function dashboardWeekCardHTML(today) {
+    const ws = today.week_so_far;
+    const parts = [`${ws.actual_miles.toFixed(1)} mi`, `${ws.actual_run_count} run${ws.actual_run_count === 1 ? '' : 's'}`];
+    if (ws.actual_workout_count) parts.push(`${ws.actual_workout_count} workout${ws.actual_workout_count === 1 ? '' : 's'}`);
+    const headline = ws.week_started ? parts.join(' · ') : '';
+    return `
+      <div class="week-card">
+        <div class="week-card-head">
+          <span class="panel-label">This week</span>
+          ${headline ? `<span class="week-headline">${esc(headline)}</span>` : ''}
+        </div>
+        ${dashboardDayChipsHTML(today)}
+        ${!ws.week_started ? `<p class="week-shape">Sync hasn't reached this week yet.</p>` : ''}
+        <div class="week-divider"></div>
+        ${vsLastWeekHTML(today)}
+      </div>`;
+  }
+
+  function renderTodayDashboard(today) {
+    const target = document.getElementById('tab-today');
+    if (!target) return;
+    target.innerHTML = `
+      ${dashboardKickerHTML(today)}
+      <div class="today-grid">
+        ${dashboardTodayCardHTML(today)}
+        ${dashboardWeekCardHTML(today)}
+      </div>
+      <p class="desc plan-tab-note">No active plan — see the <a href="#plan" data-tab-jump="plan">Plan tab</a>.</p>`;
+  }
+
   function renderToday(data) {
     const target = document.getElementById('tab-today');
     if (!target) return;
@@ -2455,8 +2637,17 @@
     return res.json();
   }
 
+  // The active-plan-scoped chart (frozen target bands, plan-window x-axis)
+  // vs the plan-independent rolling one (no bands, last RECENT_MILEAGE_WEEKS
+  // weeks) — decided once loadPlan() resolves, since it needs plan status.
   async function loadProgression() {
     const res = await fetch('/api/plan-progression');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async function loadProgressionFallback() {
+    const res = await fetch(`/api/progression?weeks=${RECENT_MILEAGE_WEEKS}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return res.json();
   }
@@ -2473,56 +2664,99 @@
     return res.json();
   }
 
+  async function loadToday() {
+    const res = await fetch('/api/today');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  async function loadWeeklyHistory() {
+    const res = await fetch('/api/weekly-history');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
   function renderHeader(data) {
+    if (!data) {
+      document.title = 'Miles · Plan';
+      document.getElementById('subtitle').textContent = 'No active plan.';
+      return;
+    }
     const { plan } = data;
     document.title = `Miles · ${plan.title}`;
     const parts = [distLabel(plan.distance_bucket), longDate(plan.race_date), plan.status];
     document.getElementById('subtitle').textContent = `${plan.title} · ${parts.join(' · ')}`;
   }
 
-  Promise.all([
-    loadPlan(),
-    loadVersions().catch(() => []),
-    loadAdherence().catch(() => null),
-    loadProgression().catch(() => null),
-    loadRetrospective().catch(() => null),
-    loadReadiness().catch(() => null),
-  ]).then(([data, versions, adherence, progression, retrospective, readiness]) => {
-    if (data === null) {
-      renderEmpty();
-      return;
-    }
+  loadPlan().then(data => {
+    // The progression endpoint choice depends on plan status, so it's fired
+    // only once loadPlan() resolves rather than joining the Promise.all below.
+    const status = data ? data.plan.status : null;
+    const progressionPromise = status === 'active' ? loadProgression() : loadProgressionFallback();
+    return Promise.all([
+      Promise.resolve(data),
+      loadVersions().catch(() => []),
+      loadAdherence().catch(() => null),
+      loadRetrospective().catch(() => null),
+      loadReadiness().catch(() => null),
+      loadToday().catch(() => null),
+      loadWeeklyHistory().catch(() => null),
+      progressionPromise.catch(() => null),
+    ]);
+  }).then(([data, versions, adherence, retrospective, readiness, today, weeklyHistory, progression]) => {
+    const status = data ? data.plan.status : null;
+
+    // actualByDate merges /api/today's map on top of the plan's own (when
+    // one exists) — a completed plan's window rarely still covers "this
+    // week", so the dashboard/popover always resolve against fresh data.
     PLAN_DATA = {
-      dayByDate: groupSessionsByDate(data.days),
-      actualByDate: new Map(Object.entries(data.actual ?? {})),
-      logByDate: new Map(Object.entries(data.log ?? {})),
+      dayByDate: data ? groupSessionsByDate(data.days) : new Map(),
+      actualByDate: new Map([
+        ...(data ? Object.entries(data.actual ?? {}) : []),
+        ...(today ? Object.entries(today.actual ?? {}) : []),
+      ]),
+      logByDate: data ? new Map(Object.entries(data.log ?? {})) : new Map(),
     };
     const bandByWeek = new Map((adherence?.weeks ?? []).map(w => [w.week_start, w.band]));
-    renderHeader(data);
 
-    // Today is default-visible for an active plan whose window covers today;
-    // a completed plan skips it entirely and renders the retrospective the
-    // way v1 always did, straight into #root, no tabs.
-    const showTabs = data.plan.status === 'active' && data.today != null;
-    if (showTabs) {
-      renderTabs();
+    renderHeader(data);
+    renderTabs();
+
+    if (status === 'active' && data.today) {
       renderToday(data);
+    } else if (today) {
+      renderTodayDashboard(today);
     }
-    if (data.plan.status === 'completed') {
+
+    if (status === 'completed') {
+      rootEl('plan').insertAdjacentHTML('beforeend', `<div class="retro-marker">Retrospective</div>`);
       renderRetrospective(data, retrospective);
-    } else {
+    } else if (status === 'active') {
       renderReadiness(data, adherence, readiness);
+    } else {
+      renderPlanEmptyCard();
     }
-    renderChart(data, bandByWeek, adherence?.flags ?? []);
-    renderCalendar(data, bandByWeek);
-    renderFlags(adherence);
+
+    if (data) {
+      renderChart(data, bandByWeek, adherence?.flags ?? []);
+      renderCalendar(data, bandByWeek);
+      renderFlags(adherence);
+      renderVersions(versions);
+    }
+
+    // Trends renders identically regardless of plan state.
     renderProgressionEasy(progression);
     renderProgressionWorkouts(progression);
-    renderVersions(versions);
+    renderRecentMileage(weeklyHistory);
+    renderFitnessStrip(progression);
 
-    if (showTabs) activatePlanTab((location.hash || '#today').replace('#', ''));
+    activatePlanTab((location.hash || '#today').replace('#', ''));
 
     document.getElementById('root').addEventListener('click', e => {
+      // A muted in-page link (e.g. the dashboard's "see the Plan tab")
+      // switches tabs instead of navigating to a real page.
+      const jumpTab = e.target.closest('[data-tab-jump]');
+      if (jumpTab) { e.preventDefault(); activatePlanTab(jumpTab.dataset.tabJump); return; }
       const el = e.target.closest('[data-plan-date]');
       if (el) { openDayPopover(el.dataset.planDate); return; }
       // In-page section anchors (e.g. Readiness's "Workout progression" link)
