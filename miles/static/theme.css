@@ -87,9 +87,22 @@ body {
   color: var(--text);
   text-decoration: none;
 }
-.site-header nav { display: flex; gap: 1.25rem; flex-wrap: wrap; }
-.site-header nav a {
+/* font-size/line-height live here, not on the individual link/button/div
+   selectors below: `<a>` and `<button>` establish their line box strut from
+   the nearest ancestor with a set font-size, and a `<button>` needs its own
+   wrapping `.nav-group` div to share that font too — otherwise the div falls
+   back to the page's default font size, its strut no longer matches the
+   button's, and the (baseline-aligned) button text sits visibly offset from
+   the plain-text links' flush-top rendering. */
+.site-header nav {
+  display: flex;
+  align-items: center;
+  gap: 1.25rem;
+  flex-wrap: wrap;
   font-size: 0.8125rem;
+  line-height: 1.4;
+}
+.site-header nav a {
   font-weight: 500;
   color: var(--muted);
   text-decoration: none;
@@ -99,14 +112,15 @@ body {
 .nav-group { position: relative; }
 .nav-group-toggle {
   font: inherit;
-  font-size: 0.8125rem;
   font-weight: 500;
   color: var(--muted);
   background: none;
   border: none;
+  appearance: none;
   padding: 0;
   margin: 0;
   cursor: pointer;
+  white-space: nowrap;
 }
 .nav-group-toggle:hover { color: var(--text-secondary); }
 .nav-group-toggle.active { color: var(--accent); font-weight: 600; }
@@ -180,15 +194,32 @@ body {
 @media (max-width: 480px) {
   .site-header {
     flex-wrap: nowrap;
-    padding: 0.75rem 0.375rem;
-    gap: 0.3rem;
+    /* Edge padding and gaps here (and on nav below) are a width budget:
+       brand + sync + workbook + the nav's min-content must fit a 375px
+       viewport (smallest current iPhone class) without clipping the
+       History caret. Check that width before spending more of it. */
+    padding: 0.625rem 0.5rem;
+    gap: 0.375rem;
   }
   .site-header .brand { flex-shrink: 0; font-size: 1rem; }
-  .site-header nav { gap: 0.35rem; flex-wrap: nowrap; }
-  .site-header nav a, .nav-group-toggle { font-size: 0.7rem; }
+  /* nav grows to claim the row's leftover width and spreads its own
+     children across it, rather than leaving them clustered against the
+     icons with unused space to the right; font-size lives on nav itself
+     (not the link/button selectors) so the .nav-group wrapper div picks up
+     the same strut as its button — see the alignment comment above. */
+  .site-header nav {
+    flex: 1;
+    justify-content: space-between;
+    gap: 0.375rem;
+    flex-wrap: nowrap;
+    font-size: 0.7rem;
+  }
+  .site-header nav a, .nav-group-toggle {
+    padding: 0.875rem 0;
+  }
   .sync-btn, .workbook-link { flex-shrink: 0; }
-  .sync-btn { padding: 2px 5px; font-size: 0.7rem; }
-  .workbook-link { padding: 2px 5px; font-size: 0.7rem; }
+  .sync-btn { padding: 0.5rem 0.4rem; font-size: 0.7rem; }
+  .workbook-link { padding: 0.5rem 0.4rem; font-size: 0.7rem; }
   .build-version { display: none; }
 }
 
