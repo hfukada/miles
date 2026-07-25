@@ -2,7 +2,7 @@ import sqlite3
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import click
 from stravalib.exc import Fault
@@ -116,6 +116,14 @@ def _run(
 ) -> None:
     after = None if full else db.last_synced_date(conn)
     if after:
+        # activities.start_date is athlete-local wall time (db.py), but Strava's
+        # `after` filter cuts on true UTC start_date. Local time can sit hours
+        # either side of UTC depending on the athlete's timezone/DST — for an
+        # athlete east of UTC, using the local timestamp directly would produce
+        # a cursor LATER than the real UTC cutoff and could permanently skip
+        # activities in that gap. Subtract generous slack; re-fetching a couple
+        # extra days is harmless since upserts are idempotent.
+        after = (datetime.fromisoformat(after) - timedelta(hours=48)).isoformat()
         print(f"Incremental sync: fetching activities after {after}")
     else:
         print("Full sync: fetching all activities (may take a few minutes)...")
@@ -215,12 +223,17 @@ def _run(
         conn.commit()
 
     # Weather sync: fetch for any activity with location but no weather yet.
+    # Open-Meteo's hourly data is requested in UTC (weather.py's `timezone: UTC`
+    # param), so this needs Strava's real UTC start_date — recovered from
+    # raw_json, since activities.start_date now stores athlete-local wall time.
     needs_weather = conn.execute("""
-        SELECT a.activity_id, a.start_lat, a.start_lng, a.start_date, a.moving_time_s
+        SELECT a.activity_id, a.start_lat, a.start_lng, a.moving_time_s,
+               json_extract(a.raw_json, '$.start_date') AS utc_start_date
         FROM activities a
         LEFT JOIN weather w ON w.activity_id = a.activity_id
         WHERE a.start_lat IS NOT NULL AND a.start_lng IS NOT NULL
-          AND a.moving_time_s IS NOT NULL AND a.start_date IS NOT NULL
+          AND a.moving_time_s IS NOT NULL
+          AND json_extract(a.raw_json, '$.start_date') IS NOT NULL
           AND w.activity_id IS NULL
         ORDER BY a.start_date DESC
     """).fetchall()
@@ -233,7 +246,7 @@ def _run(
         groups: defaultdict[tuple[float, float], list[weather_module.WeatherSpec]] = defaultdict(list)
         for act in needs_weather:
             key = (round(float(act["start_lat"]), 1), round(float(act["start_lng"]), 1))
-            start_dt = datetime.fromisoformat(act["start_date"])
+            start_dt = datetime.fromisoformat(str(act["utc_start_date"]).replace("Z", "+00:00"))
             if start_dt.tzinfo is None:
                 start_dt = start_dt.replace(tzinfo=timezone.utc)
             groups[key].append({

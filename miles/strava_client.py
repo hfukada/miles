@@ -125,11 +125,17 @@ def row_from_activity(activity: SummaryActivity) -> ActivityRow:
     start_lng: float | None = latlng.lon if latlng is not None else None
 
     assert activity.id is not None, "Activity must have an id"
+    # Store athlete-local wall time, naive (no offset/Z suffix) — see ActivityRow.start_date
+    # in db.py. stravalib parses start_date_local as tz-aware with a UTC offset because
+    # Strava tags it with a (fake) trailing 'Z', but the wall-clock value it carries is
+    # already local; stripping tzinfo (not converting) recovers it.
+    local_start = activity.start_date_local
+    start_date = local_start.replace(tzinfo=None).isoformat() if local_start else None
     return {
         "activity_id": activity.id,
         "name": activity.name,
         "sport_type": sport,
-        "start_date": activity.start_date.isoformat() if activity.start_date else None,
+        "start_date": start_date,
         "workout_type": wt,
         "run_type": WORKOUT_TYPE_MAP.get(wt, "easy"),
         "distance_m": flt(activity.distance),

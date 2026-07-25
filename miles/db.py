@@ -28,6 +28,10 @@ class ActivityRow(TypedDict):
     name: str | None
     description: NotRequired[str | None]
     sport_type: str
+    # Athlete-local wall time, naive (no offset/Z suffix) — e.g. "2026-07-23T18:09:03",
+    # not Strava's UTC start_date. Every day-bucketing consumer (DATE(start_date),
+    # strftime(...)) depends on this being local, so "today" (date.today() in the
+    # athlete's timezone) lines up with activities that actually happened that day.
     start_date: str | None
     workout_type: int
     run_type: str
@@ -169,6 +173,8 @@ def init_db(conn: sqlite3.Connection) -> None:
             activity_id   INTEGER PRIMARY KEY,
             name          TEXT,
             sport_type    TEXT,
+            -- Athlete-local wall time, stored naive (no offset/Z suffix) — see
+            -- ActivityRow.start_date in this module for why.
             start_date    TEXT,
             workout_type  INTEGER,
             run_type      TEXT,
@@ -266,6 +272,25 @@ def init_db(conn: sqlite3.Connection) -> None:
             value TEXT
         )
     """)
+    # One-shot backfill: activities.start_date changed meaning from Strava's UTC
+    # start_date to athlete-local wall time, stored naive (see ActivityRow.start_date
+    # above). Rows synced before this change still hold the old UTC value; rewrite
+    # them from raw_json's start_date_local, stripping its trailing 'Z' (fake — Strava
+    # tags local wall time with a 'Z' suffix as if it were UTC). Rows without raw_json
+    # or without a start_date_local in it keep their current value. Guarded by a meta
+    # stamp so this full-table rewrite runs exactly once per DB, not on every init_db
+    # call (e.g. hot reload) — safe to run on a fresh/empty db (touches zero rows) or
+    # re-run after the guard is cleared (content is already correct, so it's a no-op).
+    if conn.execute("SELECT value FROM meta WHERE key = 'start_date_local_migrated'").fetchone() is None:
+        conn.execute("""
+            UPDATE activities
+            SET start_date = rtrim(json_extract(raw_json, '$.start_date_local'), 'Z')
+            WHERE raw_json IS NOT NULL
+              AND json_extract(raw_json, '$.start_date_local') IS NOT NULL
+        """)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('start_date_local_migrated', '1')"
+        )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS athlete (
             id                   INTEGER PRIMARY KEY CHECK (id = 1),
