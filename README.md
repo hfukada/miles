@@ -86,11 +86,7 @@ MILES_MCP_ALLOWED_HOSTS='localhost:*,127.0.0.1:*,myhost.example.com:*'
 
 ### 5. Try it
 
-```
-/miles
-```
-
-or ask directly:
+Ask about your training — the `miles:miles` analyst persona picks it up:
 
 - "What was my highest mileage week in 2023?"
 - "Show me my workout pace trend over the last 6 months."
@@ -126,7 +122,7 @@ Opens a local web interface at `http://localhost:8000` with six pages:
 - **Compare** — put up to four builds (same distance bucket) side by side, chart and stat table
 - **Training** — training periods, weekly volume with race markers, and a fitness-trend chart with evidence drill-down
 - **Years** — year-by-year volume comparison
-- **Plan** — the active training plan vs reality. A **Today** view (today's session, the week at a glance, how the week is going, and a same-weekday comparison to last week) and an **Overall** view (planned-vs-actual weekly chart with adherence bands, color-coded weekly calendar with clickable day details, progression charts, version history); becomes a race retrospective once the goal race is run. Plans are drafted incrementally in conversation via the `/miles-plan` skill
+- **Plan** — the active training plan vs reality. A **Today** view (today's session, the week at a glance, how the week is going, and a same-weekday comparison to last week) and an **Overall** view (planned-vs-actual weekly chart with adherence bands, color-coded weekly calendar with clickable day details, progression charts, version history); becomes a race retrospective once the goal race is run. Plans are drafted incrementally in conversation via the `miles:miles-plan` skill
 
 ## MCP tools
 
@@ -153,7 +149,7 @@ Opens a local web interface at `http://localhost:8000` with six pages:
 | `get_activity_weather` | Hourly weather breakdown for one activity |
 | `get_training_plan` | The current training plan (or any version), version history, diffs, and this week's targets vs synced actuals |
 | `get_plan_adherence` | Week-by-week plan adherence bands and pattern flags |
-| `start_plan_draft` | Open a new mutable plan draft (used by the `/miles-plan` planner) |
+| `start_plan_draft` | Open a new mutable plan draft (used by the `miles:miles-plan` planner) |
 | `start_revision_draft` | Copy the active plan's current version into a new draft for revision |
 | `set_draft_weeks` / `set_draft_days` | Author or edit any subset of a draft incrementally |
 | `delete_draft_weeks` / `delete_draft_days` | Retract part of a draft |

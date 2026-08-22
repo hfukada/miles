@@ -505,7 +505,7 @@ def get_plan() -> PlanResponse | None:
     The active plan's latest version — weeks and days — with actual weekly
     miles/workout counts and per-day synced runs/log annotations joined in
     from activities/plan_log. Returns null when there's no active plan (the
-    empty state plan.html renders, pointing at the /miles-plan skill).
+    empty state plan.html renders, pointing at the miles:miles-plan skill).
 
     "Current version" here always means the latest authored version (highest
     version_n), not the per-week contemporaneous version the adherence

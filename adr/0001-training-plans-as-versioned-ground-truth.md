@@ -7,7 +7,7 @@ Status: accepted · 2026-07-07
 miles stores raw synced Strava data as ground truth and rebuilds every
 classification from it (`derive_all`). Training plans introduce the first
 athlete-*authored* data: prescriptive targets that reality will be compared
-against, drafted and revised in conversation via the `/miles-plan` skill.
+against, drafted and revised in conversation via the `miles:miles-plan` skill.
 Two failure modes drove the design: silently rewriting a plan after the fact
 to make past training look adherent, and judging a week against targets the
 athlete hadn't seen yet.

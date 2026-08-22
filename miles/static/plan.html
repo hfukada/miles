@@ -912,7 +912,7 @@
       <div id="tab-today" class="tab-panel"></div>
       <div id="tab-trends" class="tab-panel" hidden></div>
       <div id="tab-plan" class="tab-panel" hidden>
-        <p class="desc plan-tab-note">Plans are created, amended, and abandoned in chat with <code>/miles-plan</code>.</p>
+        <p class="desc plan-tab-note">Plans are created, amended, and abandoned in chat with <code>miles:miles-plan</code>.</p>
       </div>`);
     document.querySelectorAll('#plan-tabs .mode-tab').forEach(btn => {
       btn.addEventListener('click', () => activatePlanTab(btn.dataset.tab));
@@ -1014,7 +1014,7 @@
         <h2>No training plan yet</h2>
         <p>Once a plan is drafted, this page tracks planned vs actual weekly mileage,
         a day-by-day calendar, and the version history as the plan evolves.</p>
-        <p style="margin-top:0.75rem">Draft one in conversation with <code>/miles-plan</code> —
+        <p style="margin-top:0.75rem">Draft one in conversation with <code>miles:miles-plan</code> —
         it pulls your fitness estimate, past builds, and historical ramp/workout cadence,
         proposes a week-by-week skeleton, and writes it only once you approve.</p>
       </div>`);

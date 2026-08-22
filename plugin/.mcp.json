@@ -1,0 +1,6 @@
+{
+  "miles": {
+    "type": "http",
+    "url": "${MILES_MCP_URL}"
+  }
+}

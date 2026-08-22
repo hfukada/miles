@@ -16,7 +16,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-ANALYST_SYSTEM_FILE = Path(".claude/commands/miles.md")
+ANALYST_SYSTEM_FILE = Path("plugin/skills/miles/SKILL.md")
 RESULTS_DIR = Path("eval_results")
 MCP_PREFIX = "mcp__miles__"
 
