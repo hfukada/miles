@@ -1,3 +1,8 @@
+---
+name: marathon-analysis
+description: Compare every marathon build in the athlete's record as one ranked table — calls get_marathon_comparison on the miles MCP server. Use when asked to compare marathon builds or training blocks across races, or how one marathon's build stacked up against the others.
+---
+
 # Marathon Build Analysis
 
 Call `get_marathon_comparison` (miles MCP, default 12-week build window).
