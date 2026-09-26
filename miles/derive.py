@@ -1,10 +1,13 @@
 """
-Full recompute of every value derived from raw synced rows (activities/laps).
+Recompute of every value derived from raw synced rows (activities/laps).
 
-Raw synced data is ground truth; everything here is rebuildable from it. `derive_all`
-always recomputes from scratch — no incremental invalidation, ever — so a `git pull`
-that changes a classifier or threshold only needs a rerun to take effect everywhere,
-including ad-hoc `run_sql` queries.
+Raw synced data is ground truth; everything here is rebuildable from it. `derive_all(
+full=True)` — used by the `miles-derive` CLI and forced automatically on a stale
+DERIVE_VERSION — always recomputes from scratch, so a `git pull` that changes a
+classifier or threshold only needs that rerun to take effect everywhere, including
+ad-hoc `run_sql` queries. The default, incremental path scopes each pass to
+meta.derive_dirty_since (see db.mark_derive_dirty and _derive_all_incremental's
+docstring for why each pass's scoping cannot diverge from a full recompute).
 
 One-pass contract: fitness checkpoints are computed twice. Race-effort classification
 judges each race against its own estimate_fitness(as_of=race_date - 1 day) — never a
@@ -53,14 +56,31 @@ _CHECKPOINT_PACE_COL: dict[str, str] = {
 }
 
 
-def _type_laps(conn: sqlite3.Connection) -> int:
-    """Recompute laps.lap_type for every activity that has laps. Returns count typed."""
-    conn.execute("UPDATE laps SET lap_type = NULL")
-
-    activity_ids = [
-        int(row["activity_id"])
-        for row in conn.execute("SELECT DISTINCT activity_id FROM laps").fetchall()
-    ]
+def _type_laps(conn: sqlite3.Connection, *, since: str | None = None) -> int:
+    """Recompute laps.lap_type for activities that have laps, scoped to DATE(start_date)
+    >= since when given. Each activity's laps classify independently of every other
+    activity's (classify_laps takes one activity's laps at a time), so this scoping
+    can never diverge from a full recompute for an activity dated before since.
+    Returns count typed."""
+    if since is None:
+        conn.execute("UPDATE laps SET lap_type = NULL")
+        activity_ids = [
+            int(row["activity_id"])
+            for row in conn.execute("SELECT DISTINCT activity_id FROM laps").fetchall()
+        ]
+    else:
+        conn.execute("""
+            UPDATE laps SET lap_type = NULL
+            WHERE activity_id IN (SELECT activity_id FROM activities WHERE DATE(start_date) >= ?)
+        """, [since])
+        activity_ids = [
+            int(row["activity_id"])
+            for row in conn.execute("""
+                SELECT DISTINCT l.activity_id FROM laps l
+                JOIN activities a ON a.activity_id = l.activity_id
+                WHERE DATE(a.start_date) >= ?
+            """, [since]).fetchall()
+        ]
 
     typed = 0
     for activity_id in activity_ids:
@@ -94,18 +114,27 @@ def _type_laps(conn: sqlite3.Connection) -> int:
 _TIER_BY_CONFIDENCE: dict[str, int] = {"high": 1, "medium": 1, "medium-low": 2, "low": 3}
 
 
-def _fitness_checkpoints(conn: sqlite3.Connection, *, exclude_casual: bool = False) -> int:
-    """Rebuild the monthly fitness checkpoints from the first activity month
-    through the current month. Returns rows inserted."""
-    conn.execute("DELETE FROM fitness_checkpoints")
-
-    row = conn.execute("SELECT MIN(DATE(start_date)) AS d FROM activities").fetchone()
-    first: str | None = row["d"] if row is not None else None
-    if first is None:
-        return 0
+def _fitness_checkpoints(
+    conn: sqlite3.Connection, *, exclude_casual: bool = False, since_month: tuple[int, int] | None = None
+) -> int:
+    """Rebuild monthly fitness checkpoints. since_month=None rebuilds every month from
+    the first activity through the current month; a (year, month) scopes the rebuild
+    to months >= that one. Safe to scope because a checkpoint's as_of value depends
+    only on activities on or before it (fitness.py's tier1/2/3 windows all end at
+    as_of — see estimate_fitness), so a month before since_month can never depend on
+    anything at or after it and is left untouched. Returns rows inserted."""
+    if since_month is None:
+        conn.execute("DELETE FROM fitness_checkpoints")
+        row = conn.execute("SELECT MIN(DATE(start_date)) AS d FROM activities").fetchone()
+        first: str | None = row["d"] if row is not None else None
+        if first is None:
+            return 0
+        year, month = int(first[:4]), int(first[5:7])
+    else:
+        year, month = since_month
+        conn.execute("DELETE FROM fitness_checkpoints WHERE month >= ?", [f"{year:04d}-{month:02d}"])
 
     today = date.today()
-    year, month = int(first[:4]), int(first[5:7])
     inserted = 0
     while (year, month) <= (today.year, today.month):
         next_month = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
@@ -185,18 +214,30 @@ def _predicted_pace_for_race(conn: sqlite3.Connection, race_date: date, category
     return pace, est["confidence"]
 
 
-def _race_effort_pass(conn: sqlite3.Connection) -> dict[str, int]:
+def _race_effort_pass(conn: sqlite3.Connection, *, since: str | None = None) -> dict[str, int]:
     """Classify race_effort/effort_ratio for every effective race with a computable
-    pre-race estimate at its category. Clears both columns first — full recompute.
-    Each race is judged against its own estimate_fitness(race_date - 1 day), not a
-    shared checkpoint, so a race can never contaminate its own prediction."""
-    conn.execute("UPDATE activities SET race_effort = NULL, effort_ratio = NULL")
+    pre-race estimate at its category, scoped to DATE(start_date) >= since when given.
+    Each race is judged against its own estimate_fitness(race_date - 1 day) — a live,
+    backward-only window that ends before the race itself — so a race dated before
+    since can never see anything at or after since, and is safe to leave untouched."""
+    if since is None:
+        conn.execute("UPDATE activities SET race_effort = NULL, effort_ratio = NULL")
+    else:
+        conn.execute(
+            "UPDATE activities SET race_effort = NULL, effort_ratio = NULL WHERE DATE(start_date) >= ?",
+            [since],
+        )
 
     effective = effective_run_type_sql()
-    rows = conn.execute(f"""
+    query = f"""
         SELECT activity_id, distance_m, moving_time_s, average_heartrate, DATE(start_date) AS date
         FROM activities WHERE {effective} = 'race'
-    """).fetchall()
+    """
+    params: list[str] = []
+    if since is not None:
+        query += " AND DATE(start_date) >= ?"
+        params.append(since)
+    rows = conn.execute(query, params).fetchall()
 
     counts: dict[str, int] = {}
     for r in rows:
@@ -267,23 +308,44 @@ def _pace_based_race_inference(conn: sqlite3.Connection) -> int:
     return count
 
 
-def _lap_intensity_pass(conn: sqlite3.Connection) -> dict[str, int]:
+def _lap_intensity_pass(conn: sqlite3.Connection, *, since: str | None = None) -> dict[str, int]:
     """Tag work/float laps with intensity (MP/threshold/interval/repetition/
     aerobic/sprint/sub-*) using the zone anchors from the fitness checkpoint of
     the month *before* each activity's month — never that activity's own month,
     which could include itself. Skips activities with no earlier checkpoint or a
     low-confidence one: a wrong label is worse than none. Rolls each session's
     work-lap intensities up into dominant_intensity when one intensity holds
-    >= DOMINANT_INTENSITY_MIN_SHARE of work-lap moving time."""
-    conn.execute("UPDATE laps SET intensity = NULL")
-    conn.execute("UPDATE activities SET dominant_intensity = NULL")
+    >= DOMINANT_INTENSITY_MIN_SHARE of work-lap moving time.
 
-    activity_ids = [
-        int(row["activity_id"])
-        for row in conn.execute("""
-            SELECT DISTINCT activity_id FROM laps WHERE lap_type IN ('work', 'float')
-        """).fetchall()
-    ]
+    Scoped to DATE(start_date) >= since when given: each activity only reads a
+    checkpoint from *before* its own month, and checkpoint months before since are
+    left untouched by _fitness_checkpoints, so an activity dated before since always
+    sees the same checkpoint and computes the same intensities either way."""
+    if since is None:
+        conn.execute("UPDATE laps SET intensity = NULL")
+        conn.execute("UPDATE activities SET dominant_intensity = NULL")
+        activity_ids = [
+            int(row["activity_id"])
+            for row in conn.execute("""
+                SELECT DISTINCT activity_id FROM laps WHERE lap_type IN ('work', 'float')
+            """).fetchall()
+        ]
+    else:
+        conn.execute("""
+            UPDATE laps SET intensity = NULL
+            WHERE activity_id IN (SELECT activity_id FROM activities WHERE DATE(start_date) >= ?)
+        """, [since])
+        conn.execute(
+            "UPDATE activities SET dominant_intensity = NULL WHERE DATE(start_date) >= ?", [since]
+        )
+        activity_ids = [
+            int(row["activity_id"])
+            for row in conn.execute("""
+                SELECT DISTINCT l.activity_id FROM laps l
+                JOIN activities a ON a.activity_id = l.activity_id
+                WHERE l.lap_type IN ('work', 'float') AND DATE(a.start_date) >= ?
+            """, [since]).fetchall()
+        ]
 
     laps_intensity = 0
     sessions_dominant = 0
@@ -363,8 +425,29 @@ def _plan_adherence_pass(conn: sqlite3.Connection) -> dict[str, int]:
     return {"plan_adherence_weeks": len(rows)}
 
 
-def derive_all(conn: sqlite3.Connection) -> dict[str, int]:
-    """Full recompute of every derived value from raw synced data. Never incremental."""
+def _dirty_since(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = 'derive_dirty_since'").fetchone()
+    return row["value"] if row is not None else None
+
+
+def _stamp_version(conn: sqlite3.Connection) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('derive_version', ?)", (DERIVE_VERSION,)
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('derived_at', ?)", (now,)
+    )
+
+
+def _month_of(iso_date: str) -> tuple[int, int]:
+    return int(iso_date[:4]), int(iso_date[5:7])
+
+
+def _derive_all_full(conn: sqlite3.Connection) -> dict[str, int]:
+    """Complete rebuild of every derived value from raw synced data, ignoring any
+    dirty-tracking state. Required after a classifier/threshold change (DERIVE_VERSION
+    bump) and used unconditionally by the `miles-derive` CLI."""
     counts: dict[str, int] = {}
 
     inferred = apply_inference(conn)
@@ -390,23 +473,106 @@ def derive_all(conn: sqlite3.Connection) -> dict[str, int]:
 
     counts.update(_plan_adherence_pass(conn))
 
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('derive_version', ?)", (DERIVE_VERSION,)
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('derived_at', ?)", (now,)
-    )
+    conn.execute("DELETE FROM meta WHERE key = 'derive_dirty_since'")
+    _stamp_version(conn)
     conn.commit()
 
     return counts
+
+
+def _derive_all_incremental(conn: sqlite3.Connection, since: str) -> dict[str, int]:
+    """Recompute only what activities dated on or after `since` could have changed.
+
+    _type_laps, _race_effort_pass and _lap_intensity_pass are scoped to DATE(start_date)
+    >= since and provably match a full recompute for anything dated earlier: each
+    classifies one activity from a trailing window that ends at or before that
+    activity's own date (see their docstrings), so nothing at or after `since` can
+    ever feed back into an earlier activity's derived values. _fitness_checkpoints is
+    scoped by calendar month on the same reasoning (see its docstring).
+
+    apply_inference and _pace_based_race_inference are the exception — both always run
+    in full. apply_inference unconditionally resets and re-derives run_type_inferred
+    for every workout_type=0 row on every call (cheap, ~0.4s); _pace_based_race_inference
+    then fills in whatever apply_inference left NULL, including activities pace-inferred
+    as races on a prior run. Both are pure functions of an activity's own backward-
+    looking history, so they reproduce identical results for pre-`since` activities
+    every time — but only because they run over the whole table: scoping either one
+    to `since` would leave old pace-inferred races wiped by apply_inference's reset
+    and never refilled.
+    """
+    counts: dict[str, int] = {}
+
+    inferred = apply_inference(conn)
+    for run_type, n in inferred.items():
+        counts[f"inferred_{run_type}"] = n
+
+    counts["laps_typed"] = _type_laps(conn, since=since)
+
+    since_month = _month_of(since)
+    _fitness_checkpoints(conn, since_month=since_month)  # pass 1
+
+    effort_counts = _race_effort_pass(conn, since=since)
+    for effort, n in effort_counts.items():
+        counts[f"race_effort_{effort}"] = n
+
+    pace_inferred = _pace_based_race_inference(conn)
+    counts["race_pace_inferred"] = pace_inferred
+    if pace_inferred:
+        counts["inferred_race"] = counts.get("inferred_race", 0) + pace_inferred
+
+    counts["fitness_months"] = _fitness_checkpoints(conn, exclude_casual=True, since_month=since_month)  # pass 2, final
+
+    counts.update(_lap_intensity_pass(conn, since=since))
+
+    counts.update(_plan_adherence_pass(conn))
+
+    conn.execute("DELETE FROM meta WHERE key = 'derive_dirty_since'")
+    _stamp_version(conn)
+    conn.commit()
+
+    return counts
+
+
+def _derive_all_untouched(conn: sqlite3.Connection) -> dict[str, int]:
+    """Nothing has synced since the last derive. plan_adherence is athlete-edited
+    outside of sync (plans can change without a new activity), and a fitness
+    checkpoint's as_of for the current month is `today` — which moves even with no
+    new activities — so both get recomputed; everything else is unchanged from the
+    last run."""
+    counts: dict[str, int] = {}
+    today_month = (date.today().year, date.today().month)
+    counts["fitness_months"] = _fitness_checkpoints(conn, exclude_casual=True, since_month=today_month)
+    counts.update(_plan_adherence_pass(conn))
+    _stamp_version(conn)
+    conn.commit()
+    return counts
+
+
+def derive_all(conn: sqlite3.Connection, *, full: bool = False) -> dict[str, int]:
+    """Recompute derived values from raw synced rows (activities/laps). Raw synced
+    data is ground truth; everything here is rebuildable from it.
+
+    full=True, or a stale DERIVE_VERSION, forces a complete rebuild — the only path
+    guaranteed correct after a classifier/threshold change. Otherwise this recomputes
+    only what meta.derive_dirty_since (set by db.mark_derive_dirty, lowered by every
+    raw-data writer) says could have changed, which for a sync adding a handful of
+    recent activities is the difference between a full rebuild and a sub-second pass.
+    """
+    version_row = conn.execute("SELECT value FROM meta WHERE key = 'derive_version'").fetchone()
+    if full or version_row is None or version_row["value"] != DERIVE_VERSION:
+        return _derive_all_full(conn)
+
+    since = _dirty_since(conn)
+    if since is None:
+        return _derive_all_untouched(conn)
+    return _derive_all_incremental(conn, since)
 
 
 def ensure_derived(conn: sqlite3.Connection) -> None:
     """Run derive_all if the DB's derived values are missing or from a stale version."""
     row = conn.execute("SELECT value FROM meta WHERE key = 'derive_version'").fetchone()
     if row is None or row["value"] != DERIVE_VERSION:
-        derive_all(conn)
+        derive_all(conn, full=True)
 
 
 def main() -> None:
@@ -414,7 +580,7 @@ def main() -> None:
 
     conn = db.connect()
     db.init_db(conn)
-    counts = derive_all(conn)
+    counts = derive_all(conn, full=True)
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no changes"
     print(f"Derive done. {summary}")
 

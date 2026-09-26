@@ -120,6 +120,29 @@ function renderNav() {
   syncBtn.title = "Sync from Strava";
   syncBtn.textContent = "↻ Sync";
 
+  // Button text while running is driven entirely by /api/sync/status's phase/
+  // done/total, so a page-load poll (below) can resume mid-run with the same text
+  // a click would have produced.
+  function formatPhase(data) {
+    if (data.phase === "waiting" && data.until) return `↻ waiting until ${data.until}`;
+    if (!data.phase) return "↻ Syncing…";
+    if (data.total != null && data.done != null) return `↻ ${data.phase} ${data.done}/${data.total}`;
+    if (data.done != null) return `↻ ${data.phase} ${data.done}`;
+    return `↻ ${data.phase}`;
+  }
+
+  function showError(message) {
+    syncBtn.textContent = "✗ Error";
+    syncBtn.title = message || "Sync failed";
+    setTimeout(() => resetSync("↻ Sync"), 8000);
+  }
+
+  function resetSync(label) {
+    syncBtn.disabled = false;
+    syncBtn.title = "Sync from Strava";
+    syncBtn.textContent = label;
+  }
+
   async function startSync() {
     syncBtn.disabled = true;
     syncBtn.textContent = "↻ Syncing…";
@@ -132,8 +155,7 @@ function renderNav() {
         resetSync("↻ Sync");
       }
     } catch {
-      syncBtn.textContent = "✗ Error";
-      setTimeout(() => resetSync("↻ Sync"), 3000);
+      showError("Network error starting sync");
     }
   }
 
@@ -142,27 +164,42 @@ function renderNav() {
       const res = await fetch("/api/sync/status");
       const data = await res.json();
       if (data.status === "running") {
-        setTimeout(pollSync, 3000);
-      } else if (data.returncode === 0) {
-        syncBtn.textContent = "✓ Done";
+        syncBtn.disabled = true;
+        syncBtn.textContent = formatPhase(data);
+        setTimeout(pollSync, 1000);
+      } else if (data.status === "error") {
+        showError(data.error);
+      } else if (data.status === "done") {
+        const n = data.new_activities || 0;
+        syncBtn.textContent = n > 0 ? `✓ ${n} new` : "✓ up to date";
         setTimeout(() => { location.reload(); }, 2000);
       } else {
-        syncBtn.textContent = "✗ Error";
-        setTimeout(() => resetSync("↻ Sync"), 3000);
+        resetSync("↻ Sync");
       }
     } catch {
-      syncBtn.textContent = "✗ Error";
-      setTimeout(() => resetSync("↻ Sync"), 3000);
+      showError("Network error checking sync status");
     }
-  }
-
-  function resetSync(label) {
-    syncBtn.disabled = false;
-    syncBtn.textContent = label;
   }
 
   syncBtn.addEventListener("click", startSync);
   header.insertBefore(syncBtn, nav);
+
+  // Resume the polling state on a fresh page load if a sync kicked off from
+  // another tab/page is still running — otherwise navigating away loses the
+  // indicator until the next click.
+  (async function resumeSyncStatus() {
+    try {
+      const res = await fetch("/api/sync/status");
+      const data = await res.json();
+      if (data.status === "running") {
+        syncBtn.disabled = true;
+        syncBtn.textContent = formatPhase(data);
+        setTimeout(pollSync, 1000);
+      }
+    } catch {
+      // Leave the button at its idle label; the next click will surface any error.
+    }
+  })();
   // --- end sync button ---
 
   // Workbook is a utility page (collected one-off analyses), not a primary

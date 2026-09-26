@@ -4,8 +4,8 @@ import logging
 import os
 import re
 import sqlite3
+import threading
 import click
-import subprocess as _subprocess
 import uvicorn
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 from starlette.types import Scope
 
-from . import db, plan, strava_client, streams
+from . import db, plan, strava_client, streams, sync
 from .build_paces import PaceClaim, pace_claims
 from .classifier import LAP_MIN_DISTANCE_M, LAP_MIN_MOVING_TIME_S, WORKOUT_LABEL_PATTERNS, classify_workout
 from .distance_builds import (
@@ -59,8 +59,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="miles", lifespan=_lifespan)
 
 _logger = logging.getLogger(__name__)
-_sync_proc: _subprocess.Popen[bytes] | None = None
-_REPO_ROOT = Path(__file__).parent.parent
+_sync_progress = sync.SyncProgress()
 
 # GIT_HASH/BUILD_TIME are baked into the image env at `docker build` time
 # (see Dockerfile, docker-build.sh). Outside Docker, or if unset, fall back
@@ -951,9 +950,13 @@ def reclassify_activity(id: int, body: ReclassifyRequest) -> ReclassifyResponse:
     (lap fetch, label backfill, derive_all, plan auto-complete) immediately.
     """
     conn = _conn()
-    row = conn.execute("SELECT activity_id, name FROM activities WHERE activity_id = ?", [id]).fetchone()
+    row = conn.execute(
+        "SELECT activity_id, name, DATE(start_date) AS date FROM activities WHERE activity_id = ?", [id]
+    ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail=f"No activity {id}.")
+    if row["date"] is not None:
+        db.mark_derive_dirty(conn, row["date"])
 
     if "run_type" in body:
         run_type = body["run_type"]
@@ -1654,40 +1657,36 @@ class SyncTriggerResponse(TypedDict):
     status: str
 
 
-class SyncStatusResponse(TypedDict):
-    status: str
-    returncode: int | None
+def _run_sync_in_background() -> None:
+    """Thread target for /api/sync: opens its own connection (sqlite3.Connection
+    isn't safe to share across threads) and runs the same retry loop miles-sync
+    uses, with no printer — progress is exposed only via _sync_progress, polled by
+    GET /api/sync/status. Any exception (network down, bad credentials, a real bug)
+    is caught here so it can't take the server down or leave the progress state
+    stuck at "running" forever."""
+    conn = db.connect()
+    try:
+        db.init_db(conn)
+        new_count = sync.run_with_retry(conn, full=False, extra=True, progress=_sync_progress)
+        _sync_progress.finish(new_count)
+    except Exception as e:
+        _logger.exception("Background sync failed")
+        _sync_progress.fail(f"{type(e).__name__}: {e}"[:200])
+    finally:
+        conn.close()
 
 
 @app.post("/api/sync")
 def trigger_sync() -> SyncTriggerResponse:
-    global _sync_proc
-    if _sync_proc is not None and _sync_proc.poll() is None:
+    if not _sync_progress.try_start():
         return SyncTriggerResponse(status="running")
-    try:
-        _sync_proc = _subprocess.Popen(
-            ["uv", "run", "miles-sync", "--extra"],
-            cwd=_REPO_ROOT,
-            stdout=_subprocess.DEVNULL,
-            stderr=_subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        _logger.error("uv not found on PATH; cannot start miles-sync")
-        raise HTTPException(status_code=500, detail="sync command not found")
+    threading.Thread(target=_run_sync_in_background, daemon=True).start()
     return SyncTriggerResponse(status="started")
 
 
 @app.get("/api/sync/status")
-def sync_status() -> SyncStatusResponse:
-    if _sync_proc is None:
-        return SyncStatusResponse(status="idle", returncode=None)
-    rc = _sync_proc.poll()
-    if rc is None:
-        return SyncStatusResponse(status="running", returncode=None)
-    if rc != 0 and _sync_proc.stderr is not None:
-        err = _sync_proc.stderr.read().decode(errors="replace")
-        _logger.warning("miles-sync exited with code %d: %s", rc, err)
-    return SyncStatusResponse(status="done", returncode=rc)
+def sync_status() -> sync.SyncStatus:
+    return _sync_progress.snapshot()
 
 
 # Must precede the catch-all static mount below.

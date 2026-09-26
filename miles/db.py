@@ -453,6 +453,21 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def mark_derive_dirty(conn: sqlite3.Connection, since_date: str) -> None:
+    """Lower meta.derive_dirty_since to the earliest of any existing value and
+    since_date (an ISO 'YYYY-MM-DD' string); never raises it. Every raw-data writer
+    calls this so derive_all (derive.py) knows the earliest date whose derived values
+    need recomputing. ISO date strings sort correctly as plain text, so MIN() needs
+    no date parsing."""
+    conn.execute(
+        """
+        INSERT INTO meta (key, value) VALUES ('derive_dirty_since', ?)
+        ON CONFLICT(key) DO UPDATE SET value = MIN(value, excluded.value)
+        """,
+        [since_date],
+    )
+
+
 def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> None:
     conn.executemany("""
         INSERT OR REPLACE INTO activities (
@@ -475,6 +490,9 @@ def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> None
             :start_lat, :start_lng, :raw_json
         )
     """, rows)
+    dates = [r["start_date"][:10] for r in rows if r["start_date"]]
+    if dates:
+        mark_derive_dirty(conn, min(dates))
     conn.commit()
 
 
@@ -509,6 +527,15 @@ def upsert_laps(conn: sqlite3.Connection, laps: list[LapRow]) -> None:
             :total_elevation_gain_m, :pace_zone, :raw_json
         )
     """, laps)
+    activity_ids = sorted({lap["activity_id"] for lap in laps})
+    if activity_ids:
+        placeholders = ",".join("?" for _ in activity_ids)
+        row = conn.execute(
+            f"SELECT MIN(DATE(start_date)) AS d FROM activities WHERE activity_id IN ({placeholders})",
+            activity_ids,
+        ).fetchone()
+        if row is not None and row["d"] is not None:
+            mark_derive_dirty(conn, row["d"])
     conn.commit()
 
 
