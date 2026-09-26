@@ -9,6 +9,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import db
+from . import routes as routes_service
 from .builds import Build, RaceRef, detect_builds
 from .derive import derive_all, ensure_derived
 from .fitness import WINDOW_DAYS, estimate_fitness
@@ -2855,6 +2856,170 @@ def run_sql(query: str) -> str:
         rows = conn.execute(query).fetchall()
         return json.dumps([dict(r) for r in rows])
     except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def _routes_conn() -> sqlite3.Connection:
+    return routes_service.connect()
+
+
+@mcp.tool()
+def list_routes(
+    min_distance_m: float | None = None,
+    max_distance_m: float | None = None,
+    min_ft_per_mi: float | None = None,
+    max_ft_per_mi: float | None = None,
+    tag: str | None = None,
+    near_lat: float | None = None,
+    near_lng: float | None = None,
+    near_radius_m: float = 5000.0,
+) -> str:
+    """
+    List stored routes (GPX-backed hikes, race courses, and composed runs),
+    optionally filtered by distance (meters), climb rate (ft_per_mi), a
+    single tag, or proximity to a lat/lng (near_radius_m defaults to
+    5000m). Returns route_id, name, gpx_name, kind, source, tags,
+    has_elevation, distance_m, gain_m, loss_m, ft_per_mi, shape,
+    start_lat/start_lng for each match.
+    """
+    conn = _routes_conn()
+    rows = routes_service.list_routes(
+        conn,
+        min_distance_m=min_distance_m,
+        max_distance_m=max_distance_m,
+        min_ft_per_mi=min_ft_per_mi,
+        max_ft_per_mi=max_ft_per_mi,
+        tag=tag,
+        near_lat=near_lat,
+        near_lng=near_lng,
+        near_radius_m=near_radius_m,
+    )
+    return json.dumps(rows)
+
+
+@mcp.tool()
+def get_route(route_id: int) -> str:
+    """
+    Full detail for one route: metadata (name, source, notes, tags),
+    derived stats (distance, gain/loss, ft_per_mi, bbox, shape), the
+    climb/descent segment list, the grade-band histogram, snapped
+    waypoints, and (for a composed route) its leg definition.
+    """
+    conn = _routes_conn()
+    try:
+        return json.dumps(routes_service.get_route(conn, route_id))
+    except routes_service.RouteNotFoundError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def find_route_junctions(route_a: int, route_b: int, tolerance_m: float = 30.0) -> str:
+    """
+    Where two routes meet: clustered contact points ("junctions") plus any
+    shared/overlapping stretches ("overlaps"), each reported as a from/to
+    distance span on both routes. tolerance_m (default 30) is how close
+    two points must be to count as touching.
+    """
+    conn = _routes_conn()
+    try:
+        return json.dumps(routes_service.find_route_junctions(conn, route_a, route_b, tolerance_m=tolerance_m))
+    except routes_service.RouteNotFoundError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def find_routes_near(
+    lat: float | None = None,
+    lng: float | None = None,
+    route_id: int | None = None,
+    radius_m: float = 1000.0,
+) -> str:
+    """
+    Routes near a point (pass lat/lng) or near another route (pass
+    route_id) within radius_m (default 1000m), nearest first. Pass exactly
+    one of (lat and lng) or route_id.
+    """
+    conn = _routes_conn()
+    if route_id is not None:
+        try:
+            return json.dumps(routes_service.routes_near_route(conn, route_id, radius_m))
+        except routes_service.RouteNotFoundError as e:
+            return json.dumps({"error": str(e)})
+    if lat is None or lng is None:
+        return json.dumps({"error": "Pass lat and lng, or route_id."})
+    return json.dumps(routes_service.routes_near(conn, lat, lng, radius_m))
+
+
+@mcp.tool()
+def compose_route(
+    legs: str,
+    tolerance_m: float = 30.0,
+    save: bool = False,
+    name: str | None = None,
+    notes: str | None = None,
+    tags: str | None = None,
+) -> str:
+    """
+    Stitch an ordered list of route legs into one combined run. legs is a
+    JSON-encoded list, each entry either:
+      {"route_id": int, "from_m": float, "to_m": float} -- a partial span
+        of an existing route's own distance axis; from_m > to_m reverses it.
+      {"kind": "connector", "distance_m": float, "gain_m": float?, "note": str?}
+        -- a road/trail stretch with no GPX (no road routing yet).
+    Returns combined distance/gain/loss, a stitched climb list and
+    grade-band histogram, and warnings where consecutive legs don't meet
+    within tolerance_m. tags is a comma-separated string.
+
+    Pass save=true to store the result as a new route (source="composed"):
+    a GPX is generated from the stitched points and the leg definition is
+    kept alongside it, and the response includes the new route_id.
+    """
+    conn = _routes_conn()
+    try:
+        parsed_legs = json.loads(legs)
+    except json.JSONDecodeError as e:
+        return json.dumps({"error": f"legs must be a JSON list: {e}"})
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
+    try:
+        return json.dumps(
+            routes_service.compose_route(
+                conn, parsed_legs, tolerance_m=tolerance_m, save=save, name=name, notes=notes, tags=tag_list
+            )
+        )
+    except routes_service.RouteNotFoundError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def compare_route_to_course(route_id: int, course_route_id: int) -> str:
+    """
+    Transparent side-by-side comparison of two routes: ft/mi, grade-band
+    histograms plus their total L1 distance (the only aggregate
+    returned), each route's climb/descent segment list, and where
+    sustained descents fall as a fraction of total distance. No blended
+    single score.
+    """
+    conn = _routes_conn()
+    try:
+        return json.dumps(routes_service.compare_route_to_course(conn, route_id, course_route_id))
+    except routes_service.RouteNotFoundError as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def update_route(route_id: int, name: str | None = None, notes: str | None = None, tags: str | None = None) -> str:
+    """
+    Update a route's athlete-facing name, notes, and/or tags
+    (comma-separated; pass an empty string to clear all tags). Only
+    fields passed are changed; omitted ones are left as they were.
+    Everything else about a route (stats, points, climbs) is derived from
+    its raw GPX and isn't editable here.
+    """
+    conn = _routes_conn()
+    tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags is not None else None
+    try:
+        return json.dumps(routes_service.update_route(conn, route_id, name=name, notes=notes, tags=tag_list))
+    except routes_service.RouteNotFoundError as e:
         return json.dumps({"error": str(e)})
 
 
