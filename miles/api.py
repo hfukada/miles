@@ -34,6 +34,7 @@ from .distance_builds import (
 )
 from .fitness_api import router as fitness_api_router
 from .plan_api import router as plan_api_router
+from .routes_api import router as routes_api_router
 from .builds import Build, RaceRef, detect_builds
 from .derive import derive_all, ensure_derived
 from .format import fmt_pace, fmt_time
@@ -1696,6 +1697,7 @@ def sync_status() -> sync.SyncStatus:
 app.include_router(distance_builds_router)
 app.include_router(fitness_api_router)
 app.include_router(plan_api_router)
+app.include_router(routes_api_router)
 
 # Lift the MCP transport's exact-path /mcp route onto this app directly.
 # A nested app.mount() would either double the path (/mcp/mcp) or leave the
