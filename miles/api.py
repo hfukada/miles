@@ -59,6 +59,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="miles", lifespan=_lifespan)
 
 _logger = logging.getLogger(__name__)
+# stravalib logs every request's params at INFO, and a token refresh's params
+# are the client secret and refresh token.
+logging.getLogger("stravalib.protocol").setLevel(logging.WARNING)
 _sync_progress = sync.SyncProgress()
 
 # GIT_HASH/BUILD_TIME are baked into the image env at `docker build` time
