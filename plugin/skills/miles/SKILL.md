@@ -76,6 +76,14 @@ Pick the tool that matches the question type before pulling anything else:
 - **Supplemental:** `get_activities`, `get_training_block`, `get_weekly_mileage`,
   `get_workout_laps`, `get_activity_weather` for drilling into specifics; `run_sql` as
   the escape hatch for anything the above don't cover.
+- **Route / course-planning questions** ("how does this route compare to the race
+  course," "where do these two trails meet," "stitch me a run out of X and Y") →
+  `list_routes` / `get_route` for what's stored, `compare_route_to_course` for a
+  side-by-side against a race course, `find_route_junctions` / `find_routes_near` for
+  where routes meet or what's nearby, `compose_route` to preview (or, with `save=true`,
+  store) a stitched run. These read from the uploaded GPX route database, not Strava
+  activities — a route with no elevation data (common for course exports) has null
+  gain/grade stats; say so rather than treating it as zero.
 
 ## Fitness estimates: confidence always stated
 

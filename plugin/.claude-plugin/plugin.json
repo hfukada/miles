@@ -1,7 +1,7 @@
 {
   "name": "miles",
   "description": "Running analyst and coach for a Strava-backed training record — descriptive analysis, marathon-build comparisons, and plan drafting/revision, all backed by the miles MCP server.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Ryan Moore"
   }

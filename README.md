@@ -159,7 +159,40 @@ Opens a local web interface at `http://localhost:8000` with six pages:
 | `log_plan_adjustment` | Record day-level reality ("skipped Tue") without a version bump |
 | `abandon_plan` | Mark the active plan abandoned, with the reason logged |
 | `run_sql` | Ad-hoc read-only SQL against all tables, including derived columns |
+| `list_routes` | Stored routes, filterable by distance, ft/mi, a tag, or proximity to a lat/lng |
+| `get_route` | Full detail for one route: stats, climbs, grade bands, waypoints, leg definition |
+| `find_route_junctions` | Where two routes meet: contact points plus any shared/overlapping stretches |
+| `find_routes_near` | Routes near a point or near another route |
+| `compose_route` | Stitch route legs (partial spans, reversible) and connector legs into a combined run, optionally saving the result |
+| `compare_route_to_course` | Side-by-side ft/mi, grade histograms, climb lists, and descent placement for two routes |
+| `update_route` | Edit a route's name/notes/tags |
 
 `run_type` reflects the label you set in Strava (`easy`, `workout`, `long_run`, `race`);
 untagged activities get an inferred type from name, distance, and pace history — your
 explicit tags always win.
+
+## Route database
+
+Upload GPX (AllTrails/Garmin/CalTopo exports, race courses) against a running
+`miles-api`:
+
+```bash
+uv run miles-route-import ridge_loop.gpx --name "Ridge Loop" --source alltrails --tags trail,hilly
+uv run miles-route-import course_50k.gpx --name "Spring 50K" --source race --url http://miles-host:8000
+```
+
+A multi-track file (a race course plus its aid-to-aid segments, say) becomes
+one route per track, named `"<name> — <track name>"`. Raw bytes are ground
+truth (`adr/0002-routes-raw-gpx-ground-truth.md`); distance, gain/loss,
+climb segments, a grade-band histogram, and snapped waypoints are all
+derived and rebuilt automatically if the parser changes. A file with no
+`<ele>` anywhere gets `has_elevation = false` and null gain/grade stats,
+never a fake zero.
+
+`POST /api/routes/upload` (multipart) is the endpoint behind the CLI above;
+`GET /api/routes`, `GET /api/routes/{id}`, `GET /api/routes/{id}/gpx` (raw
+bytes), `GET /api/routes/{id}/profile` (resampled points), `GET
+/api/routes/junctions`, `GET /api/routes/near` / `GET /api/routes/{id}/near`,
+`POST /api/routes/compose`, `GET /api/routes/compare`, plus `PATCH`/`DELETE
+/api/routes/{id}`, round out the HTTP surface; the MCP tools above cover the
+same ground read-mostly for Claude Code.
