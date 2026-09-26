@@ -12,6 +12,8 @@ dependencies = [
     "aiofiles>=23.0",
     "pandas>=2.2",
     "pyarrow>=17.0",
+    "defusedxml>=0.7.1",
+    "requests>=2.31",
 ]
 
 [project.scripts]
@@ -20,6 +22,7 @@ miles-auth = "miles.auth:main"
 miles-mcp = "miles.mcp_server:main"
 miles-api = "miles.api:main"
 miles-derive = "miles.derive:main"
+miles-route-import = "miles.route_import:main"
 
 [build-system]
 requires = ["hatchling"]
