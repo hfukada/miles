@@ -52,6 +52,94 @@ class ActivityRow(TypedDict):
     raw_json: str
 
 
+class GpxFileRow(TypedDict):
+    file_id: int
+    sha256: str
+    filename: str
+    creator: str | None
+    data: bytes
+    uploaded_at: str
+
+
+class RouteRow(TypedDict):
+    route_id: int
+    file_id: int
+    track_index: int
+    kind: str  # 'trk' | 'rte'
+    gpx_name: str | None  # name embedded in the GPX track/route itself
+    name: str | None  # athlete-facing name; defaults from gpx_name at creation
+    source: str | None
+    notes: str | None
+    tags_json: str  # JSON list[str]
+    created_at: str
+    # Derived from gpx_files.data; NULL/None until the first derive pass.
+    derive_version: int | None
+    has_elevation: int | None  # 0/1
+    distance_m: float | None
+    gain_m: float | None
+    loss_m: float | None
+    min_ele_m: float | None
+    max_ele_m: float | None
+    ft_per_mi: float | None
+    bbox_south: float | None
+    bbox_west: float | None
+    bbox_north: float | None
+    bbox_east: float | None
+    start_lat: float | None
+    start_lng: float | None
+    end_lat: float | None
+    end_lng: float | None
+    shape: str | None  # 'loop' | 'out_and_back' | 'point_to_point'
+
+
+class RoutePointRow(TypedDict):
+    route_id: int
+    idx: int
+    lat: float
+    lng: float
+    dist_m: float  # cumulative distance from route start
+    ele_m: float | None  # smoothed; NULL when the route has no elevation
+
+
+class RouteWaypointRow(TypedDict):
+    waypoint_id: int
+    route_id: int
+    name: str | None
+    desc: str | None
+    lat: float
+    lng: float
+    dist_m: float  # snapped distance along the route
+    offset_m: float  # distance from the named point to the route itself
+
+
+class RouteClimbRow(TypedDict):
+    route_id: int
+    idx: int
+    kind: str  # 'climb' | 'descent'
+    start_m: float
+    end_m: float
+    gain_m: float  # magnitude of the elevation change over the segment
+    avg_grade: float
+
+
+class RouteGradeBandRow(TypedDict):
+    route_id: int
+    band: str
+    share: float  # fraction of distance in this band, 0..1
+
+
+class RouteLegRow(TypedDict):
+    route_id: int  # the composed route this leg belongs to
+    idx: int  # order within the composition
+    kind: str  # 'route' | 'connector'
+    leg_route_id: int | None  # the source route, for kind='route'
+    from_m: float | None  # leg's start distance on leg_route_id (kind='route')
+    to_m: float | None  # leg's end distance; from_m > to_m means reversed
+    distance_m: float | None  # leg distance; authored for connectors, derived for routes
+    gain_m: float | None  # authored estimate, for connectors only
+    note: str | None
+
+
 class AthleteRow(TypedDict):
     max_hr: int | None
     long_run_floor_miles: float | None
@@ -450,6 +538,116 @@ def init_db(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE plan_adherence ADD COLUMN {col}")
         except sqlite3.OperationalError:
             pass
+
+    # Uploaded GPX bytes are ground truth (like activities' raw_json) --
+    # everything else about a route is rebuildable from this blob. See
+    # adr/0002-routes-raw-gpx-ground-truth.md.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS gpx_files (
+            file_id     INTEGER PRIMARY KEY,
+            sha256      TEXT NOT NULL UNIQUE,
+            filename    TEXT NOT NULL,
+            creator     TEXT,
+            data        BLOB NOT NULL,
+            uploaded_at TEXT NOT NULL
+        )
+    """)
+    # One row per trk/rte found in a gpx_files blob. name/source/notes/
+    # tags_json are athlete-authored (set at upload, changed via PATCH) and
+    # are never touched by re-derivation; every other column below
+    # derive_version is rebuilt from the raw bytes by routes.derive_route.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS routes (
+            route_id       INTEGER PRIMARY KEY,
+            file_id        INTEGER NOT NULL REFERENCES gpx_files(file_id) ON DELETE CASCADE,
+            track_index    INTEGER NOT NULL,
+            kind           TEXT NOT NULL,
+            gpx_name       TEXT,
+            name           TEXT,
+            source         TEXT,
+            notes          TEXT,
+            tags_json      TEXT NOT NULL DEFAULT '[]',
+            created_at     TEXT NOT NULL,
+            derive_version INTEGER,
+            has_elevation  INTEGER,
+            distance_m     REAL,
+            gain_m         REAL,
+            loss_m         REAL,
+            min_ele_m      REAL,
+            max_ele_m      REAL,
+            ft_per_mi      REAL,
+            bbox_south     REAL,
+            bbox_west      REAL,
+            bbox_north     REAL,
+            bbox_east      REAL,
+            start_lat      REAL,
+            start_lng      REAL,
+            end_lat        REAL,
+            end_lng        REAL,
+            shape          TEXT,
+            UNIQUE(file_id, track_index)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS route_points (
+            route_id INTEGER NOT NULL REFERENCES routes(route_id) ON DELETE CASCADE,
+            idx      INTEGER NOT NULL,
+            lat      REAL NOT NULL,
+            lng      REAL NOT NULL,
+            dist_m   REAL NOT NULL,
+            ele_m    REAL,
+            PRIMARY KEY (route_id, idx)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS route_waypoints (
+            waypoint_id INTEGER PRIMARY KEY,
+            route_id    INTEGER NOT NULL REFERENCES routes(route_id) ON DELETE CASCADE,
+            name        TEXT,
+            desc        TEXT,
+            lat         REAL NOT NULL,
+            lng         REAL NOT NULL,
+            dist_m      REAL NOT NULL,
+            offset_m    REAL NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS route_climbs (
+            route_id  INTEGER NOT NULL REFERENCES routes(route_id) ON DELETE CASCADE,
+            idx       INTEGER NOT NULL,
+            kind      TEXT NOT NULL,
+            start_m   REAL NOT NULL,
+            end_m     REAL NOT NULL,
+            gain_m    REAL NOT NULL,
+            avg_grade REAL NOT NULL,
+            PRIMARY KEY (route_id, idx)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS route_grade_bands (
+            route_id INTEGER NOT NULL REFERENCES routes(route_id) ON DELETE CASCADE,
+            band     TEXT NOT NULL,
+            share    REAL NOT NULL,
+            PRIMARY KEY (route_id, band)
+        )
+    """)
+    # Composition definition for a route generated by compose_route (source
+    # 'composed' in routes.source); kind='connector' rows have no
+    # leg_route_id (a road/trail bit we don't have a GPX for).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS route_legs (
+            route_id     INTEGER NOT NULL REFERENCES routes(route_id) ON DELETE CASCADE,
+            idx          INTEGER NOT NULL,
+            kind         TEXT NOT NULL,
+            leg_route_id INTEGER REFERENCES routes(route_id) ON DELETE SET NULL,
+            from_m       REAL,
+            to_m         REAL,
+            distance_m   REAL,
+            gain_m       REAL,
+            note         TEXT,
+            PRIMARY KEY (route_id, idx)
+        )
+    """)
     conn.commit()
 
 

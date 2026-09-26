@@ -91,3 +91,32 @@ def test_backfill_is_a_noop_on_fresh_empty_db():
         "SELECT value FROM meta WHERE key = 'start_date_local_migrated'"
     ).fetchone()
     assert stamp is not None
+
+
+def test_init_db_creates_route_tables():
+    conn = _fresh_conn()
+    tables = {
+        r["name"]
+        for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+    }
+    assert {
+        "gpx_files",
+        "routes",
+        "route_points",
+        "route_waypoints",
+        "route_climbs",
+        "route_grade_bands",
+        "route_legs",
+    } <= tables
+
+
+def test_init_db_is_idempotent_for_route_tables():
+    conn = _fresh_conn()
+    conn.execute(
+        "INSERT INTO gpx_files (sha256, filename, creator, data, uploaded_at) VALUES (?, ?, ?, ?, ?)",
+        ["abc123", "test.gpx", "Test", b"<gpx></gpx>", "2026-01-01T00:00:00+00:00"],
+    )
+    conn.commit()
+    db.init_db(conn)  # must not drop/recreate and lose the row
+    row = conn.execute("SELECT filename FROM gpx_files WHERE sha256 = 'abc123'").fetchone()
+    assert row["filename"] == "test.gpx"
