@@ -45,6 +45,16 @@ class JunctionResult(TypedDict):
 # routes are running together, not just touching).
 OVERLAP_MIN_LEN_M = 100.0
 
+# A run is only one overlap while the matched position on B keeps advancing
+# by roughly one sample step per step of A, forward or backward alike. A
+# step bigger than this many multiples of B's own point spacing means A's
+# nearest match jumped to an unrelated stretch of B -- e.g. a loop's
+# outbound and return legs both passing within tolerance of the same A
+# stretch near a shared trailhead -- and the run must split there rather
+# than reporting a shared span all the way from B's first cluster to its
+# last.
+OVERLAP_MAX_STEP_MULTIPLE = 5.0
+
 
 def equirect_distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     """Flat-earth approximation using the pair's mean latitude as the
@@ -97,6 +107,34 @@ class Grid:
         return out
 
 
+def _typical_spacing_m(dist: list[float]) -> float:
+    """Median gap between consecutive entries of a cumulative-distance
+    series -- a proxy for that list's own resample spacing, without
+    importing gpx_parse's RESAMPLE_SPACING_M (gpx_parse already imports
+    from this module, so the reverse import would cycle)."""
+    if len(dist) < 2:
+        return 0.0
+    diffs = sorted(dist[i + 1] - dist[i] for i in range(len(dist) - 1))
+    return diffs[len(diffs) // 2]
+
+
+def _split_run_by_b_continuity(
+    run: list[tuple[int, int, float]], dist_b: list[float], max_step_m: float
+) -> list[list[tuple[int, int, float]]]:
+    """Split a run of A-index-contiguous matches wherever the matched
+    position on B jumps by more than max_step_m from one A point to the
+    next. B may advance forward or backward within one sub-run (both are a
+    genuine shared stretch); a jump either way starts a new one."""
+    groups: list[list[tuple[int, int, float]]] = [[run[0]]]
+    for prev, cur in zip(run, run[1:]):
+        delta = dist_b[cur[1]] - dist_b[prev[1]]
+        if abs(delta) > max_step_m:
+            groups.append([cur])
+        else:
+            groups[-1].append(cur)
+    return groups
+
+
 def find_junctions(
     points_a: list[tuple[float, float]],
     dist_a: list[float],
@@ -105,10 +143,12 @@ def find_junctions(
     tolerance_m: float = 30.0,
 ) -> JunctionResult:
     """For every point of A, find its nearest point of B within
-    tolerance_m (via a grid index over B), then collapse consecutive
-    matched runs of A into either a Junction (short contact) or an
-    Overlap (a run at least OVERLAP_MIN_LEN_M long, reported as a
-    from/to span on both routes).
+    tolerance_m (via a grid index over B), collapse consecutive matched
+    points of A into runs, then split each run wherever B's matched
+    position jumps (see _split_run_by_b_continuity) before classifying
+    each piece as a Junction (short contact) or an Overlap (a run at
+    least OVERLAP_MIN_LEN_M long, reported as a from/to span on both
+    routes).
 
     Matching is one-directional (A points look up B), which is adequate
     when both point lists are resampled at comparable spacing -- a
@@ -138,6 +178,12 @@ def find_junctions(
             current = []
     if current:
         runs.append(current)
+
+    max_step_m = max(
+        _typical_spacing_m(dist_a), _typical_spacing_m(dist_b), 0.0
+    ) * OVERLAP_MAX_STEP_MULTIPLE
+    max_step_m = max(max_step_m, tolerance_m)
+    runs = [sub for run in runs for sub in _split_run_by_b_continuity(run, dist_b, max_step_m)]
 
     junctions: list[Junction] = []
     overlaps: list[Overlap] = []

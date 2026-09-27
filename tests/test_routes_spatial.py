@@ -63,6 +63,53 @@ def test_find_junctions_detects_a_shared_stretch_as_an_overlap():
     assert overlap["a_to_m"] == pytest.approx(dist_a[-1], abs=1.0)
 
 
+def test_find_junctions_reversed_direction_overlap_stays_one_span():
+    # B runs the exact same path as A but in the opposite direction (think
+    # two routes sharing a stretch, one heading out as the other heads
+    # back) -- the matched B position still advances one step per A step,
+    # just backwards, and should report as a single overlap end to end.
+    a = _line(40.0, -105.0, 30)
+    b = list(reversed(a))
+    dist_a = _dists(a)
+    dist_b = _dists(b)
+    result = rs.find_junctions(a, dist_a, b, dist_b, tolerance_m=30.0)
+    assert len(result["overlaps"]) == 1
+    overlap = result["overlaps"][0]
+    assert overlap["a_from_m"] == pytest.approx(0.0, abs=1.0)
+    assert overlap["a_to_m"] == pytest.approx(dist_a[-1], abs=1.0)
+    assert overlap["b_from_m"] == pytest.approx(0.0, abs=1.0)
+    assert overlap["b_to_m"] == pytest.approx(dist_b[-1], abs=1.0)
+
+
+def test_find_junctions_splits_overlap_across_a_loop_wrap():
+    # A shares a stretch with B at both ends of B's own point sequence --
+    # the shape a loop takes when its outbound and return legs both pass a
+    # common trailhead stretch that a second, smaller loop also uses once.
+    # Matching every point of A into one A-contiguous run (as before the
+    # fix) reported this as a single overlap spanning the whole of B, from
+    # its first cluster to its last. It must instead split into two
+    # overlaps, each mapped to the matching half of B.
+    shared_low = _line(40.0, -105.0, 15)    # B's start; A's first half
+    shared_high = _line(40.05, -105.0, 15)  # B's end; A's second half
+    filler = _line(41.0, -105.0, 15)        # far from A -- the rest of B's loop
+
+    b = shared_low + filler + shared_high
+    a = shared_low + shared_high  # one A-contiguous run, matching both ends of B
+
+    dist_a = _dists(a)
+    dist_b = _dists(b)
+    result = rs.find_junctions(a, dist_a, b, dist_b, tolerance_m=30.0)
+
+    assert len(result["overlaps"]) == 2
+    first, second = sorted(result["overlaps"], key=lambda o: o["a_from_m"])
+    assert first["a_from_m"] == pytest.approx(0.0, abs=1.0)
+    assert first["b_from_m"] == pytest.approx(0.0, abs=1.0)
+    assert first["b_to_m"] < dist_b[len(shared_low) + len(filler)]
+    assert second["a_to_m"] == pytest.approx(dist_a[-1], abs=1.0)
+    assert second["b_from_m"] > dist_b[len(shared_low) + len(filler) - 1]
+    assert second["b_to_m"] == pytest.approx(dist_b[-1], abs=1.0)
+
+
 def test_find_junctions_empty_when_routes_never_come_close():
     a = _line(40.0, -105.0, 10)
     b = _line(50.0, -105.0, 10)

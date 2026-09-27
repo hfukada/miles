@@ -26,7 +26,7 @@ from xml.sax.saxutils import escape as xml_escape
 from . import db, gpx_parse, routes_spatial
 from .fitness import MILE_M
 
-ROUTE_DERIVE_VERSION = 1
+ROUTE_DERIVE_VERSION = 2
 
 FT_PER_M = 3.28084
 
