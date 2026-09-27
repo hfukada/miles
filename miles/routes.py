@@ -837,7 +837,7 @@ def compose_route(
 def _build_gpx(name: str, points: list[tuple[float, float, float | None]]) -> bytes:
     lines = [
         '<?xml version="1.0"?>',
-        '<gpx version="1.1" creator="miles">',
+        f'<gpx version="1.1" creator="miles" xmlns="{gpx_parse.GPX_NAMESPACE}">',
         "  <trk>",
         f"    <name>{xml_escape(name)}</name>",
         "    <trkseg>",

@@ -1,8 +1,9 @@
 import sqlite3
+from xml.etree import ElementTree as ET
 
 import pytest
 
-from miles import db, routes as routes_service
+from miles import db, gpx_parse, routes as routes_service
 
 
 def _conn() -> sqlite3.Connection:
@@ -110,6 +111,29 @@ def test_compose_save_creates_a_new_route_with_legs():
     assert saved["name"] == "My Composed Run"
     assert saved["legs"] is not None and len(saved["legs"]) == 1
     assert saved["legs"][0]["route_id"] == route_id
+
+
+def test_compose_save_generates_gpx_with_namespace_and_round_trips():
+    conn = _conn()
+    route_id = _straight_route(conn, 40.0, -105.0, name="Base")
+    detail = routes_service.get_route(conn, route_id)
+    result = routes_service.compose_route(
+        conn,
+        [{"route_id": route_id, "from_m": 0.0, "to_m": detail["distance_m"]}],
+        save=True,
+        name="Composed With Namespace",
+    )
+    filename, gpx_bytes = routes_service.get_route_gpx(conn, result["route_id"])
+    assert filename.startswith("composed-")
+
+    root = ET.fromstring(gpx_bytes)
+    assert root.tag == f"{{{gpx_parse.GPX_NAMESPACE}}}gpx"
+
+    doc = gpx_parse.parse_gpx_bytes(gpx_bytes)
+    assert doc["creator"] == "miles"
+    assert len(doc["tracks"]) == 1
+    assert doc["tracks"][0]["gpx_name"] == "Composed With Namespace"
+    assert len(doc["tracks"][0]["points"]) > 1
 
 
 def test_compose_out_of_range_leg_warns_and_is_skipped():

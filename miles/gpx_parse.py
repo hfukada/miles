@@ -55,6 +55,10 @@ GRADE_BANDS: list[tuple[float, float, str]] = [
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
+# The GPX 1.1 default namespace -- required on a root element for the file
+# to validate against the schema most consumers (Strava included) expect.
+GPX_NAMESPACE = "http://www.topografix.com/GPX/1/1"
+
 # lat, lng, elevation in meters (None when the point carries no <ele>)
 GpxPoint = tuple[float, float, float | None]
 
