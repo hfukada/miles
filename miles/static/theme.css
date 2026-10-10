@@ -255,6 +255,16 @@ section h2 {
   margin-bottom: 0.875rem;
 }
 
+.weather-credit {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin: 0.5rem 0;
+}
+
+.weather-credit a {
+  color: inherit;
+}
+
 .scroll {
   overflow-x: auto;
   border-radius: 8px;

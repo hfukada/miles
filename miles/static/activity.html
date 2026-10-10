@@ -6,9 +6,9 @@
   <title>Miles · Activity</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏃</text></svg>">
   <link rel="stylesheet" href="/theme.css">
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous">
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous"></script>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
   <style>
     .activity-view h1 {
       font-size: 1.25rem;
@@ -146,11 +146,13 @@
     }
     .activity-view .dense tbody td { padding: 0.25rem 0.75rem; font-size: 0.75rem; }
     .activity-view .dense thead th { padding: 0.375rem 0.75rem; font-size: 0.625rem; }
+    .activity-view .terrain-note { font-size: 0.75rem; color: var(--muted); font-style: italic; margin-bottom: 0.5rem; }
   </style>
 </head>
 <body>
 <script src="/nav.js"></script>
 <script src="/charts.js"></script>
+<script src="/map.js"></script>
 
 <main class="activity-view">
   <div id="root">Loading…</div>
@@ -222,6 +224,7 @@
 
     renderCharts();
     renderLapTable();
+    loadTerrainAnalysis();
   }
 
   function renderHeader(d) {
@@ -245,6 +248,7 @@
         ${stat('Elevation Loss', d.elevation_loss_ft != null ? Math.round(d.elevation_loss_ft) : '—', 'ft')}
         ${weatherStat(d)}
       </div>
+      ${d.weather_attribution ? '<p class="weather-credit">Weather data by <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a></p>' : ''}
       ${classifyPanel(d)}
       <div id="chart-section">
         <div class="chart-panel">
@@ -289,6 +293,7 @@
           </div>
           <div id="chart-elevation"></div>
         </div>
+        <div id="terrain-section"></div>
         ${d.polyline ? `
           <div class="chart-panel">
             <div class="chart-panel-head">
@@ -351,6 +356,7 @@
     elevChart = null;
     renderCharts();
     renderLapTable();
+    loadTerrainAnalysis();
   }
 
   function wireClassifyPanel() {
@@ -419,14 +425,12 @@
   function renderMap(encodedPolyline) {
     const points = decodePolyline(encodedPolyline);
     if (points.length < 2) return;
+    if (typeof L === 'undefined') return;
 
     if (routeMap) { routeMap.remove(); routeMap = null; }
     routeMap = L.map('map-route', { scrollWheelZoom: false });
 
-    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-      maxZoom: 19,
-    }).addTo(routeMap);
+    addBaseLayer(routeMap, { withTerrainData: true });
 
     const line = L.polyline(points, { color: '#7dd3fc', weight: 4, opacity: 0.9 }).addTo(routeMap);
     routeMap.fitBounds(line.getBounds(), { padding: [16, 16] });
@@ -860,6 +864,74 @@
         <td class="r">${m.max_hr != null ? Math.round(m.max_hr) : '—'}</td>
       </tr>
     `).join('');
+  }
+
+  // Climbs/descents against the terrain model's expectation for their grade.
+  // Omits the panel entirely rather than showing an error when the activity
+  // has no cached position/elevation stream yet -- the same convention the
+  // Route map panel uses for a missing polyline.
+  async function loadTerrainAnalysis() {
+    const el = document.getElementById('terrain-section');
+    if (!el) return;
+    let analysis, confidence;
+    try {
+      const [analysisRes, profileRes] = await Promise.all([
+        fetch(`/api/terrain/activities/${activityId}`),
+        fetch('/api/terrain/profile'),
+      ]);
+      if (!analysisRes.ok) { el.innerHTML = ''; return; }
+      analysis = await analysisRes.json();
+      confidence = profileRes.ok ? (await profileRes.json()).confidence : null;
+    } catch (e) {
+      el.innerHTML = '';
+      return;
+    }
+    el.innerHTML = terrainSection(analysis, confidence);
+  }
+
+  function terrainSection(analysis, confidence) {
+    const rows = analysis.climbs.length ? analysis.climbs.map(c => {
+      const startMi = (c.start_m / 1609.344).toFixed(2);
+      const lengthMi = (c.distance_m / 1609.344).toFixed(2);
+      const actualPace = c.actual_speed_mps != null ? fmt.pace((1609.344 / c.actual_speed_mps) / 60) : null;
+      const expectedPace = fmt.pace((1609.344 / c.expected_speed_mps) / 60);
+      return `
+        <tr>
+          <td>${c.kind === 'climb' ? 'Climb' : 'Descent'}</td>
+          <td class="r">${startMi} mi</td>
+          <td class="r">${lengthMi} mi</td>
+          <td class="r">${c.avg_grade_pct.toFixed(1)}%</td>
+          <td class="r">${actualPace != null ? `${actualPace}/mi` : '—'}</td>
+          <td class="r">${expectedPace}/mi</td>
+          <td class="r">${c.percentile != null ? fmt.ordinal(Math.round(c.percentile)) : '—'}</td>
+        </tr>
+      `;
+    }).join('') : '<tr><td colspan="7" class="dash">No sustained climbs or descents.</td></tr>';
+
+    return `
+      <div class="chart-panel">
+        <div class="chart-panel-head">
+          <div class="chart-panel-title">Climbs &amp; Descents</div>
+        </div>
+        ${confidence === 'low' ? '<div class="terrain-note">Terrain model confidence is low — expected pace is based on limited history.</div>' : ''}
+        <div class="scroll dense">
+          <table>
+            <thead>
+              <tr>
+                <th>Kind</th>
+                <th class="r">Start</th>
+                <th class="r">Length</th>
+                <th class="r">Grade</th>
+                <th class="r">Actual Pace</th>
+                <th class="r">Expected Pace</th>
+                <th class="r">Percentile</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+      </div>
+    `;
   }
 
   function lapMedianSeries(markers, field, sampleTimes) {

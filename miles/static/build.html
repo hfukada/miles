@@ -576,9 +576,12 @@
     try {
       const res = await fetch(`/api/build-workout-groups?race_date=${encodeURIComponent(raceDate)}`);
       const groups = res.ok ? await res.json() : [];
+      const hasWeather = groups.some(g => g.sessions.some(s => s.weather_attribution));
       container.innerHTML = groups.length
-        ? groups.map(groupSection).join('')
-        : `<p class="build-empty">No repeated workout sessions in this build.</p>`;
+        ? groups.map(groupSection).join('') + (hasWeather
+          ? '<p class="weather-credit">Weather data by <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a></p>'
+          : '')
+        :`<p class="build-empty">No repeated workout sessions in this build.</p>`;
       const contentsEl = document.getElementById('contents-line');
       if (contentsEl) contentsEl.outerHTML = contentsLine(groups.map(g => g.label));
     } catch (err) {

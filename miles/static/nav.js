@@ -14,6 +14,7 @@ const NAV_LINKS = [
       { href: "/compare.html", label: "Compare" },
       { href: "/training.html", label: "Training" },
       { href: "/years.html", label: "Years" },
+      { href: "/terrain.html", label: "Terrain" },
     ],
   },
 ];

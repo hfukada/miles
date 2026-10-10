@@ -1,18 +1,36 @@
+import logging
+import os
 import sqlite3
 import sys
 import threading
 import time
+import urllib.error
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime, timedelta, timezone
 
 import click
-from stravalib.exc import Fault
 from typing_extensions import TypedDict
 
-from . import db, plan, strava_client, weather as weather_module
+from . import db, elevation, events, outbound, plan, strava_budget, strava_client, streams, terrain, terrain_backfill, weather as weather_module
 from .classifier import classify_workout
 from .derive import derive_all
+from .errors import StravaAllowanceLowError, describe_error
+from .races import run_sport_filter
+
+_logger = logging.getLogger(__name__)
+
+HISTORY_ENV = "MILES_SYNC_HISTORY"
+DEFAULT_HISTORY_LIMIT = 900
+# An incremental sync lists activities this far before the newest stored one.
+INCREMENTAL_LOOKBACK = timedelta(days=30)
+
+# meta keys written by every run, read by the health check and /metrics.
+META_LAST_SUCCESS = "last_sync_at"
+META_LAST_FAILURE = "last_sync_failed_at"
+META_LAST_ERROR = "last_sync_error"
+META_LAST_DURATION = "last_sync_duration_s"
+META_LAST_NEW = "last_sync_new_activities"
 
 
 class SyncStatus(TypedDict):
@@ -31,7 +49,7 @@ class SyncProgress:
     """Thread-safe status for one sync run, polled by /api/sync/status and
     (optionally) echoed to the terminal by the CLI. Holds only the current phase —
     there is no history, just "what's happening right now." One instance is reused
-    across an entire run_with_retry call, including any rate-limit retries."""
+    across an entire run_sync call, including any waits on the rate limit."""
 
     def __init__(self, printer: Callable[[SyncStatus], None] | None = None) -> None:
         self._lock = threading.Lock()
@@ -131,158 +149,146 @@ def _print_progress(snapshot: SyncStatus) -> None:
         print(f"  {snapshot['done']} activities fetched...")
     elif phase == "waiting":
         print(f"\nRate limit hit — waiting until {snapshot['until']}...")
-    elif phase in ("laps", "weather", "backfill") and snapshot["total"] is not None:
+    elif snapshot["total"] is not None and phase not in ("derive", "error"):
         print(f"  {phase} {snapshot['done']}/{snapshot['total']}...")
     elif phase == "done":
         n = snapshot["new_activities"] or 0
         print(f"Sync complete. {n} new/updated activities.")
 
 
-def _wait_for_rate_limit(progress: SyncProgress) -> None:
-    now = datetime.now()
-    seconds_into_window = (now.minute % 15) * 60 + now.second
-    wait = (15 * 60) - seconds_into_window + 5  # +5s buffer past window boundary
-    until = (now + timedelta(seconds=wait)).strftime("%H:%M")
-    progress.phase("waiting", until=until)
-    time.sleep(wait)
+def history_enabled() -> bool:
+    """Whether a sync also trickles in history. On unless MILES_SYNC_HISTORY
+    is set to a false value."""
+    return os.environ.get(HISTORY_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
 
 
-def _extra_lap_backfill(conn: sqlite3.Connection, extra_limit: int, reserve: int, progress: SyncProgress) -> None:
-    """Backfill laps for all remaining runs, long runs first then newest-first.
-    Resumable: each activity is stamped and committed individually, and a fresh
-    generator is built for the remaining ids after a rate-limit interruption.
+class _PhaseSink:
+    """Reports a pass's progress as sync phases (`<prefix><phase>`) and, for
+    the history pass, mirrors it into the terrain backfill's status row."""
 
-    The remaining-rows check is a local DB query (free); it runs before anything
-    that spends a Strava call, so a no-op --extra (nothing left to backfill, the
-    common case once history is fully backfilled) never touches the network,
-    prints nothing, and reports no progress phase.
-    """
-    effective_run_type = db.effective_run_type_sql()
-    remaining_ids = [
-        row["activity_id"]
-        for row in conn.execute(f"""
-            SELECT activity_id FROM activities
-            WHERE sport_type IN ('Run', 'TrailRun', 'VirtualRun')
-              AND laps_synced_at IS NULL
-            ORDER BY CASE WHEN {effective_run_type} = 'long_run' THEN 0 ELSE 1 END,
-                     start_date DESC
-        """).fetchall()
-    ]
-    total_remaining = len(remaining_ids)
-    if total_remaining == 0:
-        return
+    def __init__(self, progress: SyncProgress, prefix: str = "", mirror: terrain_backfill.BackfillProgress | None = None) -> None:
+        self._progress = progress
+        self._prefix = prefix
+        self._mirror = mirror
 
-    # The incremental sync earlier in _run has already hit the API, so the
-    # recorded daily usage is current — skip without spending another call
-    # when the reserve is already gone (e.g. a second --extra run today).
-    remaining_calls = strava_client.daily_calls_remaining()
-    if remaining_calls is not None and remaining_calls <= reserve:
-        return
+    def start(self, total: int) -> None:
+        if self._mirror is not None:
+            self._mirror.start(total)
 
-    todo_ids = remaining_ids[:extra_limit]
-    batch_size = len(todo_ids)
+    def phase(self, phase: str, *, done: int, total: int) -> None:
+        self._progress.phase(f"{self._prefix}{phase}", done=done, total=total)
+        if self._mirror is not None:
+            self._mirror.phase(phase, done=done, total=total)
+
+
+def _fetch_laps(
+    conn: sqlite3.Connection,
+    ids: list[int],
+    gate: strava_budget.Gate,
+    sink: _PhaseSink,
+    *,
+    names: dict[int, str | None] | None = None,
+) -> int:
+    """Fetch and store laps and the description for each id in order (one
+    request each), stopping when the gate refuses. Each activity is stamped
+    and committed on its own, so an interruption loses nothing. With `names`,
+    a workout label is set from the activity's name. Returns how many were
+    fetched."""
+    if not ids:
+        return 0
+    total = len(ids)
     fetched = 0
     lap_total = 0
-    # Nonzero start: the first 429 always waits out the 15-min window; only a
-    # 429 after a fruitless full-window wait means the daily cap.
-    successes_since_429 = 1
-
-    progress.phase("backfill", done=0, total=batch_size)
-    stopped_for_reserve = False
-    while todo_ids and not stopped_for_reserve:
-        processed_in_attempt = 0
-        try:
-            for activity_id, laps in strava_client.get_activity_laps_batch(todo_ids):
-                if laps:
-                    db.upsert_laps(conn, laps)
-                    lap_total += len(laps)
-                conn.execute(
-                    "UPDATE activities SET laps_synced_at = datetime('now') WHERE activity_id = ?",
-                    (activity_id,),
-                )
-                conn.commit()
-                fetched += 1
-                successes_since_429 += 1
-                processed_in_attempt += 1
-                if fetched % 25 == 0:
-                    progress.phase("backfill", done=fetched, total=batch_size)
-                remaining_calls = strava_client.daily_calls_remaining()
-                if remaining_calls is not None and remaining_calls <= reserve:
-                    stopped_for_reserve = True
-                    break
-            else:
-                todo_ids = []
-        except Fault as e:
-            if e.response is not None and e.response.status_code == 429:
-                todo_ids = todo_ids[processed_in_attempt:]
-                if successes_since_429 == 0:
-                    break
-                _wait_for_rate_limit(progress)
-                successes_since_429 = 0
-            else:
-                raise
-
-    progress.phase("backfill", done=fetched, total=batch_size)
+    sink.phase("laps", done=0, total=total)
+    try:
+        for activity_id in ids:
+            description, laps = gate.call("detail", lambda: strava_client.get_activity_detail(activity_id))
+            db.set_activity_description(conn, activity_id, description)
+            if laps is None:
+                laps = gate.call("laps", lambda: strava_client.get_activity_laps(activity_id))
+            db.store_activity_laps(conn, activity_id, laps)
+            lap_total += len(laps)
+            if names is not None:
+                name = names.get(activity_id)
+                label = classify_workout(name) if name else None
+                if label:
+                    conn.execute(
+                        "UPDATE activities SET workout_label = ? WHERE activity_id = ? AND workout_label IS NULL",
+                        (label, activity_id),
+                    )
+                    conn.commit()
+            fetched += 1
+            if fetched % 10 == 0 or fetched == total:
+                sink.phase("laps", done=fetched, total=total)
+    except StravaAllowanceLowError as e:
+        # laps_synced_at stays unset for the rest, so a later run fetches them.
+        _logger.warning("lap fetch stopped: %s", e)
+    sink.phase("laps", done=fetched, total=total)
+    print(f"Laps done. {lap_total} laps for {fetched} activities.")
+    return fetched
 
 
-def _run(
-    conn: sqlite3.Connection,
-    full: bool,
-    extra: bool,
-    extra_limit: int,
-    extra_reserve: int,
-    progress: SyncProgress,
-) -> int:
-    """Run one sync pass. Returns the number of new/updated activities fetched."""
+def _pass_activities(
+    conn: sqlite3.Connection, full: bool, progress: SyncProgress, gate: strava_budget.Gate
+) -> tuple[int, set[int]]:
+    """Pass 1: list activities newer than the last sync and store them. Returns
+    how many of them were new or changed and the ids that were not in the
+    database before."""
     after = None if full else db.last_synced_date(conn)
     if after:
         # activities.start_date is athlete-local wall time (db.py), but Strava's
-        # `after` filter cuts on true UTC start_date. Local time can sit hours
-        # either side of UTC depending on the athlete's timezone/DST — for an
-        # athlete east of UTC, using the local timestamp directly would produce
-        # a cursor LATER than the real UTC cutoff and could permanently skip
-        # activities in that gap. Subtract generous slack; re-fetching a couple
-        # extra days is harmless since upserts are idempotent.
-        after = (datetime.fromisoformat(after) - timedelta(hours=48)).isoformat()
+        # `after` filter cuts on true UTC start_date, and local time can sit
+        # hours either side of UTC: using it directly could put the cursor
+        # later than the real cutoff and skip activities in the gap. The
+        # lookback also catches uploads that arrive days after the run and
+        # renames or retags of recent activities. Upserts are idempotent and
+        # an unchanged listing leaves derived values alone.
+        after = (datetime.fromisoformat(after) - INCREMENTAL_LOOKBACK).isoformat()
         print(f"Incremental sync: fetching activities after {after}")
     else:
         print("Full sync: fetching all activities (may take a few minutes)...")
 
-    rows = []
-    progress.phase("activities", done=0)
-    for i, row in enumerate(strava_client.get_activities(after_ts=after)):
-        rows.append(row)
-        if (i + 1) % 50 == 0:
-            progress.phase("activities", done=i + 1)
-    progress.phase("activities", done=len(rows))
+    def list_activities() -> list[db.ActivityRow]:
+        listed: list[db.ActivityRow] = []
+        progress.phase("activities", done=0)
+        for i, row in enumerate(strava_client.get_activities(after_ts=after)):
+            listed.append(row)
+            if (i + 1) % 50 == 0:
+                progress.phase("activities", done=i + 1)
+        progress.phase("activities", done=len(listed))
+        return listed
 
+    # A 429 part-way through starts the listing over once the window opens.
+    rows = gate.call(strava_budget.LISTING_KIND, list_activities)
+
+    known = {r["activity_id"] for r in conn.execute("SELECT activity_id FROM activities").fetchall()}
+    new_run_ids = {
+        int(row["activity_id"])
+        for row in rows
+        if row["activity_id"] not in known and row["sport_type"] in terrain.TERRAIN_SPORT_TYPES
+    }
+    rewritten = db.count_rewritten(conn, rows)
     if rows:
-        db.upsert_activities(conn, rows)
+        for activity_id in db.upsert_activities(conn, rows):
+            streams.discard_raw_streams(activity_id)
 
     total = conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0]
-    print(f"Done. {len(rows)} new/updated. {total} total in DB.")
+    print(f"Done. {rewritten} new/updated. {total} total in DB.")
+    return rewritten, new_run_ids
 
-    # Run derive here (not just at the end) so newly synced rows have run_type_inferred
-    # populated before the lap fetch below queries effective type — otherwise
-    # freshly-inferred races/workouts would be skipped for another sync cycle.
+
+def _derive(conn: sqlite3.Connection, progress: SyncProgress) -> None:
     progress.phase("derive")
     counts = derive_all(conn)
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no changes"
     print(f"Derive done. {summary}")
 
-    # Auto-complete the active plan when a synced effective-race activity
-    # now matches its race_date (+/-1 day) and distance_bucket (case-
-    # insensitive) — placed after the derive_all above so a race that was
-    # only just inferred (run_type_inferred) this same sync cycle is already
-    # visible to the match, not just on the next sync. The only mutation is
-    # the status flip; plans/plan_versions/plan_weeks/plan_days stay
-    # untouched and append-only. No-ops cleanly with no active plan or no
-    # matching race (see plan.auto_complete_plan).
-    completed_plan_id = plan.auto_complete_plan(conn)
-    if completed_plan_id is not None:
-        print(f"Plan {completed_plan_id} auto-completed (matching race synced).")
 
-    # Lazy lap sync: fetch laps for workout/race activities that have none yet.
+def _pass_details(conn: sqlite3.Connection, new_run_ids: Collection[int], gate: strava_budget.Gate, progress: SyncProgress) -> None:
+    """Pass 2: laps for workouts and races that have none yet, then streams
+    and terrain segments for the runs pass 1 found. Both stop at the Strava
+    reserve; what is left is picked up by the next sync (laps) or the history
+    pass (streams)."""
     # Backstamp anything already fetched by a prior sync so it's never refetched.
     conn.execute("""
         UPDATE activities SET laps_synced_at = datetime('now')
@@ -298,35 +304,15 @@ def _run(
           AND laps_synced_at IS NULL
         ORDER BY start_date
     """).fetchall()
-
     if unsynced:
-        total_workouts = len(unsynced)
-        print(f"Fetching laps for {total_workouts} workout(s)...")
-        ids = [a["activity_id"] for a in unsynced]
-        names = {a["activity_id"]: a["name"] for a in unsynced}
-        lap_total = 0
-        progress.phase("laps", done=0, total=total_workouts)
-        for i, (activity_id, laps) in enumerate(strava_client.get_activity_laps_batch(ids), 1):
-            if laps:
-                db.upsert_laps(conn, laps)
-                lap_total += len(laps)
-            conn.execute(
-                "UPDATE activities SET laps_synced_at = datetime('now') WHERE activity_id = ?",
-                (activity_id,),
-            )
-            conn.commit()
-            name: str | None = names.get(activity_id)
-            if name:
-                label = classify_workout(name)
-                if label:
-                    conn.execute(
-                        "UPDATE activities SET workout_label = ? WHERE activity_id = ? AND workout_label IS NULL",
-                        (label, activity_id),
-                    )
-                    conn.commit()
-            if i % 5 == 0 or i == total_workouts:
-                progress.phase("laps", done=i, total=total_workouts)
-        print(f"Laps done. {lap_total} total.")
+        print(f"Fetching laps for {len(unsynced)} workout(s)...")
+        _fetch_laps(
+            conn,
+            [a["activity_id"] for a in unsynced],
+            gate,
+            _PhaseSink(progress),
+            names={a["activity_id"]: a["name"] for a in unsynced},
+        )
 
     # Backfill labels for any workout activities that have laps but no label yet.
     unlabeled = conn.execute("""
@@ -346,7 +332,42 @@ def _run(
     if unlabeled:
         conn.commit()
 
-    # Weather sync: fetch for any activity with location but no weather yet.
+    if new_run_ids:
+        print(f"Fetching streams for {len(new_run_ids)} new run(s)...")
+        try:
+            terrain_backfill.run_backfill(conn, _PhaseSink(progress), gate=gate, only_ids=new_run_ids)
+        except terrain.TerrainRebuildingError:
+            # Segmenting needs the terrain model, which a rebuild in progress
+            # owns; the history pass picks these runs up afterwards.
+            _note_terrain_rebuilding(progress)
+        except (terrain_backfill.BackfillAbortedError, elevation.ElevationFetchError) as e:
+            # The new activities are stored; the history pass retries what is
+            # left, and its status row reports a persistent failure.
+            _logger.warning("stream fetch for new runs stopped: %s", describe_error(e, None))
+            print(f"Stream fetch for new runs stopped: {describe_error(e, None)}")
+        except Exception as e:
+            # The terrain model is derived data: its failure must not skip
+            # the weather, history, and derive passes or the last-sync stamp.
+            _logger.warning("terrain work for new runs failed", exc_info=True)
+            conn.rollback()
+            print(f"Terrain work for new runs failed: {describe_error(e, None)}")
+
+
+def _note_terrain_rebuilding(progress: SyncProgress) -> None:
+    _logger.info("streams skipped: a terrain model rebuild is running")
+    print("Streams skipped: a terrain model rebuild is running; a later sync will fetch them.")
+    progress.phase("streams-skipped-terrain-rebuilding")
+
+
+def _pass_weather(conn: sqlite3.Connection, progress: SyncProgress) -> None:
+    """Pass 3: weather for activities with a location and none yet. Open-Meteo,
+    not Strava, so it never touches the Strava budget. The first failed request
+    ends the pass, as does a location whose every window is refused; the
+    activities it did not reach are picked up next sync. An activity the
+    service had no hours for, or whose window was refused as unanswerable
+    (status 400 or 422), keeps a value-less marker row and is asked about
+    again only after NO_DATA_RETRY_DAYS."""
+    retry_before = (datetime.now(timezone.utc) - timedelta(days=weather_module.NO_DATA_RETRY_DAYS)).isoformat()
     # Open-Meteo's hourly data is requested in UTC (weather.py's `timezone: UTC`
     # param), so this needs Strava's real UTC start_date — recovered from
     # raw_json, since activities.start_date now stores athlete-local wall time.
@@ -358,102 +379,226 @@ def _run(
         WHERE a.start_lat IS NOT NULL AND a.start_lng IS NOT NULL
           AND a.moving_time_s IS NOT NULL
           AND json_extract(a.raw_json, '$.start_date') IS NOT NULL
-          AND w.activity_id IS NULL
+          AND (w.activity_id IS NULL
+               OR (w.fetched_at < ? AND (w.hourly_json IS NULL OR (
+                       w.temp_c_avg IS NULL AND w.temp_c_max IS NULL AND w.humidity_avg IS NULL
+                       AND w.wind_kph_avg IS NULL AND w.precip_mm IS NULL
+                       AND w.apparent_temp_c_max IS NULL))))
         ORDER BY a.start_date DESC
-    """).fetchall()
+    """, [retry_before]).fetchall()
+    if not needs_weather:
+        return
 
-    if needs_weather:
-        total_w = len(needs_weather)
-        print(f"Fetching weather for {total_w} activities...")
+    total_w = len(needs_weather)
+    print(f"Fetching weather for {total_w} activities...")
 
-        # Group by rounded location (~11km grid) so each group needs at most 2 API calls.
-        groups: defaultdict[tuple[float, float], list[weather_module.WeatherSpec]] = defaultdict(list)
-        for act in needs_weather:
-            key = (round(float(act["start_lat"]), 1), round(float(act["start_lng"]), 1))
-            start_dt = datetime.fromisoformat(str(act["utc_start_date"]).replace("Z", "+00:00"))
-            if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=timezone.utc)
-            groups[key].append({
-                "activity_id": act["activity_id"],
-                "start_dt": start_dt,
-                "duration_s": int(act["moving_time_s"]),
-            })
+    # Group by rounded location (~11km grid); each group is then fetched in
+    # windows of at most weather.MAX_WINDOW_DAYS days, one request per window.
+    groups: defaultdict[tuple[float, float], list[weather_module.WeatherSpec]] = defaultdict(list)
+    for act in needs_weather:
+        key = (round(float(act["start_lat"]), 1), round(float(act["start_lng"]), 1))
+        start_dt = datetime.fromisoformat(str(act["utc_start_date"]).replace("Z", "+00:00"))
+        if start_dt.tzinfo is None:
+            start_dt = start_dt.replace(tzinfo=timezone.utc)
+        groups[key].append({
+            "activity_id": act["activity_id"],
+            "start_dt": start_dt,
+            "duration_s": int(act["moving_time_s"]),
+        })
 
-        total_groups = len(groups)
-        print(f"  {total_groups} location group(s) — at most {total_groups * 2} API calls total.")
-        fetched_w = 0
-        progress.phase("weather", done=0, total=total_groups)
-        for g_idx, ((lat, lng), specs) in enumerate(groups.items(), 1):
-            rows = weather_module.fetch_weather_bulk(specs, lat, lng)
-            if rows:
-                db.upsert_weather(conn, rows)
-                fetched_w += len(rows)
-            print(f"  Group {g_idx}/{total_groups} ({lat:.1f},{lng:.1f}): {len(rows)}/{len(specs)} fetched. Total: {fetched_w}/{total_w}")
-            progress.phase("weather", done=g_idx, total=total_groups)
+    total_groups = len(groups)
+    print(f"  {total_groups} location group(s).")
+    fetched_w = 0
+    progress.phase("weather", done=0, total=total_groups)
+    for g_idx, ((lat, lng), specs) in enumerate(groups.items(), 1):
+        group_fetched = 0
+        try:
+            for rows, no_data in weather_module.fetch_weather_windows(specs, lat, lng):
+                db.upsert_weather(conn, rows + no_data)
+                group_fetched += len(rows)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            fetched_w += group_fetched
+            _logger.warning("weather pass stopped: %s", describe_error(e, None))
+            print(f"Weather stopped: {describe_error(e, None)}. {fetched_w} new records; the rest wait for the next sync.")
+            return
+        fetched_w += group_fetched
+        print(f"  Group {g_idx}/{total_groups} ({lat:.1f},{lng:.1f}): {group_fetched}/{len(specs)} fetched. Total: {fetched_w}/{total_w}")
+        progress.phase("weather", done=g_idx, total=total_groups)
 
-        print(f"Weather done. {fetched_w} new records.")
+    print(f"Weather done. {fetched_w} new records.")
 
-    if extra:
-        _extra_lap_backfill(conn, extra_limit, extra_reserve, progress)
+
+def remaining_lap_ids(conn: sqlite3.Connection) -> list[int]:
+    """Runs whose laps were never fetched, long runs first then newest-first.
+    A local query: a history pass with nothing left never touches the network."""
+    effective_run_type = db.effective_run_type_sql()
+    sport_clause, sport_params = run_sport_filter()
+    return [
+        row["activity_id"]
+        for row in conn.execute(f"""
+            SELECT activity_id FROM activities
+            WHERE {sport_clause}
+              AND laps_synced_at IS NULL
+            ORDER BY CASE WHEN {effective_run_type} = 'long_run' THEN 0 ELSE 1 END,
+                     start_date DESC
+        """, sport_params).fetchall()
+    ]
+
+
+def _pass_history(conn: sqlite3.Connection, limit: int, gate: strava_budget.Gate, progress: SyncProgress) -> None:
+    """Pass 4: the remaining laps, then the remaining streams and terrain
+    segments, spending only what is left above the Strava reserve. It holds
+    the terrain backfill's status row for the duration, so the standalone
+    backfill (API) and a second sync cannot spend the same allowance at
+    once; if that row is held, the pass is skipped. A failure here is
+    recorded on that row, not raised: the sync's own work is done."""
+    lap_ids = remaining_lap_ids(conn)
+    stream_work = terrain_backfill.refresh_backfill_queue(conn) > 0 or bool(terrain.activities_to_segment(conn))
+    if not lap_ids and not stream_work:
+        return
+
+    backfill = terrain_backfill.BackfillProgress(conn)
+    if not backfill.try_start():
+        print("History pass skipped: a terrain backfill is already running.")
+        return
+    sink = _PhaseSink(progress, "backfill-", mirror=backfill)
+    try:
+        backfill.start(0)
+        if lap_ids:
+            _fetch_laps(conn, lap_ids[:limit], gate, sink)
+        if stream_work:
+            try:
+                terrain_backfill.run_backfill(conn, sink, limit=limit, gate=gate)
+            except terrain.TerrainRebuildingError:
+                _note_terrain_rebuilding(progress)
+        backfill.finish()
+    except Exception as e:
+        _logger.exception("history pass failed")
+        backfill.fail(describe_error(e))
+        print(f"History pass stopped: {describe_error(e, None)}")
+
+
+def _run(
+    conn: sqlite3.Connection,
+    full: bool,
+    history: bool,
+    history_limit: int,
+    reserve: int,
+    progress: SyncProgress,
+) -> int:
+    """Run one sync in four passes. Returns the number of new/updated
+    activities fetched.
+
+      1. activities: list and store what is new (always runs, never gated)
+      2. details: laps for new workouts, streams and terrain for new runs
+      3. weather: Open-Meteo for activities without it
+      4. history: remaining laps, streams and terrain (skipped when
+         history=False)
+
+    Passes 2 and 4 stop once the day's remaining Strava calls reach `reserve`.
+    """
+    gate = strava_budget.Gate(reserve, on_wait=lambda until: progress.phase("waiting", until=until))
+
+    # Pass 1 fails the sync when Strava's daily limit is spent: without it
+    # nothing newer is seen at all. The optional passes stop quietly instead.
+    new_count, new_run_ids = _pass_activities(conn, full, progress, gate)
+
+    # Derive here (not just at the end) so newly synced rows have
+    # run_type_inferred populated before pass 2 queries effective type —
+    # otherwise freshly-inferred races/workouts would be skipped for another
+    # sync cycle.
+    _derive(conn, progress)
+
+    # Auto-complete the active plan when a synced effective-race activity
+    # now matches its race_date (+/-1 day) and distance_bucket (case-
+    # insensitive) — placed after the derive above so a race that was only
+    # just inferred (run_type_inferred) this same sync cycle is already
+    # visible to the match, not just on the next sync. The only mutation is
+    # the status flip; plans/plan_versions/plan_weeks/plan_days stay
+    # untouched and append-only. No-ops cleanly with no active plan or no
+    # matching race (see plan.auto_complete_plan).
+    completed_plan_id = plan.auto_complete_plan(conn)
+    if completed_plan_id is not None:
+        print(f"Plan {completed_plan_id} auto-completed (matching race synced).")
+
+    _pass_details(conn, new_run_ids, gate, progress)
+    _pass_weather(conn, progress)
+    if history:
+        _pass_history(conn, history_limit, gate, progress)
 
     # Recompute all derived values (inferred run types, lap types, ...) from raw synced rows.
-    progress.phase("derive")
-    counts = derive_all(conn)
-    summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no changes"
-    print(f"Derive done. {summary}")
+    _derive(conn, progress)
 
     # Stamp the moment this sync finished so readers (adherence, plan tools)
     # can tell how fresh the synced data is without guessing from activities.
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('last_sync_at', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        [datetime.now(timezone.utc).isoformat()],
-    )
+    _set_meta(conn, META_LAST_SUCCESS, datetime.now(timezone.utc).isoformat())
+    return new_count
+
+
+def _set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    db.set_meta(conn, key, value)
     conn.commit()
 
-    return len(rows)
 
-
-def run_with_retry(
+def run_sync(
     conn: sqlite3.Connection,
     full: bool,
-    extra: bool,
-    extra_limit: int = 900,
-    extra_reserve: int = 10,
+    history: bool = True,
+    history_limit: int = DEFAULT_HISTORY_LIMIT,
+    reserve: int | None = None,
     progress: SyncProgress | None = None,
 ) -> int:
-    """Run _run, retrying once per 15-minute window on a Strava 429 until it
-    succeeds. Shared by miles-sync (CLI) and /api/sync (web UI, which runs this on
-    a background thread); returns the number of new/updated activities. Callers own
-    the running/done/error transitions on `progress` (start/try_start, finish/fail)
-    — this only reports phase updates during the run itself.
-    """
+    """Run _run (every Strava request waits out a 429 or a nearly spent
+    window through the gate, or stops the pass at the daily reserve). Shared
+    by miles-sync (CLI) and /api/sync (web UI, which runs this on a
+    background thread); returns the number of new/updated activities.
+    Callers own the running/done/error transitions on `progress`
+    (start/try_start, finish/fail) — this only reports phase updates during
+    the run itself. The outcome (time, duration, new activities, or the
+    failure) is recorded in `meta` for the health check and /metrics."""
     prog = progress if progress is not None else SyncProgress()
-    while True:
-        try:
-            return _run(conn, full, extra, extra_limit, extra_reserve, prog)
-        except Fault as e:
-            if e.response is not None and e.response.status_code == 429:
-                _wait_for_rate_limit(prog)
-            else:
-                raise
+    started = time.monotonic()
+    try:
+        new_count = _run(
+            conn, full, history, history_limit, strava_budget.default_reserve() if reserve is None else reserve, prog
+        )
+    except Exception as e:
+        _set_meta(conn, META_LAST_FAILURE, datetime.now(timezone.utc).isoformat())
+        _set_meta(conn, META_LAST_ERROR, describe_error(e))
+        raise
+    _set_meta(conn, META_LAST_DURATION, f"{time.monotonic() - started:.3f}")
+    _set_meta(conn, META_LAST_NEW, str(new_count))
+    return new_count
 
 
 @click.command()
 @click.option("--full", is_flag=True, help="Ignore last sync date and fetch everything.")
-@click.option("--extra", is_flag=True, help="Backfill laps for all remaining runs, most important first (resumable; rerun daily until complete).")
-@click.option("--extra-limit", type=int, default=900, help="Max lap fetches per --extra invocation.")
-@click.option("--extra-reserve", type=int, default=10, help="Daily API calls to leave unused when --extra backfills (so later syncs today can still fetch new activities).")
+@click.option(
+    "--history/--no-history", "history", default=history_enabled, show_default="on; $MILES_SYNC_HISTORY=0 turns it off",
+    help="Also trickle in history: laps for older runs, then streams and terrain segments, newest first.",
+)
+@click.option(
+    "--history-limit", "--extra-limit", "history_limit", type=int, default=DEFAULT_HISTORY_LIMIT,
+    help="Max lap fetches and max stream fetches in the history pass of one sync.",
+)
+@click.option(
+    "--reserve", "--extra-reserve", "reserve", type=int, default=None,
+    help=f"Daily Strava calls to leave unused after the activity listing, so a later sync today can still fetch new "
+         f"activities (default: ${strava_budget.RESERVE_ENV} or {strava_budget.DEFAULT_RESERVE}).",
+)
+@click.option("--extra", is_flag=True, hidden=True, help="Deprecated: the history pass runs by default.")
 @click.option("--max-hr", type=int, default=None, help="Set max heart rate and exit (no Strava calls).")
 @click.option("--long-run-floor", type=float, default=None, help="Set long-run distance floor in miles and exit (no Strava calls).")
 def main(
     full: bool,
+    history: bool,
+    history_limit: int,
+    reserve: int | None,
     extra: bool,
-    extra_limit: int,
-    extra_reserve: int,
     max_hr: int | None,
     long_run_floor: float | None,
 ) -> None:
+    events.install()
     conn = db.connect()
     db.init_db(conn)
 
@@ -485,9 +630,10 @@ def main(
             prompted_max_hr = None
         db.upsert_athlete(conn, max_hr=prompted_max_hr, long_run_floor_miles=None)
 
+    outbound.claim()
     progress = SyncProgress(printer=_print_progress)
     progress.start()
-    new_count = run_with_retry(conn, full, extra, extra_limit, extra_reserve, progress)
+    new_count = run_sync(conn, full, history, history_limit, reserve, progress)
     progress.finish(new_count)
 
 

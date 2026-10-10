@@ -1838,6 +1838,7 @@
           </div>
         </div>
         ${captions && captions.easy ? `<p class="chart-caption">${esc(captions.easy)}</p>` : ''}
+        ${easy.some(e => e.weather_attribution) ? '<p class="weather-credit">Weather data by <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a></p>' : ''}
       </section>`);
 
     const theme = chartTheme();

@@ -58,6 +58,14 @@ the range; most athletes are a blend:
   modest, quality is playful before precise. Success is finishing the plan *and* understanding
   why it was shaped that way.
 
+## The athlete's standing documents
+
+If the session has a runner profile and a training log, read both before proposing
+anything: the profile's HR ranges set guardrails (never generic zones), and the
+log's capacities say what the block is building and what is due for upkeep. After
+a commit or a `log_plan_adjustment`, update the log through the `training-log`
+skill: an Adjustments line, and a status change for any capacity whose focus moved.
+
 ## Freshness
 
 Every draft/revision tool response carries `last_sync_at`/`days_stale`. Check it opening any

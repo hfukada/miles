@@ -27,6 +27,12 @@ const fmt = {
     if (s === 60) { m += 1; s = 0; }
     return `${m}:${String(s).padStart(2, '0')}`;
   },
+  // 1 -> "1st", 22 -> "22nd", 11 -> "11th"
+  ordinal(n) {
+    const lastTwo = n % 100;
+    const suffix = lastTwo >= 11 && lastTwo <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] ?? 'th');
+    return `${n}${suffix}`;
+  },
   // "Grandma's Marathon 2023" -> "Grandma's '23"; virtual -> "(v)"
   shortName(name, date) {
     const nameYear = (name.match(/\d{4}/) ?? [])[0];
