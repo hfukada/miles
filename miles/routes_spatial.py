@@ -11,6 +11,7 @@ be a lot of dependency for a problem this local in extent.
 """
 
 import math
+from typing import Hashable, Iterable, Iterator
 from typing_extensions import TypedDict
 
 _EARTH_RADIUS_M = 6371000.0
@@ -105,6 +106,68 @@ class Grid:
             for dy in range(-reach_y, reach_y + 1):
                 out.extend(self._cells.get((cx + dx, cy + dy), []))
         return out
+
+
+class NearestIndex:
+    """Bucketed sample points of keyed polylines (a network's edges, a set of
+    road points), answering "which key's polyline passes nearest here, at
+    what offset along it, how far away" within a radius. Keys can be added
+    and removed after construction, so a caller that cuts an edge in two
+    updates the index instead of rebuilding it. Lookups are exact at any
+    latitude: a point within radius_m is always returned and a farther one
+    never is. Longitude cells are a fixed number of degrees wide, set from
+    the first point added, so the number of cells a lookup spans is worked
+    out from its own latitude."""
+
+    def __init__(self, cell_size_m: float) -> None:
+        self._cell_m = cell_size_m
+        self._cell_lat = cell_size_m / _METERS_PER_DEG_LAT
+        self._cell_lng: float | None = None  # fixed by the first point added
+        self._cells: dict[tuple[int, int], list[tuple[Hashable, int, float, float, float]]] = {}
+        # Key -> generation of its points; remove() advances it, so points
+        # added before a removal never come back when the key is added again.
+        self._generation: dict[Hashable, int] = {}
+        self._live: set[Hashable] = set()
+
+    def _cell_of(self, lat: float, lng: float) -> tuple[int, int]:
+        assert self._cell_lng is not None
+        return (int(math.floor(lat / self._cell_lat)), int(math.floor(lng / self._cell_lng)))
+
+    def add(self, key: Hashable, points: Iterable[tuple[float, float, float]]) -> None:
+        """points are (lat, lng, offset_m along the key's polyline)."""
+        self._live.add(key)
+        generation = self._generation.get(key, 0)
+        for lat, lng, offset_m in points:
+            if self._cell_lng is None:
+                cos_ref = max(math.cos(math.radians(lat)), 1e-6)
+                self._cell_lng = self._cell_m / (_METERS_PER_DEG_LAT * cos_ref)
+            self._cells.setdefault(self._cell_of(lat, lng), []).append((key, generation, lat, lng, offset_m))
+
+    def remove(self, key: Hashable) -> None:
+        self._live.discard(key)
+        self._generation[key] = self._generation.get(key, 0) + 1
+
+    def within(self, lat: float, lng: float, radius_m: float) -> Iterator[tuple[Hashable, float, float]]:
+        """(key, offset_m, distance_m) for every indexed point within radius_m."""
+        if self._cell_lng is None:
+            return
+        row, col = self._cell_of(lat, lng)
+        reach_rows = max(1, math.ceil(radius_m / max(self._cell_m, 1e-9)))
+        widest_lat = min(abs(lat) + radius_m / _METERS_PER_DEG_LAT, 89.9)
+        lng_deg = radius_m / (_METERS_PER_DEG_LAT * max(math.cos(math.radians(widest_lat)), 1e-6))
+        reach_cols = max(1, math.ceil(lng_deg / self._cell_lng))
+        for d_row in range(-reach_rows, reach_rows + 1):
+            for d_col in range(-reach_cols, reach_cols + 1):
+                for key, generation, plat, plng, offset_m in self._cells.get((row + d_row, col + d_col), ()):
+                    if key not in self._live or generation != self._generation.get(key, 0):
+                        continue
+                    d = equirect_distance_m(lat, lng, plat, plng)
+                    if d <= radius_m:
+                        yield key, offset_m, d
+
+    def nearest(self, lat: float, lng: float, radius_m: float) -> tuple[Hashable, float, float] | None:
+        """The (key, offset_m, distance_m) of the closest indexed point within radius_m."""
+        return min(self.within(lat, lng, radius_m), key=lambda hit: hit[2], default=None)
 
 
 def _typical_spacing_m(dist: list[float]) -> float:

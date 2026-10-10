@@ -20,13 +20,9 @@ def _dists(pts: list[tuple[float, float]]) -> list[float]:
     return dist
 
 
-def test_equirect_distance_matches_known_latitude_delta():
+def test_equirect_distance_matches_known_latitude_delta_and_is_zero_for_the_same_point():
     # 1 degree of latitude is ~111.19km with this module's R=6371000 sphere.
-    d = rs.equirect_distance_m(40.0, -105.0, 41.0, -105.0)
-    assert d == pytest.approx(111194.9, rel=0.001)
-
-
-def test_equirect_distance_zero_for_same_point():
+    assert rs.equirect_distance_m(40.0, -105.0, 41.0, -105.0) == pytest.approx(111194.9, rel=0.001)
     assert rs.equirect_distance_m(40.0, -105.0, 40.0, -105.0) == 0.0
 
 
@@ -37,6 +33,48 @@ def test_grid_near_finds_close_points_and_excludes_far_ones():
     # Grid.near is cell-granularity (a superset); exact filtering is the caller's job.
     assert 0 in nearby
     assert 2 not in nearby
+
+
+def test_nearest_index_returns_the_closest_key_offset_and_distance_within_the_radius():
+    index = rs.NearestIndex(cell_size_m=50.0)
+    index.add("a", [(40.0, -105.0, 0.0), (40.0002, -105.0, 22.0)])
+    index.add("b", [(40.001, -105.0, 0.0), (40.0012, -105.0, 22.0)])
+
+    key, offset, dist = index.nearest(40.00021, -105.0, 100.0) or (None, None, None)
+    assert (key, offset) == ("a", 22.0)
+    assert dist == pytest.approx(rs.equirect_distance_m(40.00021, -105.0, 40.0002, -105.0))
+    assert index.nearest(40.00021, -105.0, 1.0) is None
+    assert rs.NearestIndex(cell_size_m=50.0).nearest(40.0, -105.0, 100.0) is None
+
+
+def test_nearest_index_follows_removed_and_added_keys():
+    index = rs.NearestIndex(cell_size_m=50.0)
+    index.add(1, [(40.0, -105.0, 0.0)])
+    index.remove(1)
+    assert index.nearest(40.0, -105.0, 100.0) is None
+    index.add(2, [(40.0, -105.0, 7.0)])
+    assert index.nearest(40.0, -105.0, 100.0) == (2, 7.0, 0.0)
+
+
+def test_nearest_index_does_not_bring_back_points_of_a_removed_key():
+    index = rs.NearestIndex(cell_size_m=50.0)
+    index.add(1, [(1.0, 2.0, 0.0)])
+    index.remove(1)
+    index.add(1, [(1.0, 2.001, 5.0)])
+    assert index.nearest(1.0, 2.0, 20.0) is None
+    assert index.nearest(1.0, 2.001, 20.0) == (1, 5.0, 0.0)
+
+
+def test_nearest_index_finds_every_point_in_range_far_from_the_first_points_latitude():
+    index = rs.NearestIndex(cell_size_m=50.0)
+    index.add("equator", [(0.0, 0.0, 0.0)])
+    for lat, lng in ((60.0, 10.0), (-60.0, 10.0)):
+        east = lng + 80.0 / (111_320.0 * 0.5)  # 80 m east at this latitude
+        index.add(lat, [(lat, east, 3.0)])
+        hit = index.nearest(lat, lng, 100.0)
+        assert hit is not None and hit[:2] == (lat, 3.0)
+        assert hit[2] == pytest.approx(80.0, rel=0.02)
+        assert index.nearest(lat, lng, 70.0) is None
 
 
 def test_find_junctions_detects_a_crossing_as_a_junction_not_an_overlap():
@@ -118,25 +156,17 @@ def test_find_junctions_empty_when_routes_never_come_close():
     assert result["overlaps"] == []
 
 
-def test_classify_shape_loop():
-    # A square loop back to (approximately) the start.
-    pts = [(40.0, -105.0), (40.001, -105.0), (40.001, -105.001), (40.0, -105.001), (40.00001, -105.00001)]
-    dist = _dists(pts)
-    assert rs.classify_shape(pts, dist) == "loop"
-
-
-def test_classify_shape_out_and_back():
-    out = _line(40.0, -105.0, 20)
-    back = list(reversed(out[:-1]))
-    pts = out + back
-    dist = _dists(pts)
-    assert rs.classify_shape(pts, dist) == "out_and_back"
-
-
-def test_classify_shape_point_to_point():
-    pts = _line(40.0, -105.0, 20)
-    dist = _dists(pts)
-    assert rs.classify_shape(pts, dist) == "point_to_point"
+@pytest.mark.parametrize(
+    "pts, shape",
+    [
+        # A square loop back to (approximately) the start.
+        ([(10.0, 20.0), (10.001, 20.0), (10.001, 20.001), (10.0, 20.001), (10.00001, 20.00001)], "loop"),
+        (_line(40.0, -105.0, 20) + list(reversed(_line(40.0, -105.0, 20)[:-1])), "out_and_back"),
+        (_line(40.0, -105.0, 20), "point_to_point"),
+    ],
+)
+def test_classify_shape(pts, shape: str):
+    assert rs.classify_shape(pts, _dists(pts)) == shape
 
 
 def test_routes_near_point_within_and_outside_radius():
