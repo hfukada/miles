@@ -19,9 +19,9 @@ from typing_extensions import TypedDict
 
 from . import db
 from .classifier import classify_workout
-from .races import classify_race_distance
+from .fitness import MILE_M
+from .races import classify_race_distance, run_sport_filter
 
-MILES_TO_METERS = 1609.34
 
 # Workout inference is name-based only: a max/avg speed-spread signal can't separate
 # workouts from ordinary runs (max_speed is an instantaneous GPS value).
@@ -188,13 +188,14 @@ def apply_inference(conn: sqlite3.Connection) -> dict[str, int]:
     scratch, so re-running after a threshold tweak (or a fresh sync) never leaves
     stale values around. Returns counts of inferred rows per inferred type.
     """
-    rows = conn.execute("""
+    sport_clause, sport_params = run_sport_filter()
+    rows = conn.execute(f"""
         SELECT activity_id, name, start_date, workout_type, distance_m,
                moving_time_s, average_speed_mps, max_speed_mps
         FROM activities
-        WHERE sport_type IN ('Run', 'TrailRun', 'VirtualRun')
+        WHERE {sport_clause}
         ORDER BY start_date
-    """).fetchall()
+    """, sport_params).fetchall()
 
     activities: list[ActivityForInference] = [
         {
@@ -212,7 +213,7 @@ def apply_inference(conn: sqlite3.Connection) -> dict[str, int]:
 
     athlete = db.get_athlete(conn)
     long_run_floor_m = (
-        athlete["long_run_floor_miles"] * MILES_TO_METERS
+        athlete["long_run_floor_miles"] * MILE_M
         if athlete and athlete["long_run_floor_miles"] is not None
         else None
     )
@@ -223,6 +224,12 @@ def apply_inference(conn: sqlite3.Connection) -> dict[str, int]:
     conn.executemany(
         "UPDATE activities SET run_type_inferred = ? WHERE activity_id = ?",
         [(run_type, activity_id) for activity_id, run_type in inferred.items()],
+    )
+    # Effort is only meaningful for an effective race; a row that lost its inferred
+    # race status must not keep the effort it was classified with.
+    conn.execute(
+        "UPDATE activities SET race_effort = NULL, effort_ratio = NULL "
+        "WHERE workout_type = 0 AND run_type_inferred IS NULL AND race_effort IS NOT NULL"
     )
     conn.commit()
 

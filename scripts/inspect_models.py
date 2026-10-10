@@ -22,8 +22,8 @@ def _model_fields(model: type) -> dict[str, str]:
 
 def _open_meteo_sample() -> dict[str, object]:
     params = urllib.parse.urlencode({
-        "latitude": 37.7749,
-        "longitude": -122.4194,
+        "latitude": 45.0,
+        "longitude": 10.0,
         "start_date": "2024-10-15",
         "end_date": "2024-10-15",
         "hourly": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,windspeed_10m",
@@ -59,7 +59,7 @@ if __name__ == "__main__":
 
     print("\n=== Key facts ===")
     from stravalib.model import LatLon
-    ll = LatLon.model_validate([37.0, -122.0])
+    ll = LatLon.model_validate([1.0, 2.0])
     print(f"  LatLon.lat = {ll.lat}, LatLon.lon = {ll.lon}  (access via .lat/.lon, not indexing)")
     print(f"  SummaryActivity.model_dump_json() available: {hasattr(SummaryActivity, 'model_dump_json')}")
     print(f"  Lap.model_dump_json() available: {hasattr(Lap, 'model_dump_json')}")

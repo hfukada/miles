@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Miles — Terrain</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏃</text></svg>">
+  <link rel="stylesheet" href="/theme.css">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous"></script>
+  <style>
+    .terrain-view h1 {
+      font-size: 1.25rem;
+      font-weight: 650;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.25rem;
+    }
+    .terrain-view .subtitle { font-size: 0.8125rem; color: var(--muted); margin-bottom: 1.25rem; max-width: 68ch; }
+    .terrain-view .data-credit { font-size: 0.75rem; color: var(--muted); margin-top: 2rem; }
+    .terrain-view .data-credit a { color: inherit; }
+    .terrain-view .loading, .terrain-view .error { font-size: 0.8125rem; color: var(--muted); padding: 1rem 0; }
+
+    .terrain-view .controls {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 1.25rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+    }
+    .terrain-view .controls select {
+      font-size: 0.8125rem;
+      padding: 0.25rem 0.5rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+    }
+
+    .terrain-view .stat-strip {
+      display: flex;
+      flex-wrap: wrap;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 1.5rem;
+    }
+    .terrain-view .stat { padding: 0.625rem 1.25rem; }
+    .terrain-view .stat + .stat { border-left: 1px solid var(--border); }
+    .terrain-view .stat-label {
+      font-size: 0.625rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 0.1875rem;
+    }
+    .terrain-view .stat-value {
+      display: flex;
+      align-items: baseline;
+      gap: 0.375rem;
+      font-size: 1.0625rem;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+    }
+    .terrain-view .stat-sub { font-size: 0.6875rem; font-weight: 400; color: var(--muted); }
+
+    .terrain-view section h2 {
+      font-size: 0.9375rem;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: -0.01em;
+      margin-bottom: 0.25rem;
+    }
+    .terrain-view .desc { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.875rem; max-width: 68ch; }
+    .terrain-view .chart-wrap { height: 300px; }
+    .terrain-view .trend-controls {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+    }
+    .terrain-view .trend-controls select {
+      font-size: 0.8125rem;
+      padding: 0.25rem 0.5rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+<script src="/nav.js"></script>
+<script src="/charts.js"></script>
+<script src="/map.js"></script>
+
+<main class="terrain-view">
+  <div id="root">Loading…</div>
+</main>
+
+<script>
+  // Bins with fewer real samples than this are drawn faded — mirrors
+  // terrain.py's MIN_SAMPLES_FOR_BIN gate, below which the backend falls
+  // back to a generic default rather than the athlete's own data for that bin.
+  const LOW_SAMPLE_THRESHOLD = 5;
+  const WINDOW_OPTIONS = [30, 60, 90, 180, 365];
+
+  const root = document.getElementById('root');
+  let paceChart = null;
+  let walkChart = null;
+  let onsetTrendChart = null;
+  let speedTrendChart = null;
+  let profile = null;
+  let selectedBandIdx = null;
+
+  async function main() {
+    root.innerHTML = `
+      <h1>Terrain</h1>
+      <div class="subtitle">
+        The athlete's own per-grade running performance, built from position and cadence
+        streams: where they actually walk, how fast they descend, and how both change over time.
+      </div>
+      <div class="controls">
+        <label for="window-select">Rolling window</label>
+        <select id="window-select">
+          ${WINDOW_OPTIONS.map(d => `<option value="${d}">${d} days</option>`).join('')}
+        </select>
+      </div>
+      <div id="thresholds"></div>
+      <section>
+        <h2>Pace by grade</h2>
+        <div class="desc">Median pace in each 2% grade bin over the selected window. Faded bars have too few samples to trust over the generic default for that bin.</div>
+        <div class="chart-wrap"><div id="chart-pace" style="height:100%"></div></div>
+      </section>
+      <section>
+        <h2>Walk fraction by grade</h2>
+        <div class="desc">Share of time spent walking (by cadence, falling back to speed) in each grade bin.</div>
+        <div class="chart-wrap"><div id="chart-walk" style="height:100%"></div></div>
+      </section>
+      <section>
+        <h2>Walk onset over time</h2>
+        <div class="desc">The uphill grade where walk fraction crosses 50%, from the weekly snapshot history.</div>
+        <div class="chart-wrap"><div id="chart-onset-trend" style="height:100%"></div></div>
+      </section>
+      <section>
+        <h2>Speed at grade over time</h2>
+        <div class="trend-controls">
+          <label for="band-select">Grade band</label>
+          <select id="band-select"></select>
+        </div>
+        <div class="desc">Median pace in the selected grade band, from the weekly snapshot history.</div>
+        <div class="chart-wrap"><div id="chart-speed-trend" style="height:100%"></div></div>
+      </section>
+      <p class="data-credit">${TERRAIN_DATA_CREDIT}</p>
+    `;
+    document.getElementById('window-select').addEventListener('change', (e) => {
+      loadProfile(Number(e.target.value));
+    });
+    document.getElementById('band-select').addEventListener('change', (e) => {
+      selectedBandIdx = Number(e.target.value);
+      loadSpeedTrend();
+    });
+    await loadProfile(90);
+    await loadOnsetTrend();
+    populateBandSelect();
+    await loadSpeedTrend();
+    window.addEventListener('resize', () => {
+      paceChart?.resize();
+      walkChart?.resize();
+      onsetTrendChart?.resize();
+      speedTrendChart?.resize();
+    });
+  }
+
+  function binLabel(b) {
+    if (b.lo_pct <= -999) return `< ${b.hi_pct.toFixed(0)}%`;
+    if (b.hi_pct >= 999) return `≥ ${b.lo_pct.toFixed(0)}%`;
+    return `${b.lo_pct.toFixed(0)}–${b.hi_pct.toFixed(0)}%`;
+  }
+
+  function speedToPace(speedMps) {
+    if (speedMps == null || speedMps <= 0) return null;
+    return (1609.344 / speedMps) / 60;
+  }
+
+  async function loadProfile(windowDays) {
+    document.getElementById('window-select').value = String(windowDays);
+    try {
+      const res = await fetch(`/api/terrain/profile?window_days=${windowDays}`);
+      if (!res.ok) throw new Error('Failed to load terrain profile.');
+      profile = await res.json();
+    } catch (e) {
+      document.getElementById('thresholds').innerHTML = `<div class="error">${e.message}</div>`;
+      return;
+    }
+    renderThresholds();
+    renderBinCharts();
+  }
+
+  function renderThresholds() {
+    document.getElementById('thresholds').innerHTML = `
+      <div class="stat-strip">
+        <div class="stat">
+          <div class="stat-label">Walk-onset grade</div>
+          <div class="stat-value">${profile.walk_onset_grade_pct.toFixed(1)}<span class="stat-sub">%</span></div>
+          <div class="stat-sub">${profile.confidence} confidence</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Comfortable descent grade</div>
+          <div class="stat-value">${profile.descent_comfort_grade_pct.toFixed(1)}<span class="stat-sub">%</span></div>
+          <div class="stat-sub">${profile.confidence} confidence</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Window</div>
+          <div class="stat-value">${profile.window_days}<span class="stat-sub">days, as of ${profile.as_of}</span></div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderBinCharts() {
+    const theme = chartTheme();
+    const bins = profile.bins;
+    const categories = bins.map(binLabel);
+
+    const paceData = bins.map(b => {
+      const pace = speedToPace(b.median_speed_mps);
+      const faded = b.sample_count < LOW_SAMPLE_THRESHOLD;
+      return { value: pace, itemStyle: { color: theme.series[0], opacity: faded ? 0.25 : 0.9 } };
+    });
+
+    if (!paceChart) paceChart = echarts.init(document.getElementById('chart-pace'));
+    paceChart.setOption({
+      animation: false,
+      grid: { top: 16, right: 24, bottom: 40, left: 56 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: theme.surface,
+        borderColor: theme.gridline,
+        textStyle: { fontSize: 12, color: theme.text },
+        formatter(items) {
+          const i = items[0].dataIndex;
+          const b = bins[i];
+          const pace = paceData[i].value;
+          return `${categories[i]}<br>${pace != null ? `${fmt.pace(pace)}/mi` : 'no data'}<br>${b.sample_count} samples`;
+        },
+      },
+      xAxis: {
+        type: 'category',
+        data: categories,
+        axisLabel: { color: theme.muted, fontSize: 10, rotate: 45 },
+        axisLine: { lineStyle: { color: theme.gridline } },
+      },
+      yAxis: {
+        type: 'value',
+        inverse: true,
+        name: 'min/mi',
+        nameTextStyle: { color: theme.muted, fontSize: 10 },
+        axisLabel: { formatter: (v) => fmt.pace(v), color: theme.muted, fontSize: 10 },
+        splitLine: { lineStyle: { color: theme.gridline, opacity: 0.4 } },
+      },
+      series: [{ type: 'bar', data: paceData }],
+    }, { notMerge: true });
+
+    const walkData = bins.map(b => {
+      const faded = b.sample_count < LOW_SAMPLE_THRESHOLD;
+      return {
+        value: b.walk_fraction != null ? b.walk_fraction * 100 : null,
+        itemStyle: { color: theme.series[1], opacity: faded ? 0.25 : 0.9 },
+      };
+    });
+
+    if (!walkChart) walkChart = echarts.init(document.getElementById('chart-walk'));
+    walkChart.setOption({
+      animation: false,
+      grid: { top: 16, right: 24, bottom: 40, left: 56 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: theme.surface,
+        borderColor: theme.gridline,
+        textStyle: { fontSize: 12, color: theme.text },
+        formatter(items) {
+          const i = items[0].dataIndex;
+          const b = bins[i];
+          const v = walkData[i].value;
+          return `${categories[i]}<br>${v != null ? `${v.toFixed(0)}% walking` : 'no data'}<br>${b.sample_count} samples`;
+        },
+      },
+      xAxis: {
+        type: 'category',
+        data: categories,
+        axisLabel: { color: theme.muted, fontSize: 10, rotate: 45 },
+        axisLine: { lineStyle: { color: theme.gridline } },
+      },
+      yAxis: {
+        type: 'value',
+        min: 0,
+        max: 100,
+        name: '%',
+        nameTextStyle: { color: theme.muted, fontSize: 10 },
+        axisLabel: { color: theme.muted, fontSize: 10 },
+        splitLine: { lineStyle: { color: theme.gridline, opacity: 0.4 } },
+      },
+      series: [{ type: 'bar', data: walkData }],
+    }, { notMerge: true });
+  }
+
+  async function loadOnsetTrend() {
+    let points;
+    try {
+      const res = await fetch('/api/terrain/trend?metric=walk_onset_grade_pct');
+      if (!res.ok) throw new Error('Failed to load trend.');
+      points = await res.json();
+    } catch (e) {
+      document.getElementById('chart-onset-trend').innerHTML = `<div class="error">${e.message}</div>`;
+      return;
+    }
+    const theme = chartTheme();
+    if (!onsetTrendChart) onsetTrendChart = echarts.init(document.getElementById('chart-onset-trend'));
+    onsetTrendChart.setOption(trendOption(theme, points, 'Walk onset', '%', (v) => `${v.toFixed(1)}%`, false));
+  }
+
+  // Populates the grade-band <select> from the current profile's own bins
+  // (excluding the open-ended over/underflow bins, which don't make a
+  // meaningful trend target), so the choices always match what the backend
+  // actually bins on.
+  function populateBandSelect() {
+    const select = document.getElementById('band-select');
+    const bins = profile.bins.filter(b => b.lo_pct > -999 && b.hi_pct < 999);
+    select.innerHTML = bins.map((b, i) => `<option value="${i}">${binLabel(b)}</option>`).join('');
+    const zeroIdx = bins.findIndex(b => b.lo_pct <= 0 && b.hi_pct > 0);
+    selectedBandIdx = zeroIdx >= 0 ? zeroIdx : 0;
+    select.value = String(selectedBandIdx);
+  }
+
+  async function loadSpeedTrend() {
+    const bins = profile.bins.filter(b => b.lo_pct > -999 && b.hi_pct < 999);
+    const band = bins[selectedBandIdx];
+    if (!band) return;
+    let points;
+    try {
+      const res = await fetch(`/api/terrain/trend?metric=median_speed_mps&grade_min_pct=${band.lo_pct}&grade_max_pct=${band.hi_pct}`);
+      if (!res.ok) throw new Error('Failed to load trend.');
+      points = await res.json();
+    } catch (e) {
+      document.getElementById('chart-speed-trend').innerHTML = `<div class="error">${e.message}</div>`;
+      return;
+    }
+    const paceSeries = points.map(p => ({ as_of: p.as_of, value: speedToPace(p.value) }));
+    const theme = chartTheme();
+    if (!speedTrendChart) speedTrendChart = echarts.init(document.getElementById('chart-speed-trend'));
+    speedTrendChart.setOption(trendOption(theme, paceSeries, 'Pace', 'min/mi', (v) => `${fmt.pace(v)}/mi`, true));
+  }
+
+  function trendOption(theme, points, name, unitLabel, tooltipFmt, inverse) {
+    return {
+      animation: false,
+      grid: { top: 16, right: 24, bottom: 32, left: 56 },
+      tooltip: {
+        trigger: 'axis',
+        backgroundColor: theme.surface,
+        borderColor: theme.gridline,
+        textStyle: { fontSize: 12, color: theme.text },
+        formatter(items) {
+          if (!items.length) return '';
+          const v = items[0].data[1];
+          return `${items[0].axisValue}<br>${v != null ? tooltipFmt(v) : 'no data'}`;
+        },
+      },
+      xAxis: {
+        type: 'category',
+        data: points.map(p => p.as_of),
+        axisLabel: { color: theme.muted, fontSize: 10 },
+        axisLine: { lineStyle: { color: theme.gridline } },
+      },
+      yAxis: {
+        type: 'value',
+        inverse: !!inverse,
+        name: unitLabel,
+        nameTextStyle: { color: theme.muted, fontSize: 10 },
+        axisLabel: {
+          formatter: (v) => (inverse ? fmt.pace(v) : v.toFixed(1)),
+          color: theme.muted,
+          fontSize: 10,
+        },
+        splitLine: { lineStyle: { color: theme.gridline, opacity: 0.4 } },
+      },
+      series: [{
+        name,
+        type: 'line',
+        data: points.map(p => [p.as_of, p.value]),
+        showSymbol: points.length < 60,
+        symbolSize: 4,
+        connectNulls: false,
+        lineStyle: { width: 1.5, color: theme.series[0] },
+        itemStyle: { color: theme.series[0] },
+      }],
+    };
+  }
+
+  main();
+</script>
+</body>
+</html>

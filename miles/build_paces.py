@@ -17,12 +17,11 @@ from datetime import date
 from typing_extensions import TypedDict
 
 from .db import effective_run_type_sql
-from .fitness import estimate_fitness
+from .fitness import MILE_M, estimate_fitness
 
 _MP_RE = re.compile(r"\bmp\b|marathon pace", re.IGNORECASE)
 _LT_RE = re.compile(r"\blt\b|tempo|threshold", re.IGNORECASE)
 
-_METERS_PER_MILE = 1609.344
 
 # Pace bands: ratio of a work lap's pace to the 5K-equivalent baseline pace
 # (fitness estimate as of build_start). Tunable relative to that baseline.
@@ -121,7 +120,7 @@ def _bucket_by_duration(rows: list[_LapRow]) -> dict[str, PaceClaim | None]:
         if total_dist_m <= 0:
             continue
         median_work_s = statistics.median(times)
-        pace = (total_time_s / 60) / (total_dist_m / _METERS_PER_MILE)
+        pace = (total_time_s / 60) / (total_dist_m / MILE_M)
         label = entry["workout_label"]
         name = entry["name"]
         bucket = (
@@ -151,7 +150,7 @@ def _bucket_by_pace(rows: list[_LapRow], baseline_5k: float) -> dict[str, PaceCl
             distance_m = lap["distance_m"]
             if distance_m <= 0:
                 continue
-            pace = (lap["moving_time_s"] / 60) / (distance_m / _METERS_PER_MILE)
+            pace = (lap["moving_time_s"] / 60) / (distance_m / MILE_M)
             if override is not None:
                 bucket = override
             else:
