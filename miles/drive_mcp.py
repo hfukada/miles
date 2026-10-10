@@ -6,12 +6,14 @@ import json
 from mcp.server.fastmcp import FastMCP
 
 from . import db, drive_starts
+from .errors import reporting
 from .offload import threaded
 
 
 def register_drive_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     @threaded
+    @reporting(ValueError)
     def find_trailheads(area_id: int, lat: float, lng: float, max_drive_minutes: float, k: int = 8) -> str:
         """
         Trailheads and trail-adjacent parking in an imported area within
@@ -25,9 +27,6 @@ def register_drive_tools(mcp: FastMCP) -> None:
         drive_time_estimated (true when routing was unavailable and the time
         is a straight-line estimate).
         """
-        try:
-            with db.connection() as conn:
-                starts = drive_starts.drive_starts(conn, area_id, lat, lng, max_drive_minutes, k=k)
-        except ValueError as e:
-            return json.dumps({"error": str(e)})
+        with db.connection() as conn:
+            starts = drive_starts.drive_starts(conn, area_id, lat, lng, max_drive_minutes, k=k)
         return json.dumps([drive_starts.athlete_view(s) for s in starts])

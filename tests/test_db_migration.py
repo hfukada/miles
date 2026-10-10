@@ -65,8 +65,7 @@ def test_backfill_rewrites_start_date_to_local_wall_time_once_and_leaves_rows_wi
 # column definition changes the hash; the version must then be bumped, the
 # upgrade for existing databases written in init_db, and the new hash recorded.
 _SCHEMA_HASHES = {
-    2: "6cfd39c255def5fb388bc072a342a1dfd15936c3f8ca3fc7d9e0ba41d3a278c4",
-    3: "82521723265850fd348cd7fb1622d7ac3295120f6e7b8a9f5fd058d5941fad6e",
+    1: "6d6f3f3b6ff16e9660ddf69b22fa07e347c5296d7337f182910cbcaa96070672",
 }
 
 
@@ -87,45 +86,12 @@ def test_the_schema_version_is_bumped_whenever_the_schema_changes(conn: sqlite3.
     )
 
 
-def test_a_database_from_before_later_columns_and_tables_is_upgraded_in_place(conn: sqlite3.Connection):
-    for table, columns in {
-        "activities": ["workout_label", "description", "laps_synced_at"],
-        "laps": ["lap_type", "intensity"],
-        "weather": ["raw_json"],
-        "map_extracts": ["checked_at", "data_as_of", "etag", "last_modified"],
-        "areas": ["region"],
-        "plan_versions": ["committed_at"],
-        "terrain_backfill_failures": ["model_version"],
-    }.items():
-        for column in columns:
-            conn.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
-    conn.execute("CREATE TABLE extract_attempts (region TEXT PRIMARY KEY, attempted_at TEXT)")
-    conn.execute("INSERT INTO map_extracts (region, path, sha256, fetched_at) VALUES ('r/x', '/p', 's', '2024-01-02T00:00:00+00:00')")
-    conn.execute("INSERT INTO plans (plan_id, title, race_date, distance_bucket, created_at) VALUES (1, 'P', '2026-05-30', '10K', '2026-01-01')")
-    conn.execute("INSERT INTO plan_versions (version_id, plan_id, version_n, created_at, author) VALUES (1, 1, 1, '2026-01-02', 'agent')")
-    _insert_dirty_row(conn)
-    conn.execute("INSERT INTO meta (key, value) VALUES ('start_date_local_migrated', '1')")
-    conn.execute("PRAGMA user_version = 1")
-    conn.commit()
-
-    db.init_db(conn)
-
-    def columns(table: str) -> set[str]:
-        return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
-
-    assert {"workout_label", "description", "laps_synced_at"} <= columns("activities")
-    assert {"lap_type", "intensity"} <= columns("laps")
-    assert "raw_json" in columns("weather")
-    assert {"checked_at", "data_as_of", "etag", "last_modified"} <= columns("map_extracts")
-    assert "region" in columns("areas")
-    assert "model_version" in columns("terrain_backfill_failures")
-    assert conn.execute("SELECT name FROM sqlite_master WHERE name = 'extract_attempts'").fetchone() is None
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
-    assert db.get_meta(conn, "start_date_local_migrated") is None  # the retired marker is cleared
-    # Rows survive, and a version written before drafts existed counts as committed.
-    assert conn.execute("SELECT region FROM map_extracts").fetchone()["region"] == "r/x"
-    assert conn.execute("SELECT committed_at FROM plan_versions").fetchone()["committed_at"] == "2026-01-02"
-    assert _start_date(conn) == "2026-01-04T22:00:00"
+_DEPLOYED_TABLES = {
+    "activities", "laps", "weather", "fitness_checkpoints", "meta", "athlete", "plans", "plan_versions",
+    "plan_weeks", "plan_days", "plan_log", "plan_adherence", "gpx_files", "routes", "route_points",
+    "route_waypoints", "route_climbs", "route_grade_bands", "route_legs",
+}
+_ADDED_ROUTE_COLUMNS = ("elevation_source", "ele_source", "elevation_pending")
 
 
 def _layout(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
@@ -133,17 +99,38 @@ def _layout(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
     return {name: [tuple(r) for r in conn.execute(f"PRAGMA table_info({name})")] for name in names}
 
 
-def test_a_version_two_database_upgrades_to_the_schema_a_fresh_one_gets(conn: sqlite3.Connection, tmp_path: Path):
-    old = sqlite3.connect(tmp_path / "v2.db")
+def _release_database(path: Path) -> sqlite3.Connection:
+    """A database as the first release left it: only its tables, the routes
+    table without the elevation columns, and no version stamp."""
+    old = sqlite3.connect(path)
     old.row_factory = sqlite3.Row
-    old.executescript((Path(__file__).parent / "schema_v2.sql").read_text())
-    old.execute("PRAGMA user_version = 2")
+    db.init_db(old)
+    for row in old.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").fetchall():
+        if row["name"] not in _DEPLOYED_TABLES:
+            old.execute(f"DROP TABLE {row['name']}")
+    for column in _ADDED_ROUTE_COLUMNS:
+        old.execute(f"ALTER TABLE routes DROP COLUMN {column}")
+    old.execute("PRAGMA user_version = 0")
     old.commit()
+    return old
+
+
+def test_a_database_from_the_first_release_upgrades_to_the_schema_a_fresh_one_gets(conn: sqlite3.Connection, tmp_path: Path):
+    old = _release_database(tmp_path / "release.db")
+    assert "elevation_source" not in {r["name"] for r in old.execute("PRAGMA table_info(routes)")}
+    old.execute("INSERT INTO plans (plan_id, title, race_date, distance_bucket, created_at) VALUES (1, 'P', '2026-05-30', '10K', '2026-01-01')")
+    old.execute("INSERT INTO plan_versions (version_id, plan_id, version_n, created_at, committed_at, author) VALUES (1, 1, 1, '2026-01-02', NULL, 'agent')")
+    old.execute("INSERT INTO meta (key, value) VALUES ('start_date_local_migrated', '1')")
+    _insert_dirty_row(old)
 
     db.init_db(old)
 
     assert _layout(old) == _layout(conn)
     assert old.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert db.get_meta(old, "start_date_local_migrated") is None  # the retired marker is cleared
+    assert _start_date(old) == "2026-01-04T22:00:00"
+    assert old.execute("SELECT committed_at FROM plan_versions").fetchone()["committed_at"] is None  # a draft stays a draft
+    assert old.execute("SELECT elevation_source FROM routes").fetchall() == []
 
 
 class _RacingConnection:

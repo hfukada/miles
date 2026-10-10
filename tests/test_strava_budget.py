@@ -154,7 +154,7 @@ def test_short_window_usage_resets_after_a_window_boundary(monkeypatch: pytest.M
     assert strava_client.daily_calls_remaining() == 600
 
 
-def test_the_daily_figure_is_dropped_after_the_utc_date_changes_or_a_waited_out_window(monkeypatch: pytest.MonkeyPatch):
+def test_the_daily_figure_is_dropped_after_the_utc_date_changes_or_a_window_ends(monkeypatch: pytest.MonkeyPatch):
     _at(monkeypatch, 2026, 3, 1, 23, 58)
     _observe(short_usage=1, long_usage=990)
     assert strava_client.daily_calls_remaining() == 10
@@ -166,7 +166,6 @@ def test_the_daily_figure_is_dropped_after_the_utc_date_changes_or_a_waited_out_
     _at(monkeypatch, 2026, 3, 1, 23, 50)
     _observe(short_usage=95, long_usage=990)
     _at(monkeypatch, 2026, 3, 2, 0, 5)
-    strava_client.note_window_elapsed()
     assert strava_client.short_window_calls_remaining() == 100
     assert strava_client.daily_calls_remaining() is None
 
@@ -205,8 +204,12 @@ def test_an_unknown_allowance_does_not_block_and_the_activity_listing_is_never_h
     strava_budget.Gate(12).acquire("activities")
 
 
-def test_a_nearly_spent_window_is_waited_out_then_resets_the_reading(slept: list[float]):
+def test_a_nearly_spent_window_is_waited_out_then_resets_the_reading(slept: list[float], monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
     _observe(short_usage=95, long_usage=100)
+    monkeypatch.setattr(
+        strava_budget.time, "sleep", lambda seconds: (slept.append(seconds), _at(monkeypatch, 2026, 3, 1, 10, 15))
+    )
     waits: list[str] = []
 
     strava_budget.Gate(12, on_wait=waits.append).acquire("laps")

@@ -9,6 +9,7 @@ from miles import streams
 from miles.streams import (
     _build_dataframe,
     cache_streams,
+    has_cached_streams,
     compute_gap_pace_s_per_m,
     fetch_and_cache_streams,
     get_stream_dataframe,
@@ -16,20 +17,18 @@ from miles.streams import (
     median_per_window,
     min_median_max_per_window,
     minetti_cost_ratio,
-    needs_streams_fetch,
-    store_raw_streams,
 )
 
 
 def _stream(data: list, stream_type: str = "time", series_type: str = "time") -> Stream:
-    # cache_streams/store_raw_streams take the real stravalib model -- it's
+    # cache_streams takes the real stravalib model -- it's
     # what strava_client hands them.
     return Stream(type=stream_type, data=data, series_type=series_type, original_size=len(data), resolution="high")
 
 
 def _entry(data: list, stream_type: str = "time", series_type: str = "time") -> dict:
     # _build_dataframe operates on the plain-dict shape a raw file actually
-    # stores and loads -- what store_raw_streams would have written for the
+    # stores and loads -- what cache_streams would have written for the
     # same stream.
     return {"type": stream_type, "data": data, "series_type": series_type, "original_size": len(data), "resolution": "high"}
 
@@ -95,7 +94,6 @@ def test_build_dataframe_maps_streams_to_columns():
         "heartrate": _entry([100, 110, 120], "heartrate"),
         "velocity_smooth": _entry([3.0, 3.1, 3.2], "velocity_smooth"),
         "latlng": _entry([[40.0, -105.0], [40.001, -105.0], [40.002, -105.0]], "latlng"),
-        "watts": _entry([200, 210, 205], "watts"),
         "temp": _entry([18, 18, 19], "temp"),
     }
     df = _build_dataframe(raw)
@@ -104,7 +102,6 @@ def test_build_dataframe_maps_streams_to_columns():
     assert list(df["velocity_smooth_mps"]) == [3.0, 3.1, 3.2]
     assert list(df["lat"]) == [40.0, 40.001, 40.002]
     assert list(df["lng"]) == [-105.0, -105.0, -105.0]
-    assert list(df["watts"]) == [200, 210, 205]
     assert list(df["temp_c"]) == [18, 18, 19]
     assert df["cadence"].isna().all()  # a stream that was not recorded becomes all-NA
 
@@ -138,24 +135,23 @@ def _legacy_parquet(activity_id: int) -> None:
 
 
 def test_a_fetch_is_needed_until_raw_streams_are_stored_and_a_legacy_parquet_does_not_count():
-    assert needs_streams_fetch(123) is True
+    assert has_cached_streams(123) is False
     _legacy_parquet(123)
-    assert needs_streams_fetch(123) is True
-    store_raw_streams(123, {"time": _stream([0, 1, 2])})
-    assert needs_streams_fetch(123) is False
+    assert has_cached_streams(123) is False
+    cache_streams(123, {"time": _stream([0, 1, 2])})
+    assert has_cached_streams(123) is True
 
 
-def test_store_raw_streams_round_trips_as_gzip_json_and_drops_streams_with_no_data():
+def test_cache_streams_round_trips_as_gzip_json_and_drops_streams_with_no_data():
     raw = {
         "time": _stream([0, 1, 2]),
         "distance": _stream([0.0, 5.0, 10.0], "distance", "distance"),
         "heartrate": _stream([140, 145, 150], "heartrate"),
         "watts": Stream(type="watts", data=None, series_type="time", original_size=0, resolution="high"),
     }
-    written = store_raw_streams(777, raw)
+    cache_streams(777, raw)
     loaded = load_raw_streams(777)
-    assert loaded == written
-    assert "watts" not in written
+    assert "watts" not in loaded
     assert loaded["heartrate"]["data"] == [140, 145, 150]
     assert loaded["heartrate"]["original_size"] == 3
     assert loaded["heartrate"]["resolution"] == "high"
@@ -164,8 +160,8 @@ def test_store_raw_streams_round_trips_as_gzip_json_and_drops_streams_with_no_da
         assert json.load(f)["time"]["data"] == [0, 1, 2]
 
 
-def test_store_raw_streams_atomic_write_leaves_original_on_failure(monkeypatch):
-    store_raw_streams(1, {"time": _stream([0, 1, 2])})
+def test_cache_streams_atomic_write_leaves_original_on_failure(monkeypatch):
+    cache_streams(1, {"time": _stream([0, 1, 2])})
     original = load_raw_streams(1)
 
     def boom(*args, **kwargs):
@@ -173,7 +169,7 @@ def test_store_raw_streams_atomic_write_leaves_original_on_failure(monkeypatch):
 
     monkeypatch.setattr(streams.os, "replace", boom)
     with pytest.raises(OSError):
-        store_raw_streams(1, {"time": _stream([9, 9, 9])})
+        cache_streams(1, {"time": _stream([9, 9, 9])})
 
     # The failed write must not clobber the existing raw file, and must not
     # leave a stray temp file behind.
@@ -188,7 +184,7 @@ def test_cache_streams_stores_the_raw_file_and_get_stream_dataframe_reads_the_sa
         "heartrate": _stream([140, 150, 160], "heartrate"),
     }
     written_df = cache_streams(42, raw)
-    assert needs_streams_fetch(42) is False
+    assert has_cached_streams(42) is True
     assert "lat" in written_df.columns
     pd.testing.assert_frame_equal(written_df.reset_index(drop=True), get_stream_dataframe(42).reset_index(drop=True))
 

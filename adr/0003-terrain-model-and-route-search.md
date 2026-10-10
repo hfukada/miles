@@ -52,7 +52,7 @@ from open map data.
   storing them lost information a later fix couldn't recover.
 - **Runnability and road comfort are scored at query time, not baked into the
   graph.** Edges store their raw inputs (grade profile, road class, speed,
-  lanes, separation, surface, technicality tags); scoring reads them through
+  lanes, separation, surface); scoring reads them through
   the current terrain model and the athlete's preference profile. Fitness
   changing or a preference edit takes effect on the next search with no
   rebuild.

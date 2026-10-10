@@ -87,7 +87,7 @@ def test_the_activities_pass_discards_the_raw_streams_of_a_changed_activity_afte
 ) -> None:
     db.upsert_activities(conn, [_row(1), _row(2)])
     for activity_id in (1, 2):
-        streams.store_raw_streams(activity_id, {})
+        streams.cache_streams(activity_id, {})
     changed = _row(1)
     changed["distance_m"] = 9000.0
     monkeypatch.setattr(strava_client, "get_activities", lambda after_ts=None: iter([changed, _row(2)]))
@@ -104,8 +104,8 @@ def test_the_activities_pass_discards_the_raw_streams_of_a_changed_activity_afte
 
     assert count == 1
     assert committed_when_discarded == [True]
-    assert streams.needs_streams_fetch(1)
-    assert not streams.needs_streams_fetch(2)
+    assert not streams.has_cached_streams(1)
+    assert streams.has_cached_streams(2)
 
 
 def test_an_incremental_sync_picks_up_an_activity_uploaded_days_late(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:

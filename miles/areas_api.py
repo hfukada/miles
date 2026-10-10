@@ -88,10 +88,10 @@ def get_area(area_id: int) -> areas_service.AreaDetail:
 @router.post("/api/areas/{area_id}/pin")
 def post_pin_area(area_id: int) -> areas_service.AreaDetail:
     with db.connection() as conn:
-        return areas_service.pin_area(conn, area_id)
+        return areas_service.set_pinned(conn, area_id, True)
 
 
 @router.post("/api/areas/{area_id}/unpin")
 def post_unpin_area(area_id: int) -> areas_service.AreaDetail:
     with db.connection() as conn:
-        return areas_service.unpin_area(conn, area_id)
+        return areas_service.set_pinned(conn, area_id, False)

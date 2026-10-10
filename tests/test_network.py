@@ -90,10 +90,8 @@ def test_build_network_dedupes_overlapping_tiles_excludes_private_ways_counts_ev
     assert conn.execute("SELECT COUNT(*) AS n FROM net_edges WHERE way_id = ?", [WAY_A_ID]).fetchone()["n"] == 1
     # the private way never becomes an edge.
     assert conn.execute("SELECT COUNT(*) AS n FROM net_edges WHERE way_id = ?", [WAY_F_ID]).fetchone()["n"] == 0
-    # the motorway is excluded from routing too, but its geometry counted
-    # toward the major-road proximity point set.
+    # the motorway is excluded from routing too.
     assert conn.execute("SELECT COUNT(*) AS n FROM net_edges WHERE way_id = ?", [WAY_E_ID]).fetchone()["n"] == 0
-    assert stats["major_road_way_points"] > 0
 
     kinds = {r["osm_node_id"]: r["kind"] for r in conn.execute("SELECT osm_node_id, kind FROM net_nodes WHERE area_id = 1")}
     assert kinds[11] == "junction"  # shared by ways A and B
@@ -115,12 +113,9 @@ def test_build_network_dedupes_overlapping_tiles_excludes_private_ways_counts_ev
     for edge_d in edge_d_rows:
         assert edge_d["maxspeed_filled"] == 1  # no maxspeed tag -> filled from the class default
         assert edge_d["maxspeed_mph"] == pytest.approx(25.0)
-        assert edge_d["nearby_water_m"] is not None  # node 60 sits on this road
 
     edge_c = conn.execute("SELECT * FROM net_edges WHERE way_id = ?", [WAY_C_ID]).fetchone()
     assert edge_c["surface_class"] == "trail"
-    assert edge_c["proximity_major_road_m"] is not None  # runs near the motorway
-    assert edge_c["nearby_water_m"] is None
 
     amenity = conn.execute("SELECT * FROM net_nodes WHERE area_id = 1 AND kind = 'drinking_water'").fetchone()
     # the two D pieces share the amenity node between them.
@@ -459,9 +454,11 @@ def test_several_amenities_on_one_edge_chain_the_pieces_end_to_end(conn: sqlite3
     assert starts - ends == {8000} and ends - starts == {9001}
 
 
-def test_the_preferences_tool_applies_a_json_object_patch_and_reports_anything_else_as_an_error():
+def test_the_preferences_tool_applies_a_patch_and_reports_a_rejected_one_as_an_error():
     server = FastMCP("test")
     network_mcp.register_network_tools(server)
 
-    assert "JSON object" in call_tool(server, "set_route_preferences", {"patch": "[1, 2]"})["error"]
-    assert call_tool(server, "set_route_preferences", {"patch": '{"max_continuous_uncomfortable_m": 1000}'})["max_continuous_uncomfortable_m"] == 1000
+    assert call_tool(server, "set_route_preferences", {"patch": {"max_continuous_uncomfortable_m": 1000}})["max_continuous_uncomfortable_m"] == 1000
+    assert call_tool(server, "set_route_preferences", {"patch": '{"max_continuous_uncomfortable_m": 900}'})["max_continuous_uncomfortable_m"] == 900
+    assert "unknown preference key" in call_tool(server, "set_route_preferences", {"patch": {"surface_weight": {}}})["error"]
+    assert "positive" in call_tool(server, "set_route_preferences", {"patch": {"max_continuous_uncomfortable_m": -1}})["error"]

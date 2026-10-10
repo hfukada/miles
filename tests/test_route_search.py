@@ -301,19 +301,15 @@ def test_a_request_without_a_start_or_with_a_nonpositive_n_or_budget_is_rejected
         route_search.find_routes(conn, _base_request(1, 100.0, 200.0, **overrides))
 
 
-def test_one_search_is_stored_as_one_request_row_with_the_real_request(conn: sqlite3.Connection):
+def test_each_returned_candidate_is_stored_and_read_back_whole(conn: sqlite3.Connection):
     _build_diamond_area(conn)
     perimeter = _perimeter_length_m(conn, 1)
     result = route_search.find_routes(conn, _base_request(1, perimeter * 0.3, perimeter * 1.3, n=3, shape="any"))
     assert len(result["candidates"]) > 1
 
-    rows = conn.execute("SELECT request_json FROM net_search_results").fetchall()
-    assert len(rows) == 1
-    stored = json.loads(rows[0]["request_json"])
-    assert stored["distance_m_max"] == pytest.approx(perimeter * 1.3)
-    assert stored["seed"] == result["seed"]
-    request_ids = {r[0] for r in conn.execute("SELECT DISTINCT request_id FROM net_candidates").fetchall()}
-    assert len(request_ids) == 1
+    assert conn.execute("SELECT COUNT(*) FROM net_candidates").fetchone()[0] == len(result["candidates"])
+    for candidate in result["candidates"]:
+        assert route_search.get_route_candidate(conn, candidate["candidate_id"]) == json.loads(json.dumps(candidate))
 
 
 @pytest.fixture

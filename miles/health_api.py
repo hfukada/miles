@@ -2,21 +2,20 @@
 
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from typing import TypeVar
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily, Metric
+from prometheus_client.registry import Collector
 
 from . import db, events, health, metrics, sync
 from .errors import describe_error
-from .metrics import Labels
 
 router = APIRouter()
-
-_TEXT_FORMAT = "text/plain; version=0.0.4; charset=utf-8"
-
 
 @router.get("/api/health")
 def get_health(verbose: bool = False) -> JSONResponse:
@@ -29,9 +28,6 @@ def get_health(verbose: bool = False) -> JSONResponse:
     except sqlite3.Error as e:
         result = {"status": "attention", "reasons": [f"database unreadable: {describe_error(e)}"]}
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
-
-
-Sample = tuple[str, str, str, Labels, float]
 
 
 T = TypeVar("T")
@@ -58,43 +54,73 @@ def _rate(text: str) -> dict[str, int]:
     return {"daily": int(parsed["daily"]), "short": int(parsed["short"])}
 
 
-def database_samples(conn: sqlite3.Connection) -> list[Sample]:
+def _gauge(name: str, help_text: str, value: float | None) -> Iterator[GaugeMetricFamily]:
+    if value is not None:
+        family = GaugeMetricFamily(name, help_text)
+        family.add_metric([], value)
+        yield family
+
+
+class DatabaseCollector(Collector):
     """Series read from the database at scrape time, so they describe work done
     by any process (the sync CLI included), unlike the in-process counters."""
-    samples: list[Sample] = []
-    for name, help_text, value in [
-        ("miles_sync_last_success_timestamp_seconds", "Unix time of the last successful sync.", _parsed_meta(conn, sync.META_LAST_SUCCESS, _timestamp)),
-        ("miles_sync_last_failure_timestamp_seconds", "Unix time of the last failed sync.", _parsed_meta(conn, sync.META_LAST_FAILURE, _timestamp)),
-        ("miles_sync_last_duration_seconds", "Duration of the last successful sync.", _parsed_meta(conn, sync.META_LAST_DURATION, float)),
-        ("miles_sync_last_new_activities", "Activities fetched by the last successful sync.", _parsed_meta(conn, sync.META_LAST_NEW, float)),
-    ]:
-        if value is not None:
-            samples.append((name, "gauge", help_text, (), value))
 
-    help_text = "Outbound requests since records began (see events.py), by service, host, endpoint kind, and status."
-    for row in events.totals(conn):
-        labels: Labels = (
-            ("host", row["host"]), ("kind", row["kind"]), ("service", row["service"]), ("status", row["status"]),
+    def describe(self) -> list[Metric]:
+        return []
+
+    def collect(self) -> Iterator[Metric]:
+        with db.connection() as conn:
+            yield from self._collect(conn)
+
+    @staticmethod
+    def _collect(conn: sqlite3.Connection) -> Iterator[Metric]:
+        yield from _gauge(
+            "miles_sync_last_success_timestamp_seconds", "Unix time of the last successful sync.",
+            _parsed_meta(conn, sync.META_LAST_SUCCESS, _timestamp),
         )
-        samples.append(("miles_outbound_requests_total", "counter", help_text, labels, float(row["count"])))
+        yield from _gauge(
+            "miles_sync_last_failure_timestamp_seconds", "Unix time of the last failed sync.",
+            _parsed_meta(conn, sync.META_LAST_FAILURE, _timestamp),
+        )
+        yield from _gauge(
+            "miles_sync_last_duration_seconds", "Duration of the last successful sync.",
+            _parsed_meta(conn, sync.META_LAST_DURATION, float),
+        )
+        yield from _gauge(
+            "miles_sync_last_new_activities", "Activities fetched by the last successful sync.",
+            _parsed_meta(conn, sync.META_LAST_NEW, float),
+        )
 
-    rate = _parsed_meta(conn, events.STRAVA_RATE_META, _rate)
-    if rate is not None:
-        samples.append((
-            "miles_strava_daily_calls_remaining", "gauge",
-            "Strava daily calls left, per the latest response any process saw.", (), float(rate["daily"]),
-        ))
-        samples.append((
-            "miles_strava_short_window_calls_remaining", "gauge",
-            "Strava 15-minute-window calls left, per the latest response any process saw.", (), float(rate["short"]),
-        ))
+        outbound = CounterMetricFamily(
+            "miles_outbound_requests",
+            "Outbound requests since records began (see events.py), by service, host, endpoint kind, and status.",
+            labels=["host", "kind", "service", "status"],
+        )
+        for row in events.totals(conn):
+            outbound.add_metric([row["host"], row["kind"], row["service"], row["status"]], float(row["count"]))
+        yield outbound
 
-    streams_left = conn.execute("SELECT COUNT(*) FROM terrain_backfill_queue").fetchone()[0]
-    laps_left = len(sync.remaining_lap_ids(conn))
-    help_text = "Historical activities still waiting for their Strava detail, by kind."
-    samples.append(("miles_backfill_remaining", "gauge", help_text, (("kind", "streams"),), float(streams_left)))
-    samples.append(("miles_backfill_remaining", "gauge", help_text, (("kind", "laps"),), float(laps_left)))
-    return samples
+        rate = _parsed_meta(conn, events.STRAVA_RATE_META, _rate)
+        if rate is not None:
+            yield from _gauge(
+                "miles_strava_daily_calls_remaining",
+                "Strava daily calls left, per the latest response any process saw.", float(rate["daily"]),
+            )
+            yield from _gauge(
+                "miles_strava_short_window_calls_remaining",
+                "Strava 15-minute-window calls left, per the latest response any process saw.", float(rate["short"]),
+            )
+
+        backfill = GaugeMetricFamily(
+            "miles_backfill_remaining", "Historical activities still waiting for their Strava detail, by kind.",
+            labels=["kind"],
+        )
+        backfill.add_metric(["streams"], conn.execute("SELECT COUNT(*) FROM terrain_backfill_queue").fetchone()[0])
+        backfill.add_metric(["laps"], len(sync.remaining_lap_ids(conn)))
+        yield backfill
+
+
+metrics.REGISTRY.register(DatabaseCollector())
 
 
 @router.get("/api/outbound")
@@ -111,6 +137,4 @@ def get_metrics() -> PlainTextResponse:
     cache series are this process's; the rest come from the database."""
     if not metrics.enabled():
         raise HTTPException(status_code=404)
-    with db.connection() as conn:
-        body = metrics.render(database_samples(conn))
-    return PlainTextResponse(body, media_type=_TEXT_FORMAT)
+    return PlainTextResponse(generate_latest(metrics.REGISTRY), media_type=CONTENT_TYPE_LATEST)

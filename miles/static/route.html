@@ -114,8 +114,9 @@
     `;
 
     renderStats(route, gainFt, lossFt, score);
-    renderMap(profilePoints, terrainPoints);
-    renderElevation(profilePoints, terrainPoints);
+    const runs = classRuns(profilePoints, new Map(terrainPoints.map(p => [p.idx, p.cls])));
+    renderMap(runs);
+    renderElevation(profilePoints, runs);
     if (score?.gap_analysis) renderGapAnalysis(score.gap_analysis);
   }
 
@@ -149,26 +150,31 @@
     strip.innerHTML = tiles.join('');
   }
 
-  // Groups consecutive points sharing a class into one polyline segment,
-  // repeating each boundary point at the start of the next segment so the
-  // drawn line stays continuous across a class change.
-  function groupByClass(points, clsByIdx) {
-    const groups = [];
-    let current = null;
+  // Runs of consecutive profile points sharing a terrain class.
+  function classRuns(points, clsByIdx) {
+    const runs = [];
     for (const p of points) {
       const cls = clsByIdx.get(p.idx) ?? null;
-      if (!current || current.cls !== cls) {
-        const bridge = current ? [current.latlngs[current.latlngs.length - 1]] : [];
-        current = { cls, latlngs: bridge };
-        groups.push(current);
-      }
-      current.latlngs.push([p.lat, p.lng]);
+      const last = runs[runs.length - 1];
+      if (last && last.cls === cls) last.points.push(p);
+      else runs.push({ cls, points: [p] });
     }
-    return groups.filter(g => g.latlngs.length > 1);
+    return runs;
   }
 
-  function renderMap(profilePoints, terrainPoints) {
-    if (!profilePoints.length) return;
+  // One polyline segment per run, repeating each boundary point at the start
+  // of the next segment so the drawn line stays continuous across a class change.
+  function groupByClass(runs) {
+    return runs
+      .map((run, i) => {
+        const bridge = i ? [runs[i - 1].points[runs[i - 1].points.length - 1]] : [];
+        return { cls: run.cls, latlngs: [...bridge, ...run.points].map(p => [p.lat, p.lng]) };
+      })
+      .filter(g => g.latlngs.length > 1);
+  }
+
+  function renderMap(runs) {
+    if (!runs.length) return;
     if (typeof L === 'undefined') {
       document.getElementById('map-route').innerHTML = '<div class="error">The map library did not load.</div>';
       return;
@@ -179,8 +185,7 @@
 
     addBaseLayer(routeMap, { withTerrainData: true });
 
-    const clsByIdx = new Map(terrainPoints.map(p => [p.idx, p.cls]));
-    const groups = groupByClass(profilePoints, clsByIdx);
+    const groups = groupByClass(runs);
     const allLatLngs = [];
     for (const g of groups) {
       L.polyline(g.latlngs, { color: classColor(theme, g.cls), weight: 4, opacity: 0.9 }).addTo(routeMap);
@@ -200,30 +205,25 @@
     routeMap.fitBounds(L.latLngBounds(allLatLngs), { padding: [16, 16] });
   }
 
-  function renderElevation(profilePoints, terrainPoints) {
+  function renderElevation(profilePoints, runs) {
     const withEle = profilePoints.filter(p => p.ele_m != null);
     if (withEle.length < 2) {
       document.getElementById('chart-elevation').innerHTML = '<div class="error">No elevation profile available.</div>';
       return;
     }
     const theme = chartTheme();
-    const clsByIdx = new Map(terrainPoints.map(p => [p.idx, p.cls]));
     const data = profilePoints.map(p => [p.dist_m / MILE_METERS, p.ele_m != null ? p.ele_m * FT_PER_METER : null]);
 
     // markArea bands colored by class, spanning each contiguous run's
     // distance range, drawn under a single neutral elevation line.
-    const distBands = [];
-    let current = null;
-    for (const p of profilePoints) {
-      const cls = clsByIdx.get(p.idx) ?? null;
-      if (!current || current.cls !== cls) {
-        if (current) current.end = p.dist_m / MILE_METERS;
-        current = { cls, start: p.dist_m / MILE_METERS, end: p.dist_m / MILE_METERS };
-        distBands.push(current);
-      } else {
-        current.end = p.dist_m / MILE_METERS;
-      }
-    }
+    const distBands = runs.map((run, i) => {
+      const last = run.points[run.points.length - 1];
+      return {
+        cls: run.cls,
+        start: run.points[0].dist_m / MILE_METERS,
+        end: (runs[i + 1] ? runs[i + 1].points[0] : last).dist_m / MILE_METERS,
+      };
+    });
 
     const markAreaData = distBands
       .filter(b => b.cls != null)

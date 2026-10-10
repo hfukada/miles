@@ -4,7 +4,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -167,16 +167,6 @@ def _on_response(response: requests.Response, **_: object) -> None:
     if status == 401:
         _forget_access_token()
         http_client.report_outcome("strava", 401)
-
-
-def note_window_elapsed() -> None:
-    """A 15-minute window has passed since the last response: its allowance is
-    whole again, though no new response has said so yet. The observation keeps
-    its own time, so the daily figure is still aged by the day it was seen."""
-    global _observation
-    with _rate_lock:
-        if _observation is not None:
-            _observation = replace(_observation, short_remaining=_observation.short_limit)
 
 
 def _window(when: datetime) -> int:

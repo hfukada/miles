@@ -234,27 +234,24 @@ _last_expired_at: float | None = None
 _expire_lock = threading.Lock()
 
 
-def _expire_cache(conn: sqlite3.Connection) -> None:
-    """Delete expired cache rows, at most once an hour per process: the TTLs
-    are days, and the delete takes a write lock."""
-    global _last_expired_at
-    with _expire_lock:
-        if _last_expired_at is not None and time.monotonic() - _last_expired_at < _EXPIRE_INTERVAL_S:
-            return
-        _last_expired_at = time.monotonic()
-    now = datetime.now(timezone.utc)
-    conn.execute(
-        "DELETE FROM drive_time_cache WHERE fetched_at < CASE WHEN drive_s IS NULL THEN ? ELSE ? END",
-        [
-            (now - timedelta(days=UNREACHABLE_CACHE_TTL_DAYS)).isoformat(),
-            (now - timedelta(days=DRIVE_TIME_CACHE_TTL_DAYS)).isoformat(),
-        ],
-    )
-    conn.commit()
-
-
 def _cache_store(conn: sqlite3.Connection, origin_key: tuple[int, int], results: dict[int, float | None]) -> None:
-    now = datetime.now(timezone.utc).isoformat()
+    """Upsert OSRM's answers. Rows past their TTL are deleted along the way, at
+    most once an hour per process: the TTLs are days, and the delete takes a
+    write lock."""
+    global _last_expired_at
+    now = datetime.now(timezone.utc)
+    with _expire_lock:
+        expire = _last_expired_at is None or time.monotonic() - _last_expired_at >= _EXPIRE_INTERVAL_S
+        if expire:
+            _last_expired_at = time.monotonic()
+    if expire:
+        conn.execute(
+            "DELETE FROM drive_time_cache WHERE fetched_at < CASE WHEN drive_s IS NULL THEN ? ELSE ? END",
+            [
+                (now - timedelta(days=UNREACHABLE_CACHE_TTL_DAYS)).isoformat(),
+                (now - timedelta(days=DRIVE_TIME_CACHE_TTL_DAYS)).isoformat(),
+            ],
+        )
     conn.executemany(
         """
         INSERT INTO drive_time_cache (origin_lat_r, origin_lng_r, dest_node_id, drive_s, fetched_at)
@@ -262,13 +259,9 @@ def _cache_store(conn: sqlite3.Connection, origin_key: tuple[int, int], results:
         ON CONFLICT(origin_lat_r, origin_lng_r, dest_node_id) DO UPDATE SET
             drive_s = excluded.drive_s, fetched_at = excluded.fetched_at
         """,
-        [(origin_key[0], origin_key[1], node_id, drive_s, now) for node_id, drive_s in results.items()],
+        [(origin_key[0], origin_key[1], node_id, drive_s, now.isoformat()) for node_id, drive_s in results.items()],
     )
     conn.commit()
-
-
-def _fetch_with_backoff(url: str) -> bytes:
-    return http_client.request(http_client.OSRM, url)
 
 
 def _osrm_table_url(origin: tuple[float, float], destinations: list[tuple[float, float]]) -> str:
@@ -280,7 +273,7 @@ def _fetch_durations(url: str) -> list[float | None] | None:
     """Per-destination durations in seconds (None where unreachable), in
     request order, or None if the whole call failed."""
     try:
-        raw = _fetch_with_backoff(url)
+        raw = http_client.request(http_client.OSRM, url)
     except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
         return None
     try:
@@ -334,7 +327,6 @@ def _resolve_drive_times(
     one request; the rest are left out. If the request fails (or OSRM was down
     recently), those that would have been sent get straight-line estimates."""
     origin_key = _round_origin(origin_lat, origin_lng)
-    _expire_cache(conn)
     cached = _cache_lookup(conn, origin_key, [c["osm_node_id"] for c in ranked])
     result: dict[int, _DriveTime | None] = {
         node_id: None if drive_s is None else {"drive_s": drive_s, "estimated": False}
@@ -422,20 +414,8 @@ def drive_starts(
         "drive_time_estimated": False,
     }
 
-    top: list[DriveStart] = [
-        {
-            "lat": c["lat"],
-            "lng": c["lng"],
-            "label": c["label"],
-            "drive_s": c["drive_s"],
-            "kind": c["kind"],
-            "osm_node_id": c["osm_node_id"],
-            "trail_m_nearby": c["trail_m_nearby"],
-            "drive_time_estimated": c["drive_time_estimated"],
-        }
-        for c in scored[:k]
-    ]
-    return [origin_start] + top
+    top = [cast(DriveStart, {key: c[key] for key in DriveStart.__annotations__}) for c in scored[:k]]
+    return [origin_start, *top]
 
 
 def athlete_view(start: DriveStart) -> dict:

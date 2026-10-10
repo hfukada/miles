@@ -130,37 +130,18 @@ class AreaRebuildingError(ValueError):
 
 
 def init_search_schema(conn: sqlite3.Connection) -> None:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS net_search_results (
-            request_id   TEXT PRIMARY KEY,
-            area_id      INTEGER NOT NULL,
-            created_at   TEXT NOT NULL,
-            expires_at   TEXT NOT NULL,
-            request_json TEXT NOT NULL
-        )
-    """)
+    # data is the candidate as get_route_candidate returns it, minus its id.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS net_candidates (
             candidate_id TEXT PRIMARY KEY,
-            request_id   TEXT NOT NULL REFERENCES net_search_results(request_id) ON DELETE CASCADE,
-            area_id      INTEGER NOT NULL,
-            shape        TEXT NOT NULL,
-            start_json   TEXT NOT NULL,
-            distance_m   REAL NOT NULL,
-            score_json   TEXT NOT NULL,
-            missed_json  TEXT NOT NULL,
-            geometry_json TEXT NOT NULL,
-            created_at   TEXT NOT NULL,
-            expires_at   TEXT NOT NULL
+            expires_at   TEXT NOT NULL,
+            data         TEXT NOT NULL
         )
     """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_net_candidates_request ON net_candidates(request_id)")
 
 
 def _purge_expired(conn: sqlite3.Connection) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute("DELETE FROM net_candidates WHERE expires_at < ?", [now])
-    conn.execute("DELETE FROM net_search_results WHERE expires_at < ?", [now])
+    conn.execute("DELETE FROM net_candidates WHERE expires_at < ?", [datetime.now(timezone.utc).isoformat()])
     conn.commit()
 
 
@@ -730,23 +711,21 @@ def resolve_starts(
     origin: tuple[float, float] | None,
     max_drive_minutes: float | None,
     drive_k: int,
-    origin_field: str = "start_lat/start_lng",
 ) -> list[Start]:
     """An explicit starts list, a single start at origin, or (with
     max_drive_minutes) the drive-to-trailhead set around origin, which
-    includes origin itself. origin_field names the caller's origin parameter
-    in error messages."""
+    includes origin itself."""
     if max_drive_minutes is not None:
         if starts:
             raise ValueError("max_drive_minutes and starts are mutually exclusive")
         if origin is None:
-            raise ValueError(f"max_drive_minutes needs {origin_field} as the drive origin")
+            raise ValueError(f"max_drive_minutes needs start_lat/start_lng as the drive origin")
         return cast(list[Start], drive_starts.drive_starts(conn, area_id, origin[0], origin[1], max_drive_minutes, k=drive_k))
     if starts:
         return list(starts)
     if origin is not None:
         return [{"lat": origin[0], "lng": origin[1]}]
-    raise ValueError(f"find_routes needs {origin_field} or a starts list")
+    raise ValueError(f"find_routes needs start_lat/start_lng or a starts list")
 
 
 def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteSearchResult:
@@ -868,8 +847,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         selected = ranked[:n]
         near_miss = True
 
-    request_id = _persist_request(conn, area_id, request, seed)
-    result_candidates = [_persist_candidate(conn, area_id, request_id, edge_rows, c) for c in selected]
+    result_candidates = [_persist_candidate(conn, area_id, edge_rows, c) for c in selected]
     conn.commit()
     return {
         "candidates": result_candidates,
@@ -879,40 +857,11 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     }
 
 
-def _persist_request(conn: sqlite3.Connection, area_id: int, request: RouteSearchRequest, seed: int) -> str:
-    now = datetime.now(timezone.utc)
-    request_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO net_search_results (request_id, area_id, created_at, expires_at, request_json) VALUES (?, ?, ?, ?, ?)",
-        [
-            request_id, area_id, now.isoformat(), (now + timedelta(hours=CANDIDATE_TTL_HOURS)).isoformat(),
-            json.dumps({**request, "seed": seed}, default=str),
-        ],
-    )
-    return request_id
-
-
 def _persist_candidate(
-    conn: sqlite3.Connection, area_id: int, request_id: str, edge_rows: Mapping[int, dict], candidate: _Candidate
+    conn: sqlite3.Connection, area_id: int, edge_rows: Mapping[int, dict], candidate: _Candidate
 ) -> RouteCandidateOut:
-    now = datetime.now(timezone.utc)
-    expires_at = (now + timedelta(hours=CANDIDATE_TTL_HOURS)).isoformat()
     candidate_id = str(uuid.uuid4())
-    geometry = _geometry(edge_rows, candidate.segments)
-    conn.execute(
-        """
-        INSERT INTO net_candidates (
-            candidate_id, request_id, area_id, shape, start_json, distance_m,
-            score_json, missed_json, geometry_json, created_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        [
-            candidate_id, request_id, area_id, candidate.shape, json.dumps(candidate.start),
-            candidate.score["distance_m"], json.dumps(candidate.score), json.dumps(candidate.missed),
-            json.dumps(geometry), now.isoformat(), expires_at,
-        ],
-    )
-    return {
+    out: RouteCandidateOut = {
         "candidate_id": candidate_id,
         "area_id": area_id,
         "shape": candidate.shape,
@@ -920,8 +869,14 @@ def _persist_candidate(
         "distance_m": candidate.score["distance_m"],
         "score": candidate.score,
         "missed_constraints": candidate.missed,
-        "geometry": [list(p) for p in geometry],
+        "geometry": [list(p) for p in _geometry(edge_rows, candidate.segments)],
     }
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=CANDIDATE_TTL_HOURS)).isoformat()
+    conn.execute(
+        "INSERT INTO net_candidates (candidate_id, expires_at, data) VALUES (?, ?, ?)",
+        [candidate_id, expires_at, json.dumps({k: v for k, v in out.items() if k != "candidate_id"})],
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -931,19 +886,10 @@ def _persist_candidate(
 
 def get_route_candidate(conn: sqlite3.Connection, candidate_id: str) -> RouteCandidateOut:
     _purge_expired(conn)
-    row = conn.execute("SELECT * FROM net_candidates WHERE candidate_id = ?", [candidate_id]).fetchone()
+    row = conn.execute("SELECT data FROM net_candidates WHERE candidate_id = ?", [candidate_id]).fetchone()
     if row is None:
         raise CandidateNotFoundError(f"no candidate {candidate_id} (or it expired)")
-    return {
-        "candidate_id": row["candidate_id"],
-        "area_id": row["area_id"],
-        "shape": row["shape"],
-        "start": json.loads(row["start_json"]),
-        "distance_m": row["distance_m"],
-        "score": json.loads(row["score_json"]),
-        "missed_constraints": json.loads(row["missed_json"]),
-        "geometry": json.loads(row["geometry_json"]),
-    }
+    return cast(RouteCandidateOut, {"candidate_id": candidate_id, **json.loads(row["data"])})
 
 
 def save_route_candidate(conn: sqlite3.Connection, candidate_id: str, name: str) -> dict:

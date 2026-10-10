@@ -29,22 +29,15 @@ from typing_extensions import TypedDict
 from . import gpx_parse, routes_spatial
 from .elevation import ElevationSampler
 
-NETWORK_DERIVE_VERSION = 6
+NETWORK_DERIVE_VERSION = 7
 
-# Paths with no vehicle traffic: no road-comfort tier, only proximity to a
-# major road alongside.
+# Paths with no vehicle traffic: they carry no road-comfort tier.
 TRAIL_HIGHWAYS = frozenset({"path", "footway", "bridleway", "steps", "cycleway"})
 
 # Drivable classes kept in the routing graph, each with a road-comfort tier.
 ROAD_LIKE_HIGHWAYS = frozenset(
     {"secondary", "secondary_link", "tertiary", "tertiary_link", "unclassified",
      "residential", "living_street", "service", "road", "track"}
-)
-
-# Too fast to route a runner onto; kept only as geometry for the
-# proximity-to-a-major-road attribute.
-EXCLUDED_ROUTING_HIGHWAY_CLASSES = frozenset(
-    {"motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"}
 )
 
 # Streets a footway can be the sidewalk of. Tracks are out (a trail beside a
@@ -76,9 +69,6 @@ DEFAULT_MAXSPEED_MPH_BY_CLASS: dict[str, float] = {
     "service": 15.0, "track": 15.0, "road": 25.0,
 }
 
-# Search radii for "alongside a major road" and "amenity nearby an edge".
-MAJOR_ROAD_PROXIMITY_RADIUS_M = 500.0
-NEARBY_AMENITY_RADIUS_M = 400.0
 AMENITY_SNAP_RADIUS_M = 300.0
 
 _SEGMENT_LEN_M = gpx_parse.RESAMPLE_SPACING_M
@@ -104,7 +94,6 @@ class NetworkStats(TypedDict):
     edge_count: int
     amenity_count: int
     excluded_way_count: int
-    major_road_way_points: int
 
 
 class RoadExposureViolation(TypedDict):
@@ -118,18 +107,6 @@ class RoadExposure(TypedDict):
     violations: list[RoadExposureViolation]
     totals_m: dict[str, float]
     avoided_ways: list[int]
-
-
-class TechnicalityBreakdown(TypedDict):
-    known_distance_m: float
-    unknown_distance_m: float
-    by_field: dict[str, dict[str, float]]
-
-
-class AmenityHit(TypedDict):
-    kind: str
-    edge_id: int
-    distance_m: float
 
 
 class PathScore(TypedDict):
@@ -148,11 +125,7 @@ class PathScore(TypedDict):
     has_elevation: bool
     elevation_coverage_pct: float
     runnability: RunnabilityResult
-    technicality: TechnicalityBreakdown
     road_exposure: RoadExposure
-    highway_alongside_m: float
-    highway_alongside_penalty: float
-    amenities: list[AmenityHit]
 
 
 DEFAULT_PREFERENCES: dict = {
@@ -163,9 +136,6 @@ DEFAULT_PREFERENCES: dict = {
         "through_traffic_classes": ["secondary", "secondary_link", "tertiary_link"],
     },
     "max_continuous_uncomfortable_m": 805.0,  # 0.5 mi
-    "surface_weight": {"trail": 1.0, "unpaved_road": 1.0, "paved": 0.5},
-    "technicality_tolerance": "moderate",
-    "highway_alongside": {"distance_m": 50.0, "penalty_weight": 1.0},
 }
 
 
@@ -225,14 +195,10 @@ def init_network_schema(conn: sqlite3.Connection) -> None:
             has_elevation           INTEGER NOT NULL,
             gain_fwd_m              REAL,
             loss_fwd_m              REAL,
-            technicality_json       TEXT NOT NULL,
             maxspeed_mph            REAL,
             maxspeed_filled         INTEGER,
             lanes                   INTEGER,
             has_separation          INTEGER,
-            proximity_major_road_m  REAL,
-            nearby_water_m          REAL,
-            nearby_toilets_m        REAL,
             points_blob             BLOB NOT NULL
         )
     """)
@@ -295,19 +261,6 @@ def _validate_preferences(prefs: dict) -> None:
     max_uncomfortable = prefs.get("max_continuous_uncomfortable_m")
     if not isinstance(max_uncomfortable, (int, float)) or max_uncomfortable <= 0:
         raise ValueError("max_continuous_uncomfortable_m must be a positive number")
-
-    surface_weight = prefs.get("surface_weight")
-    if not isinstance(surface_weight, dict) or not all(isinstance(v, (int, float)) for v in surface_weight.values()):
-        raise ValueError("surface_weight must be an object of number values")
-
-    if not isinstance(prefs.get("technicality_tolerance"), str):
-        raise ValueError("technicality_tolerance must be a string")
-
-    alongside = prefs.get("highway_alongside")
-    if not isinstance(alongside, dict):
-        raise ValueError("highway_alongside must be an object")
-    if not isinstance(alongside.get("distance_m"), (int, float)) or not isinstance(alongside.get("penalty_weight"), (int, float)):
-        raise ValueError("highway_alongside.distance_m and penalty_weight must be numbers")
 
 
 def set_route_preferences(conn: sqlite3.Connection, patch: dict) -> dict:
@@ -493,15 +446,6 @@ def is_trail_class(highway: str, surface_class: str) -> bool:
     return highway in TRAIL_CLASS_HIGHWAYS or surface_class == "trail"
 
 
-def _technicality(tags: dict) -> dict[str, str | None]:
-    return {
-        "sac_scale": tags.get("sac_scale"),
-        "mtb_scale": tags.get("mtb:scale"),
-        "trail_visibility": tags.get("trail_visibility"),
-        "smoothness": tags.get("smoothness"),
-    }
-
-
 _MAXSPEED_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(mph|knots|km/h|kmh|kph)?")
 _MPH_PER_KPH = 0.621371
 _MPH_PER_KNOT = 1.150779
@@ -640,12 +584,6 @@ def _point_index(points: list[tuple[float, float]], radius_m: float) -> routes_s
     return index
 
 
-def _nearest_within(index: routes_spatial.NearestIndex, seg_points: list[tuple[float, float]], radius_m: float) -> float | None:
-    """Distance from the closest of seg_points to anything in index, within radius_m."""
-    hits = [hit[2] for lat, lng in seg_points if (hit := index.nearest(lat, lng, radius_m))]
-    return min(hits, default=None)
-
-
 # ---------------------------------------------------------------------------
 # Edge splitting
 # ---------------------------------------------------------------------------
@@ -675,12 +613,18 @@ def synthetic_id_for(amenity_osm_id: int) -> int:
 
 class EdgeSplit(TypedDict):
     """The two edge-row-shaped pieces from cutting an edge at offset_m, plus the
-    new node's position. Proximity/nearby-amenity fields carry over from the
-    parent edge; they are approximate and a rebuild recomputes them."""
+    new node's position."""
     before: dict
     after: dict
     node_lat: float
     node_lng: float
+
+
+# The way-level columns every piece of a cut edge inherits.
+_WAY_COLUMNS = (
+    "way_id", "way_name", "highway", "surface_class", "oneway", "maxspeed_mph", "maxspeed_filled", "lanes",
+    "has_separation",
+)
 
 
 def split_edge_row(row: dict, offset_m: float) -> EdgeSplit | None:
@@ -699,43 +643,29 @@ def split_edge_row(row: dict, offset_m: float) -> EdgeSplit | None:
     lng_vals = cast("list[float | None]", [p[1] for p in points])
     ele_vals: list[float | None] = [p[3] for p in points]
 
-    dist_before, lat_before = routes_spatial.slice_by_distance(dist_m, lat_vals, 0.0, offset_m)
-    _, lng_before = routes_spatial.slice_by_distance(dist_m, lng_vals, 0.0, offset_m)
-    _, ele_before = routes_spatial.slice_by_distance(dist_m, ele_vals, 0.0, offset_m)
-    dist_after, lat_after = routes_spatial.slice_by_distance(dist_m, lat_vals, offset_m, length_m)
-    _, lng_after = routes_spatial.slice_by_distance(dist_m, lng_vals, offset_m, length_m)
-    _, ele_after = routes_spatial.slice_by_distance(dist_m, ele_vals, offset_m, length_m)
-
-    def _piece(dist: list[float], lat: list[float | None], lng: list[float | None], ele: list[float | None]) -> dict:
+    def piece(from_m: float, to_m: float) -> tuple[dict, list[float | None], list[float | None]]:
+        dist, lat = routes_spatial.slice_by_distance(dist_m, lat_vals, from_m, to_m)
+        _, lng = routes_spatial.slice_by_distance(dist_m, lng_vals, from_m, to_m)
+        _, ele = routes_spatial.slice_by_distance(dist_m, ele_vals, from_m, to_m)
         has_elevation = bool(row["has_elevation"]) and all(e is not None for e in ele)
         gain_m = loss_m = None
         if has_elevation:
             gain_m, loss_m = gpx_parse.gain_loss_m(cast("list[float]", ele))
         latlng = list(zip(cast("list[float]", lat), cast("list[float]", lng)))
-        return {
-            "way_id": row["way_id"],
-            "way_name": row["way_name"],
-            "highway": row["highway"],
-            "surface_class": row["surface_class"],
-            "oneway": row["oneway"],
+        edge = {c: row[c] for c in _WAY_COLUMNS} | {
             "length_m": dist[-1] if dist else 0.0,
             "has_elevation": int(has_elevation),
             "gain_fwd_m": gain_m,
             "loss_fwd_m": loss_m,
-            "technicality_json": row["technicality_json"],
-            "maxspeed_mph": row["maxspeed_mph"],
-            "maxspeed_filled": row["maxspeed_filled"],
-            "lanes": row["lanes"],
-            "has_separation": row["has_separation"],
-            "proximity_major_road_m": row["proximity_major_road_m"],
-            "nearby_water_m": row["nearby_water_m"],
-            "nearby_toilets_m": row["nearby_toilets_m"],
             "points_blob": _pack_points(latlng, dist, ele),
         }
+        return edge, lat, lng
 
+    before, lat_before, lng_before = piece(0.0, offset_m)
+    after, _, _ = piece(offset_m, length_m)
     return {
-        "before": _piece(dist_before, lat_before, lng_before, ele_before),
-        "after": _piece(dist_after, lat_after, lng_after, ele_after),
+        "before": before,
+        "after": after,
         "node_lat": cast(float, lat_before[-1]),
         "node_lng": cast(float, lng_before[-1]),
     }
@@ -791,14 +721,10 @@ def splice_at(
 _DEFAULT_EDGE_ATTRS: dict[str, object] = {
     "way_name": None,
     "oneway": "no",
-    "technicality_json": json.dumps(_technicality({})),
     "maxspeed_mph": None,
     "maxspeed_filled": 0,
     "lanes": None,
     "has_separation": 0,
-    "proximity_major_road_m": None,
-    "nearby_water_m": None,
-    "nearby_toilets_m": None,
 }
 
 
@@ -900,7 +826,6 @@ def _build_network(
                     node_coords.setdefault(nid, (pt["lat"], pt["lon"]))
 
     routable_ways: list[tuple[int, dict, list[tuple[float, float]]]] = []
-    major_road_points: list[tuple[float, float]] = []
     excluded_count = 0
 
     for way_id, way in ways.items():
@@ -910,9 +835,6 @@ def _build_network(
             continue
         points = _way_points(way, node_coords)
         if points is None:
-            continue
-        if highway in EXCLUDED_ROUTING_HIGHWAY_CLASSES:
-            major_road_points.extend(points)
             continue
         if highway not in TRAIL_HIGHWAYS and highway not in ROAD_LIKE_HIGHWAYS:
             continue
@@ -943,14 +865,6 @@ def _build_network(
             kind = "junction" if node_way_count.get(osm_node_id, 0) >= 2 else "endpoint"
             nodes[osm_node_id] = {"kind": kind, "name": None, "lat": lat, "lng": lng}
 
-    major_road_index = _point_index(major_road_points, MAJOR_ROAD_PROXIMITY_RADIUS_M)
-    water_index = _point_index(
-        [(lat, lng) for kind, lat, lng, _name in amenity_nodes.values() if kind == "drinking_water"], NEARBY_AMENITY_RADIUS_M
-    )
-    toilets_index = _point_index(
-        [(lat, lng) for kind, lat, lng, _name in amenity_nodes.values() if kind == "toilets"], NEARBY_AMENITY_RADIUS_M
-    )
-
     # Resampled: street nodes can be 100m+ apart, which would miss a sidewalk
     # running between two of them.
     road_points: list[tuple[float, float]] = []
@@ -962,14 +876,6 @@ def _build_network(
             continue
         road_points.extend(_resample([(lat, lng, None) for lat, lng in way_points])[0])
     road_index = _point_index(road_points, SIDEWALK_ROAD_PROXIMITY_M)
-
-    def proximity_columns(points_blob: bytes, trail: bool) -> dict:
-        latlng = [(lat, lng) for lat, lng, _d, _e in unpack_edge_points(points_blob)]
-        return {
-            "nearby_water_m": _nearest_within(water_index, latlng, NEARBY_AMENITY_RADIUS_M),
-            "nearby_toilets_m": _nearest_within(toilets_index, latlng, NEARBY_AMENITY_RADIUS_M),
-            "proximity_major_road_m": _nearest_within(major_road_index, latlng, MAJOR_ROAD_PROXIMITY_RADIUS_M) if trail else None,
-        }
 
     edges: dict[int, dict] = {}
     edge_ids = itertools.count()
@@ -992,7 +898,6 @@ def _build_network(
             "surface_class": surface_class,
             "way_name": tags.get("name"),
             "oneway": _oneway_value(tags),
-            "technicality_json": json.dumps(_technicality(tags)),
         }
         if is_road_like:
             maxspeed_mph, maxspeed_filled = _resolve_maxspeed(highway, tags)
@@ -1016,7 +921,6 @@ def _build_network(
             row = _edge_row(sampler, from_osm, to_osm, [(lat, lng, None) for lat, lng in seg_points], way_attrs)
             if row is None:
                 continue
-            row.update(proximity_columns(row["points_blob"], highway in TRAIL_HIGHWAYS))
             edge_key = next(edge_ids)
             index_edge(edge_index, edge_key, row["points_blob"])
             edges[edge_key] = row
@@ -1082,15 +986,10 @@ def _build_network(
         "edge_count": len(final_edges),
         "amenity_count": len(amenity_nodes),
         "excluded_way_count": excluded_count,
-        "major_road_way_points": len(major_road_points),
     }
 
 
-_EDGE_COLUMNS = (
-    "way_id", "way_name", "highway", "surface_class", "oneway", "length_m", "has_elevation",
-    "gain_fwd_m", "loss_fwd_m", "technicality_json", "maxspeed_mph", "maxspeed_filled", "lanes",
-    "has_separation", "proximity_major_road_m", "nearby_water_m", "nearby_toilets_m", "points_blob",
-)
+_EDGE_COLUMNS = (*_WAY_COLUMNS, "length_m", "has_elevation", "gain_fwd_m", "loss_fwd_m", "points_blob")
 
 
 def _replace_area_graph(
@@ -1211,12 +1110,7 @@ def score_path(
     gain_known = False
     elevation_m = 0.0
     grade_profile: list[float] = []
-    tech_known_m = tech_unknown_m = 0.0
-    tech_fields: dict[str, dict[str, float]] = {"sac_scale": {}, "mtb_scale": {}, "trail_visibility": {}, "smoothness": {}}
     exposure_entries: list[tuple[str | None, float, int | None]] = []
-    highway_alongside_m = 0.0
-    amenities: list[AmenityHit] = []
-    alongside_threshold = prefs["highway_alongside"]["distance_m"]
 
     for edge_id, forward in edge_sequence:
         row = rows.get(edge_id)
@@ -1256,16 +1150,6 @@ def score_path(
                     continue
                 grade_profile.append((e1 - e0) / seg_len * 100.0)
 
-        tech = json.loads(row["technicality_json"])
-        if any(v is not None for v in tech.values()):
-            tech_known_m += length_m
-        else:
-            tech_unknown_m += length_m
-        for field, value in tech.items():
-            if value is not None:
-                bucket = tech_fields[field]
-                bucket[value] = bucket.get(value, 0.0) + length_m
-
         way_id = row["way_id"]
         override = overrides.get(way_id)
         tier: str | None = None
@@ -1280,13 +1164,6 @@ def score_path(
                 tier = "uncomfortable"
         exposure_entries.append((tier, length_m, avoided_way_id))
 
-        if surface_class == "trail" and row["proximity_major_road_m"] is not None and row["proximity_major_road_m"] <= alongside_threshold:
-            highway_alongside_m += length_m
-
-        for kind, col in (("drinking_water", "nearby_water_m"), ("toilets", "nearby_toilets_m")):
-            if row[col] is not None:
-                amenities.append({"kind": kind, "edge_id": edge_id, "distance_m": row[col]})
-
     return {
         "distance_m": distance_m,
         "trail_distance_m": trail_m,
@@ -1298,13 +1175,5 @@ def score_path(
         "has_elevation": gain_known and elevation_m >= distance_m,
         "elevation_coverage_pct": 100.0 * min(elevation_m / distance_m, 1.0) if distance_m > 0 else 0.0,
         "runnability": runnability(grade_profile),
-        "technicality": {
-            "known_distance_m": tech_known_m,
-            "unknown_distance_m": tech_unknown_m,
-            "by_field": tech_fields,
-        },
         "road_exposure": _road_exposure(exposure_entries, prefs["max_continuous_uncomfortable_m"]),
-        "highway_alongside_m": highway_alongside_m,
-        "highway_alongside_penalty": highway_alongside_m * prefs["highway_alongside"]["penalty_weight"],
-        "amenities": amenities,
     }

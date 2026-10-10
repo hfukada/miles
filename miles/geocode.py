@@ -96,12 +96,8 @@ def _recent(fetched_at: str) -> bool:
 
 def _cached_answer(conn: sqlite3.Connection, key: str, query: str, refresh: bool) -> GeocodeResult | None:
     """The cached answer, or None when Nominatim has to be asked. Raises for a
-    cached "no match". Rows keyed by raw query text (older) are also found."""
-    hit = conn.execute(
-        "SELECT lat, lng, display_name, fetched_at FROM geocode_cache WHERE query IN (?, ?) "
-        "ORDER BY query = ? DESC LIMIT 1",
-        (key, query, key),
-    ).fetchone()
+    cached "no match"."""
+    hit = conn.execute("SELECT lat, lng, display_name, fetched_at FROM geocode_cache WHERE query = ?", (key,)).fetchone()
     miss = conn.execute("SELECT fetched_at FROM geocode_misses WHERE query = ?", (key,)).fetchone()
     if hit is not None and not refresh:
         metrics.cache("geocode", "hit")
@@ -142,16 +138,13 @@ def lookup(conn: sqlite3.Connection, query: str, *, refresh: bool = False) -> Ge
 
 def _ask_nominatim(conn: sqlite3.Connection, key: str, query: str) -> GeocodeResult:
     now = datetime.now(timezone.utc).isoformat()
-    previous = conn.execute(
-        "SELECT lat, lng, display_name FROM geocode_cache WHERE query IN (?, ?) ORDER BY query = ? DESC LIMIT 1",
-        (key, query, key),
-    ).fetchone()
+    previous = conn.execute("SELECT lat, lng, display_name FROM geocode_cache WHERE query = ?", (key,)).fetchone()
     try:
         lat, lng, display_name = _fetch_nominatim(query)
     except NoMatchError:
         if previous is not None:
             # The question was asked; the once-a-day limit counts from now.
-            conn.execute("UPDATE geocode_cache SET fetched_at = ? WHERE query IN (?, ?)", (now, key, query))
+            conn.execute("UPDATE geocode_cache SET fetched_at = ? WHERE query = ?", (now, key))
             conn.commit()
             return _result(
                 previous["lat"], previous["lng"], previous["display_name"], query,

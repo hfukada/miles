@@ -1,9 +1,8 @@
 """Elevation sampling behind one sampler interface.
 
 The DEM is AWS's global Terrarium-encoded PNG tiles (slippy-map x/y/z),
-cached as fetched bytes in elevation_tiles keyed by (provider, zoom, x, y)
-and never expired. The provider column is always "terrarium" and stays in the
-key to avoid a migration.
+cached as fetched bytes in elevation_tiles keyed by (zoom, x, y) and never
+expired.
 
 The sampler reads the cache alone, interpolates bilinearly, and returns None
 outside cached coverage (ocean tiles 404) rather than fabricating a value.
@@ -48,9 +47,10 @@ class ElevationFetchError(RuntimeError):
 _TERRARIUM_MEMO_TILES = 64
 
 
-def _fetch(policy: http_client.ServicePolicy, url: str) -> bytes | None:
-    """The response body, None for a 404, or ElevationFetchError once retries
+def _fetch_terrarium_tile(url: str) -> bytes | None:
+    """The tile body, None for a 404, or ElevationFetchError once retries
     are exhausted."""
+    policy = http_client.TERRARIUM
     try:
         return http_client.request(policy, url)
     except urllib.error.HTTPError as e:
@@ -59,10 +59,6 @@ def _fetch(policy: http_client.ServicePolicy, url: str) -> bytes | None:
         raise ElevationFetchError(f"{policy.name} request failed: HTTP {e.code} for {redact(url)}") from e
     except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
         raise ElevationFetchError(f"{policy.name} request failed: {describe_error(e, None)} for {redact(url)}") from e
-
-
-def _fetch_terrarium_tile(url: str) -> bytes | None:
-    return _fetch(http_client.TERRARIUM, url)
 
 
 def _decode_terrarium(data: bytes) -> Image.Image | None:
@@ -146,7 +142,7 @@ def ensure_tiles(
 
 def _ensure_tile(conn: sqlite3.Connection, zoom: int, tx: int, ty: int) -> None:
     row = conn.execute(
-        "SELECT data FROM elevation_tiles WHERE provider = 'terrarium' AND zoom = ? AND x = ? AND y = ?",
+        "SELECT data FROM elevation_tiles WHERE zoom = ? AND x = ? AND y = ?",
         (zoom, tx, ty),
     ).fetchone()
     if row is not None and _decode_terrarium(row["data"]) is not None:
@@ -158,7 +154,7 @@ def _ensure_tile(conn: sqlite3.Connection, zoom: int, tx: int, ty: int) -> None:
         raise ElevationFetchError(f"terrarium tile {zoom}/{tx}/{ty} is not a valid PNG tile")
     try:
         conn.execute(
-            "INSERT OR REPLACE INTO elevation_tiles (provider, zoom, x, y, fetched_at, data) VALUES ('terrarium', ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO elevation_tiles (zoom, x, y, fetched_at, data) VALUES (?, ?, ?, ?, ?)",
             (zoom, tx, ty, datetime.now(timezone.utc).isoformat(), data),
         )
         conn.commit()
@@ -178,7 +174,7 @@ class TerrariumSampler:
 
     def _read_tile_image(self, tx: int, ty: int) -> Image.Image | None:
         row = self._conn.execute(
-            "SELECT data FROM elevation_tiles WHERE provider = 'terrarium' AND zoom = ? AND x = ? AND y = ?",
+            "SELECT data FROM elevation_tiles WHERE zoom = ? AND x = ? AND y = ?",
             (self._zoom, tx, ty),
         ).fetchone()
         # A corrupt cached tile counts as missing.

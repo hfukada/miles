@@ -127,19 +127,15 @@ def test_cut_area_with_a_disk_index_matches_the_in_memory_cut_and_leaves_no_inde
 
 
 # ---------------------------------------------------------------------------
-# Registration / bounds
+# Registration
 # ---------------------------------------------------------------------------
 
 
-def test_register_local_extract_hashes_and_reads_bounds_via_fallback_scan(conn: sqlite3.Connection, sample_pbf: Path):
+def test_register_local_extract_hashes_the_file_and_reuses_the_region_key(conn: sqlite3.Connection, sample_pbf: Path):
     record = extracts.register_local_extract(conn, sample_pbf, "test/sample")
     assert record["region"] == "test/sample"
     assert record["path"] == str(sample_pbf)
     assert record["sha256"] == extracts._sha256_file(sample_pbf)
-    assert record["bounds_south"] == pytest.approx(0.010)
-    assert record["bounds_north"] == pytest.approx(5.010)
-    assert record["bounds_west"] == pytest.approx(0.010)
-    assert record["bounds_east"] == pytest.approx(5.010)
 
     extracts.register_local_extract(conn, sample_pbf, "test/sample")
     assert len(extracts.list_extracts(conn)) == 1  # the region key is reused
@@ -151,21 +147,6 @@ def test_register_local_extract_hashes_and_reads_bounds_via_fallback_scan(conn: 
 # ---------------------------------------------------------------------------
 # Region selection
 # ---------------------------------------------------------------------------
-
-
-def test_find_registered_extract_picks_the_smallest_containing_bbox_and_none_when_nothing_contains_it(conn: sqlite3.Connection):
-    now = datetime.now(timezone.utc).isoformat()
-    for region, bound in (("big", 10), ("small", 1)):
-        conn.execute(
-            "INSERT INTO map_extracts (region, path, sha256, fetched_at, bounds_south, bounds_west, bounds_north, bounds_east) "
-            "VALUES (?, 'x', 'x', ?, ?, ?, ?, ?)",
-            (region, now, -bound, -bound, bound, bound),
-        )
-    conn.commit()
-
-    found = extracts.find_registered_extract(conn, (-0.5, -0.5, 0.5, 0.5))
-    assert found is not None and found["region"] == "small"
-    assert extracts.find_registered_extract(conn, (20, 20, 21, 21)) is None
 
 
 @pytest.mark.parametrize(
@@ -513,17 +494,12 @@ def test_a_registered_extract_whose_file_is_gone_is_downloaded_again(conn: sqlit
     sample_pbf.unlink()
     downloads: list[tuple[str, dict]] = []
     monkeypatch.setattr(extracts, "_download_with_backoff", _fake_download(downloads))
+    monkeypatch.setattr(extracts.geofabrik, "validate_region", lambda conn, region: None)
 
-    (record,) = extracts.select_extracts(conn, (0.012, 0.012, 0.04, 0.04))
+    (record,) = extracts.select_extracts(conn, (0.012, 0.012, 0.04, 0.04), preferred_region="test/sample")
 
     assert [validators for _url, validators in downloads] == [{}]
     assert Path(record["path"]).is_file()
-
-
-def test_planned_regions_falls_back_to_the_registered_extract_containing_the_area(conn: sqlite3.Connection, sample_pbf: Path):
-    _register_downloaded(conn, sample_pbf)
-    assert extracts.planned_regions(conn, (0.012, 0.012, 0.04, 0.04)) == ["test/sample"]
-    assert extracts.planned_regions(conn, (40.0, 40.0, 41.0, 41.0)) == []
 
 
 def test_force_replaces_a_registered_file_unconditionally(conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch):
@@ -535,22 +511,6 @@ def test_force_replaces_a_registered_file_unconditionally(conn: sqlite3.Connecti
 
     assert [validators for _url, validators in seen] == [{}]
     assert record["etag"] == '"new"'
-
-
-def test_a_local_extract_is_never_refreshed_from_geofabrik_and_a_missing_file_is_reported(
-    conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch
-):
-    extracts.register_local_extract(conn, sample_pbf, "local:sample")
-    monkeypatch.setattr(extracts, "_download_with_backoff", lambda *a, **kw: pytest.fail("contacted Geofabrik"))
-    monkeypatch.setattr(extracts.http_client, "request", lambda *a, **kw: pytest.fail("contacted Geofabrik"))
-    bbox = (0.012, 0.012, 0.04, 0.04)
-
-    for flags in ({"refresh": True}, {"force": True}):
-        assert [e["region"] for e in extracts.select_extracts(conn, bbox, **flags)] == ["local:sample"]
-
-    sample_pbf.unlink()
-    with pytest.raises(extracts.ExtractDownloadError, match="missing"):
-        extracts.select_extracts(conn, bbox, refresh=True)
 
 
 def test_stale_part_files_are_swept_before_a_download(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
@@ -576,8 +536,8 @@ def test_extract_cache_metrics_count_hits_misses_and_not_modified(conn: sqlite3.
     monkeypatch.setattr(extracts, "_download_with_backoff", lambda url, dest, validators, **kw: None)
     extracts.download_extract(conn, "test/sample", refresh=True)
 
-    assert metrics.get(metrics.CACHE_REQUESTS, cache="extract", result="hit") == 1
-    assert metrics.get(metrics.CACHE_REQUESTS, cache="extract", result="not_modified") == 1
+    assert metrics.REGISTRY.get_sample_value("miles_cache_requests_total", {"cache": "extract", "result": "hit"}) == 1
+    assert metrics.REGISTRY.get_sample_value("miles_cache_requests_total", {"cache": "extract", "result": "not_modified"}) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -587,8 +547,8 @@ def test_extract_cache_metrics_count_hits_misses_and_not_modified(conn: sqlite3.
 
 @pytest.mark.parametrize(
     "region, asks_geofabrik",
-    [("test/sample", True), ("local:sample", False)],
-    ids=["a downloaded extract is re-asked", "a local extract is kept when Geofabrik has no such file"],
+    [("test/sample", True), ("test/sample", False)],
+    ids=["a downloaded extract is re-asked", "an extract is kept when Geofabrik no longer serves it"],
 )
 def test_select_extracts_refresh_asks_geofabrik_and_keeps_an_unrefreshable_extract(
     conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch, region: str, asks_geofabrik: bool
@@ -604,8 +564,9 @@ def test_select_extracts_refresh_asks_geofabrik_and_keeps_an_unrefreshable_extra
         return download(url, dest, validators, **kw)
 
     monkeypatch.setattr(extracts, "_download_with_backoff", fake)
+    monkeypatch.setattr(extracts.geofabrik, "validate_region", lambda conn, region: None)
 
-    found = extracts.select_extracts(conn, (0.012, 0.012, 0.04, 0.04), refresh=True)
+    found = extracts.select_extracts(conn, (0.012, 0.012, 0.04, 0.04), preferred_region=region, refresh=True)
 
     assert [f["region"] for f in found] == [region]
     assert len(calls) == int(asks_geofabrik)
@@ -730,16 +691,13 @@ def _tile_ways(conn: sqlite3.Connection, gx: int) -> dict[int, dict]:
     return {el["id"]: el for el in payload["elements"] if el["type"] == "way"}
 
 
-def test_a_registered_extract_whose_header_box_reaches_across_the_border_does_not_stand_in_for_both_regions(
+def test_a_registered_extract_for_one_side_of_a_border_does_not_stand_in_for_both_regions(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     sources = _border_pbfs(tmp_path)
     _serve_index(monkeypatch)
     extracts.geofabrik.regions(conn)
     extracts.register_local_extract(conn, sources["example/parent/region-b"], "example/parent/region-b")
-    conn.execute("UPDATE map_extracts SET bounds_south = -1, bounds_west = -1, bounds_north = 1, bounds_east = 1")
-    conn.commit()
-    assert extracts.find_registered_extract(conn, STRADDLING_BBOX) is not None
     downloaded: list[str] = []
     monkeypatch.setattr(extracts, "_download_with_backoff", _border_download(sources, downloaded))
     monkeypatch.setattr(extracts, "GEOFABRIK_BASE_URL", "https://download.example.test")
@@ -765,11 +723,17 @@ def _tile_row(conn: sqlite3.Connection, gx: int = 0) -> sqlite3.Row:
     return conn.execute("SELECT * FROM map_tiles WHERE gx = ? AND gy = 0", (gx,)).fetchone()
 
 
+@pytest.fixture
+def border_index(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve_index(monkeypatch)
+    extracts.geofabrik.regions(conn)
+
+
 def _register_border_regions(conn: sqlite3.Connection, tmp_path: Path) -> list[extracts.ExtractRecord]:
     return [extracts.register_local_extract(conn, p, region) for region, p in _border_pbfs(tmp_path).items()]
 
 
-def test_a_cut_from_one_region_includes_every_other_registered_region_touching_the_tile(conn: sqlite3.Connection, tmp_path: Path):
+def test_a_cut_from_one_region_includes_every_other_registered_region_touching_the_tile(conn: sqlite3.Connection, tmp_path: Path, border_index: None):
     both = _register_border_regions(conn, tmp_path)
     only_a = [r for r in both if r["region"] == "example/parent/region-a"]
 
@@ -791,7 +755,7 @@ def test_a_stored_element_that_no_file_holds_is_dropped_by_a_cut(conn: sqlite3.C
     assert set(_tile_ways(conn, 0)) == {100, 150}
 
 
-def test_a_way_deleted_in_one_region_leaves_the_border_tile_when_only_that_region_is_refreshed(conn: sqlite3.Connection, tmp_path: Path):
+def test_a_way_deleted_in_one_region_leaves_the_border_tile_when_only_that_region_is_refreshed(conn: sqlite3.Connection, tmp_path: Path, border_index: None):
     _register_border_regions(conn, tmp_path)
     a_record = extracts.get_extract(conn, "example/parent/region-a")
     assert a_record is not None
@@ -813,7 +777,7 @@ def test_a_way_deleted_in_one_region_leaves_the_border_tile_when_only_that_regio
     assert extracts.tiles_cut_from(conn, [new_a], [(0, 0)])
 
 
-def test_a_tile_is_as_fresh_as_the_oldest_extract_it_was_cut_from(conn: sqlite3.Connection, tmp_path: Path):
+def test_a_tile_is_as_fresh_as_the_oldest_extract_it_was_cut_from(conn: sqlite3.Connection, tmp_path: Path, border_index: None):
     _register_border_regions(conn, tmp_path)
     _set_times(conn, "example/parent/region-a", fetched_days_ago=30)
     _set_times(conn, "example/parent/region-b", fetched_days_ago=2)
@@ -921,23 +885,29 @@ def test_an_explicit_region_on_a_fresh_install_is_not_blocked_by_an_unreachable_
     assert [e["region"] for e in selected] == ["example/region-a"]
 
 
-def test_the_checksum_fetch_is_retried_once_and_a_verified_download_is_kept_without_reading_it_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_an_unreachable_checksum_fails_the_download_and_a_verified_one_is_fetched_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     body = b"data"
     md5_calls: list[str] = []
+    reachable = [False]
 
     def request(policy, url, *, headers=None, reader=None, **kwargs):
         if url.endswith(".md5"):
             md5_calls.append(url)
-            if len(md5_calls) == 1:
+            if not reachable[0]:
                 raise urllib.error.URLError("reset")
-            digest = hashlib.md5(body).hexdigest() if len(md5_calls) == 2 else "0" * 32
-            return f"{digest}  y\n".encode()
+            return f"{hashlib.md5(body).hexdigest()}  y\n".encode()
         return reader(FakeResponse(body))
 
     monkeypatch.setattr(extracts.http_client, "request", request)
+    with pytest.raises(extracts.ExtractChecksumUnavailableError):
+        extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
+    assert not (tmp_path / "y.pbf").exists()
+
+    reachable[0] = True
+    md5_calls.clear()
     extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
     assert (tmp_path / "y.pbf").read_bytes() == body
-    assert len(md5_calls) == 2  # one failed attempt, one retry; none after the body
+    assert len(md5_calls) == 1  # none after the body
 
 
 def test_the_checksum_is_fetched_from_the_url_the_body_was_served_from(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1055,18 +1025,6 @@ def test_an_interior_cut_reads_only_the_child(conn: sqlite3.Connection, monkeypa
     assert extracts.tiles_cut_from(conn, selected, [INTERIOR_TILE])
 
 
-def test_the_index_polygon_decides_which_registered_extracts_touch_a_tile(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    family = _register_family(conn, tmp_path)
-    _store_border_index(conn, monkeypatch)
-    conn.execute("UPDATE map_extracts SET bounds_south = -1, bounds_west = -1, bounds_north = 1, bounds_east = 1")
-    conn.commit()
-    selected = [family["example/parent/region-a"]]
-
-    per_tile = extracts.tile_extracts(conn, selected, [INTERIOR_TILE])
-
-    assert _regions_of(per_tile, INTERIOR_TILE) == ["example/parent/region-a"], "region-b's wide header box is ignored"
-
-
 def test_a_registered_extract_whose_file_is_missing_is_not_cut_from(conn: sqlite3.Connection, tmp_path: Path):
     sources = _border_pbfs(tmp_path)
     a, b = (extracts.register_local_extract(conn, p, region) for region, p in sources.items())
@@ -1078,19 +1036,11 @@ def test_a_registered_extract_whose_file_is_missing_is_not_cut_from(conn: sqlite
     assert b["region"] not in {e["region"] for e in per_tile[(0, 0)]}
 
 
-def test_an_extract_with_no_bounds_touches_only_tiles_of_a_selected_cut(conn: sqlite3.Connection, tmp_path: Path):
+def test_an_extract_missing_from_the_index_touches_only_tiles_of_a_selected_cut(conn: sqlite3.Connection, tmp_path: Path):
     a, b = _register_border_regions(conn, tmp_path)
-    conn.execute(
-        "UPDATE map_extracts SET bounds_south = NULL, bounds_west = NULL, bounds_north = NULL, bounds_east = NULL "
-        "WHERE region = ?",
-        (b["region"],),
-    )
-    conn.commit()
-    unbounded = extracts.get_extract(conn, b["region"])
-    assert unbounded is not None
 
-    assert _regions_of(extracts.tile_extracts(conn, [a], [(40, 40)]), (40, 40)) == [a["region"]]
-    assert _regions_of(extracts.tile_extracts(conn, [unbounded], [(40, 40)]), (40, 40)) == [b["region"]]
+    assert _regions_of(extracts.tile_extracts(conn, [a], [(0, 0)]), (0, 0)) == [a["region"]]
+    assert _regions_of(extracts.tile_extracts(conn, [b], [(0, 0)]), (0, 0)) == [b["region"]]
 
 
 # ---------------------------------------------------------------------------
@@ -1127,20 +1077,3 @@ def test_a_failing_progress_callback_does_not_stop_the_reporter():
     report(2, None)
 
     assert calls == [1, 2]
-
-
-def test_an_extract_registry_from_before_conditional_downloads_still_reads():
-    legacy = sqlite3.connect(":memory:")
-    legacy.row_factory = sqlite3.Row
-    legacy.execute(
-        "CREATE TABLE map_extracts (region TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL, "
-        "fetched_at TEXT NOT NULL, bounds_south REAL, bounds_west REAL, bounds_north REAL, bounds_east REAL)"
-    )
-    legacy.execute("INSERT INTO map_extracts VALUES ('r/x', '/p', 's', '2024-01-01T00:00:00+00:00', 0, 0, 1, 1)")
-    extracts.init_extract_schema(legacy)
-
-    record = extracts.get_extract(legacy, "r/x")
-
-    assert record is not None
-    assert record["checked_at"] == record["data_as_of"] == "2024-01-01T00:00:00+00:00"
-    assert record["etag"] is None

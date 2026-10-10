@@ -107,12 +107,11 @@ date, or the cut time of tiles uploaded from a local file) and `refresh_suggeste
   cover the area; the size comes from the HEAD that resolves the redirect, so
   a refusal sends no GET and does not start the one-hour cooldown.
   The `.md5` published beside the dated file that `-latest` redirects to is
-  fetched first, with one retry, and the body
+  fetched first, and the body
   is requested from that dated URL only once the checksum is in hand; an
   unreachable `.md5` ends the attempt before any download. A file is registered only after its byte count matches
   Content-Length and its MD5 matches; the dated URL is immutable, so the
-  `.md5` is not read a second time. The partial file is removed on any failure. An extract
-  registered from a local file is never refreshed from Geofabrik. A
+  `.md5` is not read a second time. The partial file is removed on any failure. A
   registered extract whose file has gone missing is downloaded again, and
   `miles-area-refresh LABEL --force-extract` replaces a bad file
   unconditionally. Tiles already cut from an extract's current file are not

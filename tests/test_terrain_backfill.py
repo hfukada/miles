@@ -84,7 +84,7 @@ def test_the_queue_holds_runs_that_need_streams_and_drops_them_once_fetched_else
     _run(conn, 8, 2)
     _run(conn, 7, 3, sport_type="VirtualRun")  # never queued
     needing = {1, 3}
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: aid in needing)
+    monkeypatch.setattr(streams, "has_cached_streams", lambda aid: aid not in needing)
 
     assert terrain_backfill.refresh_backfill_queue(conn) == 1
     assert {r["activity_id"] for r in conn.execute("SELECT activity_id FROM terrain_backfill_queue")} == {1}
@@ -118,7 +118,7 @@ def test_run_backfill_fetches_caches_and_segments(conn: sqlite3.Connection, monk
     assert sorted(asked) == [1, 2]
     assert _queued(conn) == 0
     for activity_id in (1, 2):
-        assert streams.needs_streams_fetch(activity_id) is False
+        assert streams.has_cached_streams(activity_id) is True
         assert _segment_count(conn, activity_id) > 0
 
     snap = progress.snapshot()

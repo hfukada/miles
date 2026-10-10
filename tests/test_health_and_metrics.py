@@ -187,15 +187,15 @@ def test_metrics_renders_text_format_with_sync_and_backfill_series(client: TestC
 
     response = client.get("/metrics")
 
-    assert response.headers["content-type"].startswith("text/plain; version=0.0.4")
+    assert response.headers["content-type"].startswith("text/plain; version=")
     text = response.text
     assert "# TYPE miles_cache_requests_total counter" in text
-    assert 'miles_cache_requests_total{cache="geocode",result="hit"} 1' in text
-    assert "miles_sync_last_success_timestamp_seconds 1767323045" in text
+    assert 'miles_cache_requests_total{cache="geocode",result="hit"} 1.0' in text
+    assert "miles_sync_last_success_timestamp_seconds 1.767323045e+09" in text
     assert "miles_sync_last_duration_seconds 12.5" in text
-    assert "miles_sync_last_new_activities 3" in text
-    assert 'miles_backfill_remaining{kind="streams"} 1' in text
-    assert 'miles_backfill_remaining{kind="laps"} 1' in text
+    assert "miles_sync_last_new_activities 3.0" in text
+    assert 'miles_backfill_remaining{kind="streams"} 1.0' in text
+    assert 'miles_backfill_remaining{kind="laps"} 1.0' in text
     assert "miles_sync_last_failure_timestamp_seconds" not in text
 
 
@@ -209,20 +209,6 @@ def test_a_malformed_sync_timestamp_does_not_break_the_metrics(client: TestClien
 
     assert response.status_code == 200
     assert "miles_sync_last_success_timestamp_seconds" not in response.text
-
-
-# ---------------------------------------------------------------------------
-# metrics registry
-# ---------------------------------------------------------------------------
-
-
-def test_labels_are_escaped_and_samples_sorted():
-    metrics.reset()
-    metrics.inc("miles_test_total", 2, name='a"b\\c')
-    metrics.set_gauge("miles_test_gauge", 1.5)
-    text = metrics.render()
-    assert 'miles_test_total{name="a\\"b\\\\c"} 2' in text
-    assert "miles_test_gauge 1.5" in text
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +234,7 @@ def test_every_attempt_is_reported_with_its_host_and_retries_are_counted(
         ("t", "mirror.example", "503", ""),
         ("t", "mirror.example", "200", ""),
     ]
-    assert metrics.get(metrics.HTTP_RETRIES, service="t") == 2
+    assert metrics.REGISTRY.get_sample_value("miles_http_retries_total", {"service": "t"}) == 2
 
 
 def test_time_spent_waiting_on_the_throttle_is_counted(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
@@ -258,7 +244,7 @@ def test_time_spent_waiting_on_the_throttle_is_counted(clock: FakeClock, monkeyp
     http_client.request(policy, "http://x")
     http_client.request(policy, "http://x")
 
-    assert metrics.get(metrics.HTTP_WAIT_SECONDS, service="slow") == pytest.approx(2.0)
+    assert metrics.REGISTRY.get_sample_value("miles_http_wait_seconds_total", {"service": "slow"}) == pytest.approx(2.0)
 
 
 def test_install_hooks_the_ledger_into_both_clients():
@@ -351,8 +337,8 @@ def test_the_outbound_endpoint_and_metrics_expose_the_ledger(client: TestClient,
         {"day": day, "service": "osrm", "host": "router.example", "kind": "", "status": "200", "count": 7}
     ]
     text = client.get("/metrics").text
-    assert 'miles_outbound_requests_total{host="router.example",kind="",service="osrm",status="200"} 10' in text
-    assert "miles_strava_daily_calls_remaining 600" in text
-    assert "miles_strava_short_window_calls_remaining 90" in text
+    assert 'miles_outbound_requests_total{host="router.example",kind="",service="osrm",status="200"} 10.0' in text
+    assert "miles_strava_daily_calls_remaining 600.0" in text
+    assert "miles_strava_short_window_calls_remaining 90.0" in text
 
 

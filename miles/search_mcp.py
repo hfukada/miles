@@ -15,33 +15,6 @@ from .offload import threaded
 FT_PER_M = 3.28084
 
 
-def _parse_starts(raw: str | list) -> list[route_search.Start]:
-    parsed = json.loads(raw) if isinstance(raw, str) else raw
-    if not isinstance(parsed, list) or not parsed:
-        raise ValueError('starts must be a non-empty JSON list of {"lat", "lng"} objects')
-    out: list[route_search.Start] = []
-    for i, item in enumerate(parsed):
-        if (
-            not isinstance(item, dict)
-            or not _is_number(item.get("lat"))
-            or not _is_number(item.get("lng"))
-        ):
-            raise ValueError(f'starts[{i}] must be an object with numeric "lat" and "lng"')
-        out.append(cast(route_search.Start, item))
-    return out
-
-
-def _parse_way_ids(name: str, raw: str | list) -> list[int]:
-    parsed = json.loads(raw) if isinstance(raw, str) else raw
-    if not isinstance(parsed, list) or not all(isinstance(v, int) and not isinstance(v, bool) for v in parsed):
-        raise ValueError(f"{name} must be a JSON list of integer OSM way ids")
-    return parsed
-
-
-def _is_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
 def _start_summary(start: route_search.Start) -> dict:
     drive_s = start.get("drive_s")
     return {
@@ -91,6 +64,7 @@ def _candidate_summary(candidate: route_search.RouteCandidateOut) -> dict:
 def register_search_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     @threaded
+    @reporting(ValueError)
     def find_routes(
         area_id: int,
         start_lat: float | None = None,
@@ -107,7 +81,7 @@ def register_search_tools(mcp: FastMCP) -> None:
         avoid_way_ids: list[int] | None = None,
         include_way_ids: list[int] | None = None,
         n: int = 5,
-        starts: list[dict[str, object]] | None = None,
+        starts: list[route_search.Start] | None = None,
         seed: int | None = None,
     ) -> str:
         """
@@ -134,39 +108,36 @@ def register_search_tools(mcp: FastMCP) -> None:
         what it misses. The same seed, request, and network reproduce the same
         candidates; the seed used is always returned.
         """
-        try:
-            with db.connection() as conn:
-                start_list = route_search.resolve_starts(
-                    conn,
-                    area_id,
-                    starts=_parse_starts(starts) if starts else None,
-                    origin=(start_lat, start_lng) if start_lat is not None and start_lng is not None else None,
-                    max_drive_minutes=max_drive_minutes,
-                    drive_k=drive_k,
-                )
-                if distance_mi_min is None or distance_mi_max is None:
-                    return json.dumps({"error": "find_routes needs distance_mi_min and distance_mi_max"})
-                if shape not in ("loop", "out_and_back", "lollipop", "any"):
-                    return json.dumps({"error": f"invalid shape: {shape!r}"})
+        with db.connection() as conn:
+            start_list = route_search.resolve_starts(
+                conn,
+                area_id,
+                starts=starts,
+                origin=(start_lat, start_lng) if start_lat is not None and start_lng is not None else None,
+                max_drive_minutes=max_drive_minutes,
+                drive_k=drive_k,
+            )
+            if distance_mi_min is None or distance_mi_max is None:
+                raise ValueError("find_routes needs distance_mi_min and distance_mi_max")
+            if shape not in ("loop", "out_and_back", "lollipop", "any"):
+                raise ValueError(f"invalid shape: {shape!r}")
 
-                request: route_search.RouteSearchRequest = {
-                    "area_id": area_id,
-                    "starts": start_list,
-                    "distance_m_min": distance_mi_min * MILE_M,
-                    "distance_m_max": distance_mi_max * MILE_M,
-                    "shape": cast(route_search.Shape, shape),
-                    "n": n,
-                    "min_trail_m": None if min_trail_mi is None else min_trail_mi * MILE_M,
-                    "min_runnable_pct": min_runnable_pct,
-                    "gain_m_min": None if gain_ft_min is None else gain_ft_min / FT_PER_M,
-                    "gain_m_max": None if gain_ft_max is None else gain_ft_max / FT_PER_M,
-                    "avoid_way_ids": _parse_way_ids("avoid_way_ids", avoid_way_ids) if avoid_way_ids else None,
-                    "include_way_ids": _parse_way_ids("include_way_ids", include_way_ids) if include_way_ids else None,
-                    "seed": seed,
-                }
-                result = route_search.find_routes(conn, request)
-        except (ValueError, json.JSONDecodeError) as e:
-            return json.dumps({"error": str(e)})
+            request: route_search.RouteSearchRequest = {
+                "area_id": area_id,
+                "starts": start_list,
+                "distance_m_min": distance_mi_min * MILE_M,
+                "distance_m_max": distance_mi_max * MILE_M,
+                "shape": cast(route_search.Shape, shape),
+                "n": n,
+                "min_trail_m": None if min_trail_mi is None else min_trail_mi * MILE_M,
+                "min_runnable_pct": min_runnable_pct,
+                "gain_m_min": None if gain_ft_min is None else gain_ft_min / FT_PER_M,
+                "gain_m_max": None if gain_ft_max is None else gain_ft_max / FT_PER_M,
+                "avoid_way_ids": avoid_way_ids,
+                "include_way_ids": include_way_ids,
+                "seed": seed,
+            }
+            result = route_search.find_routes(conn, request)
 
         return json.dumps(
             {

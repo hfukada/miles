@@ -35,13 +35,10 @@ from .distance_builds import (
     _DISTANCE_CATEGORY,
 )
 from .areas_api import router as areas_api_router
-from .drive_api import router as drive_api_router
 from .fitness_api import router as fitness_api_router
 from .health_api import router as health_api_router
-from .network_api import router as network_api_router
 from .plan_api import router as plan_api_router
 from .routes_api import router as routes_api_router
-from .search_api import router as search_api_router
 from .terrain_api import router as terrain_api_router
 from .builds import Build, detect_builds
 from .derive import connect_derived as _conn, derive_all
@@ -1505,13 +1502,10 @@ def sync_status() -> sync.SyncStatus:
 # Must precede the catch-all static mount below.
 app.include_router(areas_api_router)
 app.include_router(distance_builds_router)
-app.include_router(drive_api_router)
 app.include_router(fitness_api_router)
 app.include_router(health_api_router)
-app.include_router(network_api_router)
 app.include_router(plan_api_router)
 app.include_router(routes_api_router)
-app.include_router(search_api_router)
 app.include_router(terrain_api_router)
 
 # Lift the MCP transport's exact-path /mcp route onto this app directly.

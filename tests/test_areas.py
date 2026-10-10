@@ -190,7 +190,7 @@ def test_gc_removes_stale_unpinned_areas_their_networks_and_orphaned_tiles(conn:
     fresh = datetime.now(timezone.utc).isoformat()
     for gx, gy, sha, owner in ((0, 0, "x", stale_id), (1, 1, "y", kept_id)):
         conn.execute(
-            "INSERT INTO map_tiles (gx, gy, query_version, fetched_at, sha256, data) VALUES (?, ?, 1, ?, ?, ?)",
+            "INSERT INTO map_tiles (gx, gy, query_version, fetched_at, sha256, data, source) VALUES (?, ?, 1, ?, ?, ?, 'x')",
             (gx, gy, fresh, sha, gzip.compress(b"{}")),
         )
         conn.execute("INSERT INTO area_tiles (area_id, gx, gy) VALUES (?, ?, ?)", (owner, gx, gy))
@@ -206,7 +206,7 @@ def test_gc_removes_stale_unpinned_areas_their_networks_and_orphaned_tiles(conn:
         )
     conn.execute(
         "INSERT INTO net_edges (area_id, way_id, highway, surface_class, from_node_id, to_node_id, length_m, "
-        "has_elevation, technicality_json, points_blob) VALUES (?, 5, 'path', 'dirt', 1, 2, 10, 0, '{}', x'00')",
+        "has_elevation, points_blob) VALUES (?, 5, 'path', 'dirt', 1, 2, 10, 0, x'00')",
         (stale_id,),
     )
     conn.commit()
@@ -490,8 +490,8 @@ def test_an_extract_cut_tile_is_as_of_the_extracts_own_date_and_a_merged_tile_th
     older, newer = (now - timedelta(days=200)).isoformat(), (now - timedelta(days=5)).isoformat()
     for region, as_of in (("r/x", newer), ("r/y", older)):
         conn.execute(
-            "INSERT INTO map_extracts (region, path, sha256, fetched_at, data_as_of) VALUES (?, '/p', 's', ?, ?)",
-            (region, now.isoformat(), as_of),
+            "INSERT INTO map_extracts (region, path, sha256, fetched_at, checked_at, data_as_of) VALUES (?, '/p', 's', ?, ?, ?)",
+            (region, now.isoformat(), now.isoformat(), as_of),
         )
     single = _insert_area(conn, "cut")
     _tile_row(conn, single, now.isoformat(), source="extract:r/y")

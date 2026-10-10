@@ -7,7 +7,9 @@ import time
 import urllib.error
 from collections import defaultdict
 from collections.abc import Callable, Collection
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 import click
 from typing_extensions import TypedDict
@@ -45,6 +47,19 @@ class SyncStatus(TypedDict):
     new_activities: int | None
 
 
+@dataclass
+class _SyncState:
+    status: str = "idle"
+    phase: str | None = None
+    done: int | None = None
+    total: int | None = None
+    until: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    error: str | None = None
+    new_activities: int | None = None
+
+
 class SyncProgress:
     """Thread-safe status for one sync run, polled by /api/sync/status and
     (optionally) echoed to the terminal by the CLI. Holds only the current phase —
@@ -54,79 +69,53 @@ class SyncProgress:
     def __init__(self, printer: Callable[[SyncStatus], None] | None = None) -> None:
         self._lock = threading.Lock()
         self._printer = printer
-        self._reset_locked()
-
-    def _reset_locked(self) -> None:
-        self._status = "idle"
-        self._phase: str | None = None
-        self._done: int | None = None
-        self._total: int | None = None
-        self._until: str | None = None
-        self._started_at: str | None = None
-        self._finished_at: str | None = None
-        self._error: str | None = None
-        self._new_activities: int | None = None
+        self._state = _SyncState()
 
     def _snapshot_locked(self) -> SyncStatus:
-        return {
-            "status": self._status,
-            "phase": self._phase,
-            "done": self._done,
-            "total": self._total,
-            "until": self._until,
-            "started_at": self._started_at,
-            "finished_at": self._finished_at,
-            "error": self._error,
-            "new_activities": self._new_activities,
-        }
+        return cast(SyncStatus, asdict(self._state))
 
     def _notify_locked(self) -> None:
         if self._printer is not None:
             self._printer(self._snapshot_locked())
 
+    def _start_locked(self) -> None:
+        self._state = _SyncState(status="running", started_at=datetime.now(timezone.utc).isoformat())
+        self._notify_locked()
+
     def start(self) -> None:
         with self._lock:
-            self._reset_locked()
-            self._status = "running"
-            self._started_at = datetime.now(timezone.utc).isoformat()
-            self._notify_locked()
+            self._start_locked()
 
     def try_start(self) -> bool:
         """Atomically switch to running unless a run is already in progress.
         Returns whether this call won the race and should launch the sync."""
         with self._lock:
-            if self._status == "running":
+            if self._state.status == "running":
                 return False
-            self._reset_locked()
-            self._status = "running"
-            self._started_at = datetime.now(timezone.utc).isoformat()
-            self._notify_locked()
+            self._start_locked()
             return True
 
     def phase(
         self, name: str, *, done: int | None = None, total: int | None = None, until: str | None = None
     ) -> None:
         with self._lock:
-            self._phase = name
-            self._done = done
-            self._total = total
-            self._until = until
+            self._state = replace(self._state, phase=name, done=done, total=total, until=until)
             self._notify_locked()
 
     def finish(self, new_activities: int) -> None:
         with self._lock:
-            self._status = "done"
-            self._phase = "done"
-            self._finished_at = datetime.now(timezone.utc).isoformat()
-            self._new_activities = new_activities
+            self._state = replace(
+                self._state, status="done", phase="done", new_activities=new_activities,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
             self._notify_locked()
 
     def fail(self, error: str) -> None:
         with self._lock:
-            self._status = "error"
-            self._phase = "error"
-            self._finished_at = datetime.now(timezone.utc).isoformat()
-            self._error = error
+            self._state = replace(
+                self._state, status="error", phase="error", error=error,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+            )
             self._notify_locked()
 
     def snapshot(self) -> SyncStatus:
@@ -136,7 +125,7 @@ class SyncProgress:
     @property
     def status(self) -> str:
         with self._lock:
-            return self._status
+            return self._state.status
 
 
 def _print_progress(snapshot: SyncStatus) -> None:

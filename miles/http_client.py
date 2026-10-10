@@ -150,7 +150,7 @@ def _wait_turn(policy: ServicePolicy, state: _State) -> None:
                     f"{policy.name} asked us to stay away; not contacting it for another "
                     f"{int((state.quiet_until - now) // 60) + 1} min"
                 )
-            metrics.inc(metrics.HTTP_WAIT_SECONDS, ready - now, service=policy.name)
+            metrics.HTTP_WAIT_SECONDS.labels(service=policy.name).inc(ready - now)
             time.sleep(ready - now)
         state.last_at = time.monotonic()
 
@@ -208,7 +208,7 @@ def _attempt_loop(policy: ServicePolicy, state: _State, send: Callable[[], T], h
         else:
             return result
         attempt += 1
-        metrics.inc(metrics.HTTP_RETRIES, service=policy.name)
+        metrics.HTTP_RETRIES.labels(service=policy.name).inc()
         state.stay_quiet_until(time.monotonic() + delay)
 
 

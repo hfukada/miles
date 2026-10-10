@@ -1,7 +1,7 @@
 """Resumable backfill of run streams for the terrain model.
 
 Fetches streams for every run activity with no raw stream file yet
-(streams.needs_streams_fetch), newest first, respecting Strava's read rate
+(streams.has_cached_streams), newest first, respecting Strava's read rate
 limits, and segments every activity whose streams are on disk but which has
 not been segmented (streams stored by some other path, an activity-page view
 for instance) or was segmented without fetching DEM tiles. Segmenting is
@@ -20,7 +20,6 @@ import time
 from collections.abc import Collection
 from datetime import date, datetime, timezone
 from typing import Protocol
-
 import click
 from stravalib.exc import Fault
 from typing_extensions import TypedDict
@@ -152,7 +151,7 @@ def refresh_backfill_queue(conn: sqlite3.Connection) -> int:
     start_dates: dict[int, str | None] = {}
     for row in rows:
         activity_id = row["activity_id"]
-        if streams.needs_streams_fetch(activity_id):
+        if not streams.has_cached_streams(activity_id):
             needed_ids.append(activity_id)
             start_dates[activity_id] = row["start_date"]
 
@@ -228,14 +227,23 @@ def run_backfill(
             if row is not None:
                 segmented_dates.append(date.fromisoformat(row["start_date"]))
 
-    for i, activity_id in enumerate(cached_unsegmented, 1):
+    def try_segment(activity_id: int, raw: object = None) -> bool:
+        """Store raw streams just fetched (if any) and segment one activity;
+        False after recording why that could not be done."""
         try:
+            if raw is not None:
+                streams.cache_streams(activity_id, raw)  # type: ignore[arg-type]
             segment(activity_id)
         except elevation.ElevationFetchError:
             raise
         except Exception as e:
             _logger.warning("terrain segmentation failed for activity %s", activity_id, exc_info=True)
             terrain.record_segmentation_failure(conn, activity_id, e)
+            return False
+        return True
+
+    for i, activity_id in enumerate(cached_unsegmented, 1):
+        try_segment(activity_id)
         progress.phase("segments", done=i, total=len(cached_unsegmented))
 
     progress.phase("streams", done=0, total=batch_total)
@@ -265,14 +273,7 @@ def run_backfill(
             if raw is None:
                 continue
             service_failures = 0
-            try:
-                streams.cache_streams(activity_id, raw)
-                segment(activity_id)
-            except elevation.ElevationFetchError:
-                raise
-            except Exception as e:
-                _logger.warning("terrain backfill failed for activity %s", activity_id, exc_info=True)
-                terrain.record_segmentation_failure(conn, activity_id, e)
+            if not try_segment(activity_id, raw):
                 continue
             conn.execute("DELETE FROM terrain_backfill_queue WHERE activity_id = ?", [activity_id])
             conn.commit()
@@ -282,8 +283,7 @@ def run_backfill(
         _logger.info("stream fetch stopped: %s", e)
 
     if segmented_dates:
-        settings = terrain.get_settings(conn)
-        terrain.backfill_snapshots(conn, settings["rolling_window_days"], since=min(segmented_dates))
+        terrain.backfill_snapshots(conn, terrain.ROLLING_WINDOW_DAYS, since=min(segmented_dates))
     return fetched
 
 

@@ -260,7 +260,7 @@ def parse_osrm_coords(url: str) -> list[tuple[float, float]]:
 
 
 class FakeOsrm:
-    """Stands in for drive_starts._fetch_with_backoff. The answer is a table
+    """Stands in for the OSRM request drive_starts makes through http_client. The answer is a table
     row whose durations are straight-line kilometres times `seconds_per_km`
     (90 by default, slower than the module's prefilter ceiling, so a candidate
     can pass the prefilter and still miss the budget). `fail_with` raises,
@@ -344,12 +344,12 @@ def write_pbf(path: Path, nodes: list[tuple[int, float, float, dict]], ways: lis
 
 
 def fake_extract_record(region: str = "test/region") -> extracts.ExtractRecord:
-    """A registered-extract row whose bounds cover the world, for tests that
-    stub out the file itself."""
+    """A registered-extract row for tests that stub out the file itself."""
     return {
         "region": region, "path": "/nonexistent.osm.pbf", "sha256": "x",
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "bounds_south": -90.0, "bounds_west": -180.0, "bounds_north": 90.0, "bounds_east": 180.0,
+        "checked_at": datetime.now(timezone.utc).isoformat(), "data_as_of": datetime.now(timezone.utc).isoformat(),
+        "etag": None, "last_modified": None,
     }
 
 

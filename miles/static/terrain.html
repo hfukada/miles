@@ -29,14 +29,7 @@
       color: var(--text);
     }
 
-    .terrain-view section h2 {
-      font-size: 0.9375rem;
-      font-weight: 600;
-      color: var(--text);
-      letter-spacing: -0.01em;
-      margin-bottom: 0.25rem;
-    }
-    .terrain-view .desc { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.875rem; max-width: 68ch; }
+    .terrain-view .desc { max-width: 68ch; }
     .terrain-view .chart-wrap { height: 300px; }
     .terrain-view .trend-controls { margin-bottom: 0.75rem; }
   </style>
@@ -190,16 +183,21 @@
       chartValueAxis(theme, { min: 0, max: 100, name: '%' }));
   }
 
-  async function loadOnsetTrend() {
-    let points;
+  // The trend points for a query string, or null after showing the failure in the chart's container.
+  async function fetchTrend(query, containerId) {
     try {
-      const res = await fetch('/api/terrain/trend?metric=walk_onset_grade_pct');
+      const res = await fetch(`/api/terrain/trend?${query}`);
       if (!res.ok) throw new Error('Failed to load trend.');
-      points = await res.json();
+      return await res.json();
     } catch (e) {
-      document.getElementById('chart-onset-trend').innerHTML = `<div class="error">${e.message}</div>`;
-      return;
+      document.getElementById(containerId).innerHTML = `<div class="error">${e.message}</div>`;
+      return null;
     }
+  }
+
+  async function loadOnsetTrend() {
+    const points = await fetchTrend('metric=walk_onset_grade_pct', 'chart-onset-trend');
+    if (!points) return;
     const theme = chartTheme();
     if (!onsetTrendChart) onsetTrendChart = echarts.init(document.getElementById('chart-onset-trend'));
     onsetTrendChart.setOption(trendOption(theme, points, 'Walk onset', '%', (v) => `${v.toFixed(1)}%`, false));
@@ -222,15 +220,10 @@
     const bins = profile.bins.filter(b => b.lo_pct > -999 && b.hi_pct < 999);
     const band = bins[selectedBandIdx];
     if (!band) return;
-    let points;
-    try {
-      const res = await fetch(`/api/terrain/trend?metric=median_speed_mps&grade_min_pct=${band.lo_pct}&grade_max_pct=${band.hi_pct}`);
-      if (!res.ok) throw new Error('Failed to load trend.');
-      points = await res.json();
-    } catch (e) {
-      document.getElementById('chart-speed-trend').innerHTML = `<div class="error">${e.message}</div>`;
-      return;
-    }
+    const points = await fetchTrend(
+      `metric=median_speed_mps&grade_min_pct=${band.lo_pct}&grade_max_pct=${band.hi_pct}`, 'chart-speed-trend'
+    );
+    if (!points) return;
     const paceSeries = points.map(p => ({ as_of: p.as_of, value: speedToPace(p.value) }));
     const theme = chartTheme();
     if (!speedTrendChart) speedTrendChart = echarts.init(document.getElementById('chart-speed-trend'));

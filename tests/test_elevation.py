@@ -36,7 +36,7 @@ def _tile_png(meters: float) -> bytes:
 
 def _cache_tile(conn: sqlite3.Connection, zoom: int, tx: int, ty: int, data: bytes) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO elevation_tiles (provider, zoom, x, y, fetched_at, data) VALUES ('terrarium', ?, ?, ?, 'now', ?)",
+        "INSERT OR REPLACE INTO elevation_tiles (zoom, x, y, fetched_at, data) VALUES (?, ?, ?, 'now', ?)",
         (zoom, tx, ty, data),
     )
     conn.commit()

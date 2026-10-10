@@ -1,6 +1,6 @@
 """Regional OpenStreetMap extracts (Geofabrik .osm.pbf), the only map source
 for area import. A registered extract is ground truth like an uploaded GPX
-(adr/0002, adr/0003): its file, sha256, and header bounds are only replaced
+(adr/0002, adr/0003): its file and sha256 are only replaced
 wholesale on an explicit refresh, never by age. A refresh is a conditional
 request that a 304 answers without a download.
 
@@ -88,10 +88,6 @@ class ExtractRecord(TypedDict):
     path: str
     sha256: str
     fetched_at: str
-    bounds_south: float | None
-    bounds_west: float | None
-    bounds_north: float | None
-    bounds_east: float | None
     # When the file was last confirmed current (a download or a 304).
     checked_at: str
     # The server's Last-Modified (ISO, UTC) when it gave one, else fetched_at:
@@ -99,9 +95,6 @@ class ExtractRecord(TypedDict):
     data_as_of: str
     etag: str | None
     last_modified: str | None
-
-
-_EXTRA_COLUMNS = ("checked_at TEXT", "data_as_of TEXT", "etag TEXT", "last_modified TEXT")
 
 
 def _large_extracts_allowed() -> bool:
@@ -115,24 +108,18 @@ def init_extract_schema(conn: sqlite3.Connection) -> None:
             path          TEXT NOT NULL,
             sha256        TEXT NOT NULL,
             fetched_at    TEXT NOT NULL,
-            bounds_south  REAL,
-            bounds_west   REAL,
-            bounds_north  REAL,
-            bounds_east   REAL,
-            checked_at    TEXT,
-            data_as_of    TEXT,
+            checked_at    TEXT NOT NULL,
+            data_as_of    TEXT NOT NULL,
             etag          TEXT,
             last_modified TEXT
         )
     """)
-    db.add_missing_columns(conn, "map_extracts", *_EXTRA_COLUMNS)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS extract_requests (
             region       TEXT PRIMARY KEY,
             requested_at TEXT NOT NULL
         )
     """)
-    conn.execute("DROP TABLE IF EXISTS extract_attempts")
     geofabrik.init_index_schema(conn)
     conn.commit()
 
@@ -148,12 +135,8 @@ def _row_to_record(row: sqlite3.Row) -> ExtractRecord:
         "path": row["path"],
         "sha256": row["sha256"],
         "fetched_at": row["fetched_at"],
-        "bounds_south": row["bounds_south"],
-        "bounds_west": row["bounds_west"],
-        "bounds_north": row["bounds_north"],
-        "bounds_east": row["bounds_east"],
-        "checked_at": row["checked_at"] or row["fetched_at"],
-        "data_as_of": row["data_as_of"] or row["fetched_at"],
+        "checked_at": row["checked_at"],
+        "data_as_of": row["data_as_of"],
         "etag": row["etag"],
         "last_modified": row["last_modified"],
     }
@@ -168,35 +151,8 @@ def list_extracts(conn: sqlite3.Connection) -> list[ExtractRecord]:
     return [_row_to_record(r) for r in conn.execute("SELECT * FROM map_extracts ORDER BY region").fetchall()]
 
 
-def _extract_bounds(record: ExtractRecord) -> tuple[float, float, float, float] | None:
-    south, west, north, east = record["bounds_south"], record["bounds_west"], record["bounds_north"], record["bounds_east"]
-    if south is None or west is None or north is None or east is None:
-        return None
-    return (south, west, north, east)
-
-
+# Region name for an extract registered from a file the user supplies.
 LOCAL_REGION_PREFIX = "local:"
-
-
-def find_registered_extract(
-    conn: sqlite3.Connection, bbox: tuple[float, float, float, float], *, local_only: bool = False
-) -> ExtractRecord | None:
-    """The smallest registered extract whose header bounds contain bbox, with
-    no network I/O. A header bbox usually reaches across the region's borders,
-    so a hit does not mean the region's polygon covers the area;
-    select_extracts trusts it only for local extracts or with no stored
-    region index. local_only restricts to extracts registered from a file."""
-    candidates: list[tuple[float, ExtractRecord]] = []
-    for record in list_extracts(conn):
-        if local_only and not record["region"].startswith(LOCAL_REGION_PREFIX):
-            continue
-        bounds = _extract_bounds(record)
-        if bounds is not None and tiles.bbox_within(bbox, bounds):
-            area = (bounds[2] - bounds[0]) * (bounds[3] - bounds[1])
-            candidates.append((area, record))
-    if not candidates:
-        return None
-    return min(candidates, key=lambda t: t[0])[1]
 
 
 def split_regions(value: str | Sequence[str] | None) -> list[str]:
@@ -237,27 +193,14 @@ def planned_regions(
     allow_network, only stored data is used and the result is empty when it
     can't say; with it, a missing index is fetched, a preferred region is
     validated, and an uncovered area is an error. Raises geofabrik.RegionError."""
-    local = find_registered_extract(conn, bbox, local_only=True)
-    if local is not None:
-        return [local["region"]]
     paths = split_regions(preferred_region)
     if paths:
         if allow_network:
             for path in paths:
                 geofabrik.validate_region(conn, path)
         return paths
-    found = find_registered_extract(conn, bbox)
-    if found is not None and geofabrik.cached_regions(conn) is None:
-        return [found["region"]]
-    try:
-        covering = geofabrik.choose_regions(conn, bbox) if allow_network else geofabrik.choose_cached_regions(conn, bbox)
-    except geofabrik.RegionError:
-        if found is None:
-            raise
-        covering = None
-    if covering:
-        return covering
-    return [found["region"]] if found is not None else []
+    covering = geofabrik.choose_regions(conn, bbox) if allow_network else geofabrik.choose_cached_regions(conn, bbox)
+    return covering or []
 
 
 # Called with the bytes written so far and the declared size (None if none).
@@ -294,12 +237,6 @@ def _refreshed(
     on_wait: Callable[[], None] | None = None,
     on_progress: DownloadProgress | None = None,
 ) -> ExtractRecord:
-    if extract["region"].startswith(LOCAL_REGION_PREFIX):
-        if not Path(extract["path"]).is_file():
-            raise ExtractDownloadError(
-                f"the file registered for {extract['region']} is missing; register it again with miles-area-import --pbf"
-            )
-        return extract
     if not Path(extract["path"]).is_file():
         return download_extract(conn, extract["region"], force=force, on_wait=on_wait, on_progress=on_progress)
     if not refresh and not force:
@@ -338,17 +275,12 @@ def select_extracts(
 ) -> list[ExtractRecord]:
     """The extracts to cut bbox from, in order of precedence:
 
-    - the smallest local-file (`local:`) extract whose header bounds contain
-      bbox, since it has no region boundary to consult;
     - the preferred_region (one path or several), if given;
     - the cheapest Geofabrik regions whose boundaries cover bbox
-      (geofabrik.choose_regions), once the region index is stored;
-    - the smallest registered extract whose header bounds contain bbox, only
-      when no index has been stored or no region in it covers bbox.
+      (geofabrik.choose_regions).
 
-    Header bounds are not used for coverage while the index is available: they
-    reach across borders. Paths are looked up in the registry; a missing
-    region or file is downloaded, one after another.
+    Paths are looked up in the registry; a missing region or file is
+    downloaded, one after another.
 
     refresh=True first asks Geofabrik for a newer file (see download_extract);
     one that can't be refreshed is used as is. force=True replaces the file
@@ -380,24 +312,21 @@ def select_extracts(
 def tile_extracts(
     conn: sqlite3.Connection, selected: Sequence[ExtractRecord], tile_ids: Iterable[tuple[int, int]]
 ) -> dict[tuple[int, int], list[ExtractRecord]]:
-    """The extracts each tile is cut from: every registered Geofabrik extract
-    with its file present whose region polygon shares area with the tile (the
-    header bbox when the index doesn't list the region), plus the selected
-    extracts that do. One with neither polygon nor header bounds touches only
-    a selected one's tiles. A region is dropped from a tile when a registered
-    region nested under its path contains the whole tile, as the parent is far
-    larger to read; a tile straddling the child's edge keeps the parent. With
-    a local-file selection the selection alone is used, and a tile no extract
-    touches falls back to the selection."""
+    """The extracts each tile is cut from: every registered extract with its
+    file present whose region polygon (from the stored Geofabrik index) shares
+    area with the tile, plus the selected extracts. A region missing from the
+    index touches only the tiles of a selected extract. A region is dropped
+    from a tile when a registered region nested under its path contains the
+    whole tile, as the parent is far larger to read; a tile straddling the
+    child's edge keeps the parent. A tile no extract touches falls back to
+    the selection."""
     tile_list = list(tile_ids)
-    if any(e["region"].startswith(LOCAL_REGION_PREFIX) for e in selected):
-        return {t: list(selected) for t in tile_list}
     known = geofabrik.cached_regions(conn)
     by_path = {r.path: r for r in known} if known is not None else {}
     chosen = {e["region"] for e in selected}
     others = [
         e for e in list_extracts(conn)
-        if e["region"] not in chosen and not e["region"].startswith(LOCAL_REGION_PREFIX) and Path(e["path"]).is_file()
+        if e["region"] not in chosen and Path(e["path"]).is_file()
     ]
     candidates = [*selected, *others]
 
@@ -405,17 +334,11 @@ def tile_extracts(
         region = by_path.get(e["region"])
         if region is not None:
             return geofabrik.intersects(region, bounds)
-        header = _extract_bounds(e)
-        if header is None:
-            return e["region"] in chosen
-        return tiles.bbox_overlaps(header, bounds)
+        return e["region"] in chosen
 
     def contains(e: ExtractRecord, bounds: tuple[float, float, float, float]) -> bool:
         region = by_path.get(e["region"])
-        if region is not None:
-            return geofabrik.contains_bbox(region, bounds)
-        header = _extract_bounds(e)
-        return header is not None and tiles.bbox_within(bounds, header)
+        return region is not None and geofabrik.contains_bbox(region, bounds)
 
     def without_ancestors(touching: list[ExtractRecord], bounds: tuple[float, float, float, float]) -> list[ExtractRecord]:
         holders = [e["region"] for e in touching if contains(e, bounds)]
@@ -455,37 +378,6 @@ def tiles_cut_from(
         ):
             return False
     return True
-
-
-# ---------------------------------------------------------------------------
-# Bounds from a pbf's own header
-# ---------------------------------------------------------------------------
-
-
-def _scan_bounds(path: Path) -> tuple[float, float, float, float] | None:
-    """Fallback when a pbf's header carries no bbox: one pass over every
-    node's coordinates."""
-    lats: list[float] = []
-    lons: list[float] = []
-    for obj in osmium.FileProcessor(str(path), osmium.osm.osm_entity_bits.NODE):
-        if not isinstance(obj, osmium.osm.Node):
-            continue
-        lats.append(obj.location.lat)
-        lons.append(obj.location.lon)
-    if not lats:
-        return None
-    return (min(lats), min(lons), max(lats), max(lons))
-
-
-def _read_bounds(path: Path) -> tuple[float, float, float, float] | None:
-    reader = osmium.io.Reader(str(path), osmium.osm.osm_entity_bits.NOTHING)
-    try:
-        box = reader.header().box()
-        if box.valid():
-            return (box.bottom_left.lat, box.bottom_left.lon, box.top_right.lat, box.top_right.lon)
-    finally:
-        reader.close()
-    return _scan_bounds(path)
 
 
 def _sha256_file(path: Path) -> str:
@@ -533,23 +425,19 @@ def register_local_extract(
     if not path.is_file():
         raise ExtractDownloadError(f"no such file: {path}")
     sha256 = _sha256_file(path)
-    bounds = _read_bounds(path) or (None, None, None, None)
     now = datetime.now(timezone.utc).isoformat()
     data_as_of = _http_date_to_iso(last_modified) or now
     conn.execute(
         """
         INSERT INTO map_extracts (
-            region, path, sha256, fetched_at, bounds_south, bounds_west, bounds_north, bounds_east,
-            checked_at, data_as_of, etag, last_modified
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            region, path, sha256, fetched_at, checked_at, data_as_of, etag, last_modified
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(region) DO UPDATE SET
             path = excluded.path, sha256 = excluded.sha256, fetched_at = excluded.fetched_at,
-            bounds_south = excluded.bounds_south, bounds_west = excluded.bounds_west,
-            bounds_north = excluded.bounds_north, bounds_east = excluded.bounds_east,
             checked_at = excluded.checked_at, data_as_of = excluded.data_as_of,
             etag = excluded.etag, last_modified = excluded.last_modified
         """,
-        (region, str(path), sha256, now, *bounds, now, data_as_of, etag, last_modified),
+        (region, str(path), sha256, now, now, data_as_of, etag, last_modified),
     )
     conn.commit()
     record = get_extract(conn, region)
@@ -588,14 +476,11 @@ def _head_info(requested: str) -> Callable[[object], tuple[str, int | None]]:
 def _published_md5(file_url: str) -> str:
     """The digest published beside file_url, which must be the URL the body was
     served from: `-latest` redirects to a dated file, and a rebuild in between
-    would pair a new digest with an old file. One retry on a network failure."""
-    for attempt in range(2):
-        try:
-            return _md5_of(http_client.request(http_client.GEOFABRIK, f"{file_url}.md5"))
-        except (OSError, http.client.HTTPException) as e:
-            if attempt == 1:
-                raise ExtractChecksumUnavailableError(f"could not fetch the checksum for {file_url}: {e}") from e
-    raise AssertionError("unreachable")
+    would pair a new digest with an old file."""
+    try:
+        return _md5_of(http_client.request(http_client.GEOFABRIK, f"{file_url}.md5"))
+    except (OSError, http.client.HTTPException) as e:
+        raise ExtractChecksumUnavailableError(f"could not fetch the checksum for {file_url}: {e}") from e
 
 
 def _sweep_stale_parts(directory: Path) -> None:
@@ -788,8 +673,6 @@ def download_extract(
     per-region lock stops two importers fetching one file; a waiter then uses
     the holder's file. on_wait is called once if the lock is taken;
     on_progress receives bytes written and expected total (not for a 304)."""
-    if region.startswith(LOCAL_REGION_PREFIX):
-        raise ExtractDownloadError(f"{region} is registered from a local file and cannot be downloaded")
     existing, validators = _validators_for(conn, region, refresh, force)
     if validators is None:
         assert existing is not None
@@ -813,34 +696,29 @@ def download_extract(
         path.parent.mkdir(parents=True, exist_ok=True)
         _sweep_stale_parts(path.parent)
         url = f"{(base_url or GEOFABRIK_BASE_URL).rstrip('/')}/{region}-latest.osm.pbf"
-        try:
-            downloaded = _download_with_backoff(
-                url,
-                path,
-                validators,
-                allow_large=allow_large,
-                on_progress=on_progress,
-                on_request=lambda: _stamp_request(conn, region),
+        downloaded = _download_with_backoff(
+            url,
+            path,
+            validators,
+            allow_large=allow_large,
+            on_progress=on_progress,
+            on_request=lambda: _stamp_request(conn, region),
+        )
+        if downloaded is None:
+            assert existing is not None
+            metrics.cache("extract", "not_modified")
+            conn.execute(
+                "UPDATE map_extracts SET checked_at = ? WHERE region = ?",
+                (datetime.now(timezone.utc).isoformat(), region),
             )
-            if downloaded is None:
-                assert existing is not None
-                metrics.cache("extract", "not_modified")
-                conn.execute(
-                    "UPDATE map_extracts SET checked_at = ? WHERE region = ?",
-                    (datetime.now(timezone.utc).isoformat(), region),
-                )
-                conn.commit()
-                refreshed = get_extract(conn, region)
-                assert refreshed is not None
-                return refreshed
-            metrics.cache("extract", "miss")
-            record = register_local_extract(
-                conn, path, region, etag=downloaded["etag"], last_modified=downloaded["last_modified"]
-            )
-        except Exception as e:
-            _logger.warning("extract download for %s failed: %s", region, e)
-            raise
-        return record
+            conn.commit()
+            refreshed = get_extract(conn, region)
+            assert refreshed is not None
+            return refreshed
+        metrics.cache("extract", "miss")
+        return register_local_extract(
+            conn, path, region, etag=downloaded["etag"], last_modified=downloaded["last_modified"]
+        )
     finally:
         lock.release()
 

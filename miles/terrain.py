@@ -18,7 +18,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Callable, Literal, Sequence, cast
+from typing import Literal, Sequence, cast
 from typing_extensions import TypedDict
 
 import pandas as pd
@@ -48,10 +48,10 @@ TERRAIN_SPORT_TYPES = tuple(t for t in races.RUN_SPORT_TYPES if t != "VirtualRun
 ELE_SOURCE_RECORDED = 0
 ELE_SOURCE_DEM = 1
 
-WALK_THRESHOLD_SPM_DEFAULT = 130.0
+WALK_THRESHOLD_SPM = 130.0
 # Used only when the cadence stream is missing outright.
 WALK_SPEED_FALLBACK_MPS = 2.2
-ROLLING_WINDOW_DAYS_DEFAULT = 90
+ROLLING_WINDOW_DAYS = 90
 
 GRADE_BIN_WIDTH_PCT = 2.0
 GRADE_BIN_MIN_PCT = -30.0
@@ -93,28 +93,7 @@ class TerrainDataError(ValueError):
 # ---------------------------------------------------------------------------
 
 
-def _drop_legacy_terrain_segments(conn: sqlite3.Connection) -> None:
-    """terrain_segments is derived, so a layout change drops it for
-    rebuild_terrain to repopulate rather than migrating rows. Fires only for a
-    table with the old grade_pct column (the current one has grade_dpct)."""
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(terrain_segments)").fetchall()}
-    if cols and "grade_dpct" not in cols:
-        conn.execute("DROP TABLE terrain_segments")
-
-
 def init_terrain_schema(conn: sqlite3.Connection) -> None:
-    _drop_legacy_terrain_segments(conn)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS terrain_settings (
-            id                   INTEGER PRIMARY KEY CHECK (id = 1),
-            walk_threshold_spm   REAL NOT NULL,
-            rolling_window_days  INTEGER NOT NULL
-        )
-    """)
-    conn.execute(
-        "INSERT OR IGNORE INTO terrain_settings (id, walk_threshold_spm, rolling_window_days) VALUES (1, ?, ?)",
-        [WALK_THRESHOLD_SPM_DEFAULT, ROLLING_WINDOW_DAYS_DEFAULT],
-    )
     # Values are compact integers (tenths of a percent/degree, cm/s, whole
     # seconds) rather than REAL: far smaller per row at multi-year row counts,
     # and precise enough. WITHOUT ROWID because (activity_id, idx) is already
@@ -150,12 +129,6 @@ def init_terrain_schema(conn: sqlite3.Connection) -> None:
             needs_dem     INTEGER NOT NULL DEFAULT 0
         )
     """)
-    db.add_missing_columns(
-        conn,
-        "terrain_segment_dates",
-        "segment_count INTEGER NOT NULL DEFAULT 1",
-        "needs_dem INTEGER NOT NULL DEFAULT 0",
-    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_terrain_segment_dates_date ON terrain_segment_dates(start_date)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS terrain_snapshots (
@@ -191,7 +164,6 @@ def init_terrain_schema(conn: sqlite3.Connection) -> None:
             model_version TEXT
         )
     """)
-    db.add_missing_columns(conn, "terrain_backfill_failures", "model_version TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS terrain_backfill_status (
             id          INTEGER PRIMARY KEY CHECK (id = 1),
@@ -227,48 +199,6 @@ def connect() -> sqlite3.Connection:
     conn.close()
     start_background_rebuild()
     raise TerrainRebuildingError("the terrain model is being rebuilt after an update; try again in a few minutes")
-
-
-class TerrainSettings(TypedDict):
-    walk_threshold_spm: float
-    rolling_window_days: int
-
-
-def get_settings(conn: sqlite3.Connection) -> TerrainSettings:
-    row = conn.execute(
-        "SELECT walk_threshold_spm, rolling_window_days FROM terrain_settings WHERE id = 1"
-    ).fetchone()
-    if row is None:
-        return {"walk_threshold_spm": WALK_THRESHOLD_SPM_DEFAULT, "rolling_window_days": ROLLING_WINDOW_DAYS_DEFAULT}
-    return {"walk_threshold_spm": row["walk_threshold_spm"], "rolling_window_days": row["rolling_window_days"]}
-
-
-def update_settings(
-    conn: sqlite3.Connection,
-    *,
-    walk_threshold_spm: float | None = None,
-    rolling_window_days: int | None = None,
-) -> TerrainSettings:
-    """Changing walk_threshold_spm reclassifies every segment, so it forces a
-    full resegmentation."""
-    current = get_settings(conn)
-    new_walk = walk_threshold_spm if walk_threshold_spm is not None else current["walk_threshold_spm"]
-    new_window = rolling_window_days if rolling_window_days is not None else current["rolling_window_days"]
-    conn.execute(
-        """
-        INSERT INTO terrain_settings (id, walk_threshold_spm, rolling_window_days) VALUES (1, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            walk_threshold_spm = excluded.walk_threshold_spm,
-            rolling_window_days = excluded.rolling_window_days
-        """,
-        [new_walk, new_window],
-    )
-    conn.commit()
-    if walk_threshold_spm is not None and walk_threshold_spm != current["walk_threshold_spm"]:
-        rebuild_terrain(conn, full=True)
-    elif new_window != current["rolling_window_days"]:
-        backfill_snapshots(conn, new_window)
-    return {"walk_threshold_spm": new_walk, "rolling_window_days": new_window}
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +338,7 @@ def default_model() -> TerrainModel:
     neutral_temp = [(lo, hi, 1.0) for lo, hi in zip(TEMP_BAND_EDGES_C, TEMP_BAND_EDGES_C[1:])]
     return TerrainModel(
         as_of=date.today().isoformat(),
-        window_days=ROLLING_WINDOW_DAYS_DEFAULT,
+        window_days=ROLLING_WINDOW_DAYS,
         walk_onset_grade_pct=_DEFAULT_WALK_ONSET_PCT,
         descent_comfort_grade_pct=_DEFAULT_DESCENT_COMFORT_PCT,
         confidence="low",
@@ -484,12 +414,10 @@ def _derive_bands(
 
 
 def current_model(
-    conn: sqlite3.Connection, window_days: int | None = None, as_of: date | None = None
+    conn: sqlite3.Connection, window_days: int = ROLLING_WINDOW_DAYS, as_of: date | None = None
 ) -> TerrainModel:
     """The athlete's model over a trailing window; bins with fewer than
     MIN_SAMPLES_FOR_BIN samples use default_model()'s."""
-    settings = get_settings(conn)
-    window_days = window_days if window_days is not None else settings["rolling_window_days"]
     as_of = as_of or date.today()
     start_date = (as_of - timedelta(days=window_days)).isoformat()
     end_date = as_of.isoformat()
@@ -809,21 +737,24 @@ def segment_cached_activity(
     df: pd.DataFrame | None = None,
     *,
     fetch_dem: bool = False,
+    dem_sampler: elevation.ElevationSampler | None = None,
 ) -> int:
     """Segment one run from its cached streams (df, if already loaded) and
     store the result. Returns the segments stored; 0 for a non-terrain sport,
     an unsynced activity, or no usable elevation. fetch_dem downloads the
-    tiles the track crosses (the backfill's call to make); otherwise the
-    activity keeps recorded altitude and is flagged for a later pass."""
+    tiles the track crosses (the backfill's call to make); otherwise only
+    cached tiles are read, and an activity they do not cover keeps recorded
+    altitude and is flagged for a later pass. dem_sampler lets a caller
+    segmenting many activities share one sampler's tile memo."""
     row = conn.execute(
         "SELECT sport_type, start_date FROM activities WHERE activity_id = ?", [activity_id]
     ).fetchone()
     if row is None or row["sport_type"] not in TERRAIN_SPORT_TYPES:
         return 0
-    stream_df = df if df is not None else load_stream_file(activity_id, streams.get_stream_dataframe)
-    dem_sampler = None
+    stream_df = df if df is not None else load_stream_file(activity_id)
     if fetch_dem:
         elevation.ensure_tiles(conn, points=_stream_fixes(stream_df))
+    if dem_sampler is None:
         dem_sampler = elevation.sampler_for(conn)
     n = segment_and_store_activity(
         conn,
@@ -831,7 +762,7 @@ def segment_cached_activity(
         stream_df,
         (row["start_date"] or "")[:10],
         activity_temp_c(conn, activity_id, stream_df),
-        get_settings(conn)["walk_threshold_spm"],
+        WALK_THRESHOLD_SPM,
         dem_sampler=dem_sampler,
         dem_fetch=fetch_dem,
     )
@@ -930,21 +861,15 @@ def start_background_rebuild() -> None:
 
 
 
-# A rebuild commits every this many activities rather than holding one write
-# transaction that would block other writers. The model version is stamped
-# last, so a rebuild cut short reads as stale.
-REBUILD_COMMIT_EVERY = 25
-
-
 class StreamFileError(Exception):
     """The raw stream file of an activity could not be read."""
 
 
-def load_stream_file(activity_id: int, loader: Callable[[int], pd.DataFrame]) -> pd.DataFrame:
+def load_stream_file(activity_id: int) -> pd.DataFrame:
     """Read an activity's cached streams; an unreadable file is discarded for
     the backfill to refetch."""
     try:
-        return loader(activity_id)
+        return streams.get_stream_dataframe(activity_id)
     except Exception as e:
         streams.discard_raw_streams(activity_id)
         raise StreamFileError(f"unreadable stream file: {e}") from e
@@ -992,7 +917,6 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
     required after a model_version_tag() bump."""
     full = full or not model_is_current(conn)
 
-    settings = get_settings(conn)
     if full:
         already_segmented: set[int] = set()
     else:
@@ -1006,7 +930,7 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
     for table in ("terrain_segments", "terrain_segment_dates"):
         conn.execute(f"DELETE FROM {table} WHERE activity_id NOT IN ({eligible})", list(TERRAIN_SPORT_TYPES))
     rows = conn.execute(
-        f"SELECT activity_id, start_date FROM activities WHERE sport_type IN ({placeholders}) ORDER BY start_date DESC",
+        f"SELECT activity_id FROM activities WHERE sport_type IN ({placeholders}) ORDER BY start_date DESC",
         list(TERRAIN_SPORT_TYPES),
     ).fetchall()
 
@@ -1014,20 +938,14 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
     dem_sampler = elevation.sampler_for(conn)
 
     segmented = 0
-    examined = 0
     for row in rows:
         activity_id = row["activity_id"]
         if activity_id in skipped:
             continue
-        if streams.needs_streams_fetch(activity_id):
+        if not streams.has_cached_streams(activity_id):
             continue  # backfill hasn't reached this activity yet
         try:
-            stream_df = load_stream_file(activity_id, streams.fetch_and_cache_streams)
-            temp_c = activity_temp_c(conn, activity_id, stream_df)
-            start_date = (row["start_date"] or "")[:10]
-            n = segment_and_store_activity(
-                conn, activity_id, stream_df, start_date, temp_c, settings["walk_threshold_spm"], dem_sampler=dem_sampler
-            )
+            n = segment_cached_activity(conn, activity_id, dem_sampler=dem_sampler)
         except sqlite3.Error:
             raise
         except Exception as e:
@@ -1039,17 +957,14 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
             continue
         if n:
             segmented += 1
-        examined += 1
-        if examined % REBUILD_COMMIT_EVERY == 0:
-            conn.commit()
 
     db.set_meta(conn, "terrain_model_version", model_version_tag())
     conn.commit()
 
     if full:
-        snapshots = backfill_snapshots(conn, settings["rolling_window_days"])
+        snapshots = backfill_snapshots(conn, ROLLING_WINDOW_DAYS)
     else:
-        record_snapshot(conn, window_days=settings["rolling_window_days"])
+        record_snapshot(conn)
         snapshots = 1
     return {"activities_segmented": segmented, "snapshots": snapshots}
 
@@ -1059,9 +974,7 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
 # ---------------------------------------------------------------------------
 
 
-def record_snapshot(conn: sqlite3.Connection, as_of: date | None = None, window_days: int | None = None) -> None:
-    settings = get_settings(conn)
-    window_days = window_days if window_days is not None else settings["rolling_window_days"]
+def record_snapshot(conn: sqlite3.Connection, as_of: date | None = None, window_days: int = ROLLING_WINDOW_DAYS) -> None:
     as_of = as_of or date.today()
     model = current_model(conn, window_days=window_days, as_of=as_of)
     bins_payload = [asdict(b) for b in model.bins]
@@ -1131,7 +1044,7 @@ class TerrainProfile(TypedDict):
     bins: list[TerrainProfileBin]
 
 
-def get_terrain_profile(conn: sqlite3.Connection, window_days: int | None = None) -> TerrainProfile:
+def get_terrain_profile(conn: sqlite3.Connection, window_days: int = ROLLING_WINDOW_DAYS) -> TerrainProfile:
     model = current_model(conn, window_days=window_days)
     return {
         "as_of": model.as_of,
@@ -1157,18 +1070,15 @@ def get_terrain_trend(
     metric: str,
     grade_range: tuple[float, float] | None = None,
     since: str | None = None,
-    window_days: int | None = None,
+    window_days: int = ROLLING_WINDOW_DAYS,
 ) -> list[TerrainTrendPoint]:
-    """One point per snapshot date, from snapshots taken with window_days
-    (default: the current setting). Bins averaged into a bin-based metric
+    """One point per snapshot date, from snapshots taken with window_days. Bins averaged into a bin-based metric
     need MIN_SAMPLES_FOR_BIN samples."""
     if metric not in _SCALAR_TREND_METRICS and metric not in _BIN_TREND_METRICS:
         raise ValueError(f"Unknown terrain trend metric: {metric!r}")
     if metric in _BIN_TREND_METRICS and grade_range is None:
         raise ValueError(f"metric {metric!r} needs a grade_range")
 
-    if window_days is None:
-        window_days = get_settings(conn)["rolling_window_days"]
     sql = (
         "SELECT as_of, walk_onset_grade_pct, descent_comfort_grade_pct, bins_json "
         "FROM terrain_snapshots WHERE window_days = ?"
@@ -1366,7 +1276,7 @@ def analyze_activity_terrain(conn: sqlite3.Connection, activity_id: int) -> Acti
     """Each climb/descent of the activity against the current model: residual
     from expected speed for that grade, fatigue, and temperature, and a
     percentile of the athlete's own history at that grade."""
-    if streams.needs_streams_fetch(activity_id):
+    if not streams.has_cached_streams(activity_id):
         raise TerrainDataError(f"No current cached streams for activity {activity_id}")
     stream_df = streams.fetch_and_cache_streams(activity_id)
     resampled = _resample_altitude(stream_df)
@@ -1382,7 +1292,6 @@ def analyze_activity_terrain(conn: sqlite3.Connection, activity_id: int) -> Acti
     elapsed_raw = _nearest(raw_dist, cast(pd.Series, sub["time_s"]), dist_out)
     elapsed_at = [_flt(v) for v in elapsed_raw]
 
-    settings = get_settings(conn)
     model = current_model(conn)
     temp_c = activity_temp_c(conn, activity_id, stream_df)
 
@@ -1397,7 +1306,7 @@ def analyze_activity_terrain(conn: sqlite3.Connection, activity_id: int) -> Acti
         expected_speed = model.expected_speed_mps(avg_grade_pct, elapsed_s=t0 or 0.0, temp_c=temp_c)
         residual = (actual_speed - expected_speed) if actual_speed is not None else None
         percentile = (
-            _percentile_at_grade(conn, avg_grade_pct, actual_speed, settings["rolling_window_days"])
+            _percentile_at_grade(conn, avg_grade_pct, actual_speed, ROLLING_WINDOW_DAYS)
             if actual_speed is not None
             else None
         )

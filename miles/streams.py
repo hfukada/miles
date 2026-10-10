@@ -13,7 +13,7 @@ anything that caches a result keyed to it (terrain.model_version_tag()),
 not a re-fetch from Strava.
 
 A *.parquet file from before raw storage existed is left on disk -- it's the
-athlete's data -- but ignored: needs_streams_fetch only checks for the raw
+athlete's data -- but ignored: has_cached_streams only checks for the raw
 file, since a legacy parquet discarded per-stream metadata and a shorter
 stream's true length, so it can't stand in for a real fetch.
 """
@@ -42,7 +42,7 @@ STREAM_DERIVE_VERSION = 1
 
 _STREAM_COLUMNS = [
     "time_s", "distance_m", "altitude_m", "velocity_smooth_mps",
-    "heartrate", "cadence", "watts", "temp_c", "grade_smooth", "moving",
+    "heartrate", "cadence", "temp_c", "grade_smooth", "moving",
     "lat", "lng",
 ]
 
@@ -53,7 +53,6 @@ _STRAVA_TO_COLUMN = {
     "velocity_smooth": "velocity_smooth_mps",
     "heartrate": "heartrate",
     "cadence": "cadence",
-    "watts": "watts",
     "temp": "temp_c",
     "grade_smooth": "grade_smooth",
     "moving": "moving",
@@ -71,11 +70,6 @@ def has_cached_streams(activity_id: int) -> bool:
 def discard_raw_streams(activity_id: int) -> None:
     """Forget the cached streams, so the next backfill fetches them again."""
     _raw_path(activity_id).unlink(missing_ok=True)
-
-
-def needs_streams_fetch(activity_id: int) -> bool:
-    """True when there's no raw stream file for this activity yet."""
-    return not has_cached_streams(activity_id)
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -96,17 +90,6 @@ def _raw_to_dict(raw: Mapping[str, object]) -> dict[str, dict[str, object]]:
         for key, stream in raw.items()
         if isinstance(stream, Stream) and stream.data is not None
     }
-
-
-def store_raw_streams(activity_id: int, raw: Mapping[str, object]) -> dict[str, dict[str, object]]:
-    """Persist Strava's stream response verbatim, gzipped, written
-    atomically (temp file + rename); an existing file is replaced whole, so
-    callers fetch only when needs_streams_fetch says there is none.
-    Returns the plain-dict form actually written, so a caller that just
-    fetched doesn't need to read it back off disk to derive a DataFrame."""
-    raw_dict = _raw_to_dict(raw)
-    _atomic_write_bytes(_raw_path(activity_id), gzip.compress(json.dumps(raw_dict).encode("utf-8")))
-    return raw_dict
 
 
 def load_raw_streams(activity_id: int) -> dict[str, dict[str, object]]:
@@ -131,7 +114,7 @@ def _aligned(data: list[object], n: int) -> list[object]:
 
 def _build_dataframe(raw: Mapping[str, Mapping[str, object]]) -> pd.DataFrame:
     """Derive the per-second stream DataFrame from raw stream data, as
-    stored by store_raw_streams / loaded by load_raw_streams. time is the
+    stored by cache_streams / loaded by load_raw_streams. time is the
     reference stream (everything else aligns to its length) when present;
     distance stands in for the rare activity Strava returns without one."""
     reference_key, reference_column = "time", "time_s"
@@ -169,18 +152,20 @@ def _build_dataframe(raw: Mapping[str, Mapping[str, object]]) -> pd.DataFrame:
 
 def get_stream_dataframe(activity_id: int) -> pd.DataFrame:
     """The derived DataFrame for an activity whose raw stream file is
-    already on disk -- callers check needs_streams_fetch/has_cached_streams
-    first."""
+    already on disk -- callers check has_cached_streams first."""
     return _build_dataframe(load_raw_streams(activity_id))
 
 
 def cache_streams(activity_id: int, raw: Mapping[str, object]) -> pd.DataFrame:
-    """Store already-fetched raw streams and derive a DataFrame from the
-    same data in memory, without reading it back off disk. Split out from
-    fetch_and_cache_streams so a batch fetcher (the terrain backfill job)
-    can store each activity as it arrives without a redundant per-activity
-    API call."""
-    raw_dict = store_raw_streams(activity_id, raw)
+    """Persist Strava's stream response verbatim, gzipped, written atomically
+    (temp file + rename); an existing file is replaced whole, so callers fetch
+    only when has_cached_streams says there is none. Returns the DataFrame
+    derived from the same data in memory, without reading it back off disk.
+    Split out from fetch_and_cache_streams so a batch fetcher (the terrain
+    backfill job) can store each activity as it arrives without a redundant
+    per-activity API call."""
+    raw_dict = _raw_to_dict(raw)
+    _atomic_write_bytes(_raw_path(activity_id), gzip.compress(json.dumps(raw_dict).encode("utf-8")))
     return _build_dataframe(raw_dict)
 
 

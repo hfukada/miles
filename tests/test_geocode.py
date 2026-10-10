@@ -64,16 +64,6 @@ def test_spellings_that_differ_in_case_spacing_or_accent_encoding_share_an_entry
     assert len(asked) == 1
 
 
-def test_an_entry_cached_under_its_raw_text_is_still_found(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    conn.execute(
-        "INSERT INTO geocode_cache (query, lat, lng, display_name, fetched_at) VALUES ('Old Style', 3.0, 4.0, 'x', 'now')"
-    )
-    conn.commit()
-    asked = _nominatim(monkeypatch, (9.0, 9.0, "y"))
-    assert geocode.geocode(conn, "Old Style") == (3.0, 4.0)
-    assert asked == []
-
-
 def test_a_refresh_asks_again_only_after_a_day(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     _nominatim(monkeypatch, (1.0, 2.0, "x"))
     geocode.geocode(conn, "Moved Place")

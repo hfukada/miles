@@ -163,7 +163,7 @@ def strava_allowance(monkeypatch: pytest.MonkeyPatch):
 def osrm(monkeypatch: pytest.MonkeyPatch) -> FakeOsrm:
     """drive_starts' OSRM request replaced by a configurable fake."""
     fake = FakeOsrm()
-    monkeypatch.setattr(drive_starts, "_fetch_with_backoff", fake)
+    monkeypatch.setattr(drive_starts.http_client, "request", lambda policy, url, **kwargs: fake(url))
     return fake
 
 

@@ -88,11 +88,11 @@ def register_area_tools(mcp: FastMCP) -> None:
     def pin_area(area_id: int) -> str:
         """Keep an area indefinitely instead of collecting it after 60 days unused."""
         with db.connection() as conn:
-            return json.dumps(areas_service.pin_area(conn, area_id))
+            return json.dumps(areas_service.set_pinned(conn, area_id, True))
 
     @mcp.tool()
     @reporting(areas_service.AreaNotFoundError)
     def unpin_area(area_id: int) -> str:
         """Return an area to the 60-days-unused collection lifecycle."""
         with db.connection() as conn:
-            return json.dumps(areas_service.unpin_area(conn, area_id))
+            return json.dumps(areas_service.set_pinned(conn, area_id, False))

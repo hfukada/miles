@@ -30,13 +30,6 @@ def bbox_overlaps(a: tuple[float, float, float, float], b: tuple[float, float, f
     return a_south <= b_north and a_north >= b_south and a_west <= b_east and a_east >= b_west
 
 
-def bbox_within(inner: tuple[float, float, float, float], outer: tuple[float, float, float, float]) -> bool:
-    """Whether the `inner` (south, west, north, east) box lies inside `outer`."""
-    i_south, i_west, i_north, i_east = inner
-    o_south, o_west, o_north, o_east = outer
-    return o_south <= i_south and o_west <= i_west and o_north >= i_north and o_east >= i_east
-
-
 def bbox_for_center_radius(lat: float, lng: float, radius_km: float) -> tuple[float, float, float, float]:
     """(south, west, north, east) bounding square of a circle, longitude scaled
     for convergence at this latitude. Callers needing the exact circle filter

@@ -17,7 +17,7 @@ import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import Callable, cast
 from typing_extensions import NotRequired, TypedDict
 
 from . import db, elevation, extracts, geocode, geofabrik, metrics, network, tilecache, tiles
@@ -93,8 +93,7 @@ class AreaStatus(TypedDict):
 
 
 def init_area_schema(conn: sqlite3.Connection) -> None:
-    # source is "extract:<region>"; older rows may say "overpass" and stay
-    # readable. inputs is a JSON object of region -> fetched_at of the extract
+    # source is "extract:<region>". inputs is a JSON object of region -> fetched_at of the extract
     # files a tile was cut from, NULL for uploaded or older tiles.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS map_tiles (
@@ -104,20 +103,19 @@ def init_area_schema(conn: sqlite3.Connection) -> None:
             fetched_at    TEXT NOT NULL,
             sha256        TEXT NOT NULL,
             data          BLOB NOT NULL,
-            source        TEXT NOT NULL DEFAULT 'overpass',
+            source        TEXT NOT NULL,
+            inputs        TEXT,
             PRIMARY KEY (gx, gy)
         )
     """)
-    db.add_missing_columns(conn, "map_tiles", "source TEXT NOT NULL DEFAULT 'overpass'", "inputs TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS elevation_tiles (
-            provider   TEXT NOT NULL,
             zoom       INTEGER NOT NULL,
             x          INTEGER NOT NULL,
             y          INTEGER NOT NULL,
             fetched_at TEXT NOT NULL,
             data       BLOB NOT NULL,
-            PRIMARY KEY (provider, zoom, x, y)
+            PRIMARY KEY (zoom, x, y)
         )
     """)
     conn.execute("""
@@ -143,7 +141,6 @@ def init_area_schema(conn: sqlite3.Connection) -> None:
             center_lng         REAL NOT NULL,
             radius_km          REAL NOT NULL,
             drive_minutes      REAL,
-            elevation_provider TEXT NOT NULL DEFAULT 'terrarium',
             pinned             INTEGER NOT NULL DEFAULT 0,
             status             TEXT NOT NULL DEFAULT 'new',
             status_phase       TEXT,
@@ -156,7 +153,6 @@ def init_area_schema(conn: sqlite3.Connection) -> None:
             region             TEXT
         )
     """)
-    db.add_missing_columns(conn, "areas", "region TEXT")
     # No FK on (gx, gy) -> map_tiles: a row here is written before the tile
     # fetch that creates its map_tiles row completes (see _do_import), and a
     # tile can also be evicted by gc_tiles once no area references it.
@@ -183,19 +179,13 @@ def _get_area_row(conn: sqlite3.Connection, area_id: int) -> sqlite3.Row:
     return row
 
 
+_SUMMARY_COLUMNS = (
+    "area_id", "label", "center_lat", "center_lng", "radius_km", "status", "created_at", "last_used_at", "imported_at",
+)
+
+
 def _row_to_summary(row: sqlite3.Row) -> AreaSummary:
-    return {
-        "area_id": row["area_id"],
-        "label": row["label"],
-        "center_lat": row["center_lat"],
-        "center_lng": row["center_lng"],
-        "radius_km": row["radius_km"],
-        "pinned": bool(row["pinned"]),
-        "status": row["status"],
-        "created_at": row["created_at"],
-        "last_used_at": row["last_used_at"],
-        "imported_at": row["imported_at"],
-    }
+    return cast(AreaSummary, {**{c: row[c] for c in _SUMMARY_COLUMNS}, "pinned": bool(row["pinned"])})
 
 
 def _row_to_detail(conn: sqlite3.Connection, row: sqlite3.Row) -> AreaDetail:
@@ -286,16 +276,9 @@ def list_areas(conn: sqlite3.Connection) -> list[AreaSummary]:
     return [_row_to_summary(r) for r in rows]
 
 
-def pin_area(conn: sqlite3.Connection, area_id: int) -> AreaDetail:
+def set_pinned(conn: sqlite3.Connection, area_id: int, pinned: bool) -> AreaDetail:
     _get_area_row(conn, area_id)
-    conn.execute("UPDATE areas SET pinned = 1 WHERE area_id = ?", (area_id,))
-    conn.commit()
-    return get_area(conn, area_id)
-
-
-def unpin_area(conn: sqlite3.Connection, area_id: int) -> AreaDetail:
-    _get_area_row(conn, area_id)
-    conn.execute("UPDATE areas SET pinned = 0 WHERE area_id = ?", (area_id,))
+    conn.execute("UPDATE areas SET pinned = ? WHERE area_id = ?", (int(pinned), area_id))
     conn.commit()
     return get_area(conn, area_id)
 
@@ -382,6 +365,58 @@ def _try_start_import(conn: sqlite3.Connection, area_id: int) -> bool:
 
 
 
+def _upsert_area(
+    conn: sqlite3.Connection,
+    label: str,
+    center_lat: float,
+    center_lng: float,
+    radius_km: float,
+    drive_minutes: float | None,
+    pinned: bool | None,
+    region: str | None,
+    now: str,
+) -> int:
+    """The area_id of label's row, updated to the given center and size (pinned
+    and region are kept when None) or inserted as 'new'."""
+    existing = conn.execute("SELECT area_id FROM areas WHERE label = ?", (label,)).fetchone()
+    if existing is not None:
+        area_id = int(existing["area_id"])
+        conn.execute(
+            """
+            UPDATE areas SET center_lat = ?, center_lng = ?, radius_km = ?, drive_minutes = ?,
+                pinned = COALESCE(?, pinned), region = COALESCE(?, region), last_used_at = ?
+            WHERE area_id = ?
+            """,
+            (
+                center_lat, center_lng, radius_km, drive_minutes,
+                None if pinned is None else int(pinned), region, now, area_id,
+            ),
+        )
+    else:
+        cur = conn.execute(
+            """
+            INSERT INTO areas (
+                label, center_lat, center_lng, radius_km, drive_minutes,
+                pinned, region, status, created_at, last_used_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+            """,
+            (label, center_lat, center_lng, radius_km, drive_minutes, int(bool(pinned)), region, now, now),
+        )
+        area_id = int(cur.lastrowid)  # type: ignore[arg-type]
+    conn.commit()
+    return area_id
+
+
+def _start_job_or_touch(conn: sqlite3.Connection, area_id: int, now: str, target: Callable[..., None], *args: object) -> None:
+    """Start target(area_id, *args) in a thread unless an import already holds
+    the area, in which case only last_used_at moves."""
+    if _try_start_import(conn, area_id):
+        threading.Thread(target=target, args=(area_id, *args), daemon=True).start()
+    else:
+        conn.execute("UPDATE areas SET last_used_at = ? WHERE area_id = ?", (now, area_id))
+        conn.commit()
+
+
 def _estimate_import(conn: sqlite3.Connection, bbox: tuple[float, float, float, float], region: str | None) -> ImportEstimate:
     """Source, tile count, and expected seconds, from what is already
     registered and cached; never downloads or fetches the index."""
@@ -456,40 +491,12 @@ def import_area(
         resolved_radius = _resolve_radius_km(radius_km, drive_minutes)
     now = datetime.now(timezone.utc).isoformat()
 
-    if existing is not None:
-        area_id = int(existing["area_id"])
-        conn.execute(
-            """
-            UPDATE areas SET center_lat = ?, center_lng = ?, radius_km = ?, drive_minutes = ?,
-                pinned = COALESCE(?, pinned), region = COALESCE(?, region), last_used_at = ?
-            WHERE area_id = ?
-            """,
-            (
-                center_lat, center_lng, resolved_radius, drive_minutes,
-                None if pinned is None else int(pinned), region, now, area_id,
-            ),
-        )
-    else:
-        cur = conn.execute(
-            """
-            INSERT INTO areas (
-                label, center_lat, center_lng, radius_km, drive_minutes,
-                pinned, region, status, created_at, last_used_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
-            """,
-            (label, center_lat, center_lng, resolved_radius, drive_minutes, int(bool(pinned)), region, now, now),
-        )
-        area_id = int(cur.lastrowid)  # type: ignore[arg-type]
-    conn.commit()
+    area_id = _upsert_area(conn, label, center_lat, center_lng, resolved_radius, drive_minutes, pinned, region, now)
 
     bbox = tiles.bbox_for_center_radius(center_lat, center_lng, resolved_radius)
     estimate = _estimate_import(conn, bbox, region)
 
-    if _try_start_import(conn, area_id):
-        threading.Thread(target=_run_import_job, args=(area_id, refresh), daemon=True).start()
-    else:
-        conn.execute("UPDATE areas SET last_used_at = ? WHERE area_id = ?", (now, area_id))
-        conn.commit()
+    _start_job_or_touch(conn, area_id, now, _run_import_job, refresh)
     status = get_area_status(conn, area_id)
     status["estimate"] = estimate
     if geocoded is not None:
@@ -663,29 +670,7 @@ def import_tiles(
     gc_areas_and_tiles(conn)
     now = datetime.now(timezone.utc).isoformat()
 
-    existing = conn.execute("SELECT area_id FROM areas WHERE label = ?", (label,)).fetchone()
-    if existing is not None:
-        area_id = int(existing["area_id"])
-        conn.execute(
-            """
-            UPDATE areas SET center_lat = ?, center_lng = ?, radius_km = ?,
-                pinned = COALESCE(?, pinned), last_used_at = ?
-            WHERE area_id = ?
-            """,
-            (center_lat, center_lng, radius_km, None if pinned is None else int(pinned), now, area_id),
-        )
-    else:
-        cur = conn.execute(
-            """
-            INSERT INTO areas (
-                label, center_lat, center_lng, radius_km,
-                pinned, status, created_at, last_used_at
-            ) VALUES (?, ?, ?, ?, ?, 'new', ?, ?)
-            """,
-            (label, center_lat, center_lng, radius_km, int(bool(pinned)), now, now),
-        )
-        area_id = int(cur.lastrowid)  # type: ignore[arg-type]
-    conn.commit()
+    area_id = _upsert_area(conn, label, center_lat, center_lng, radius_km, None, pinned, None, now)
 
     for tile in tile_payloads:
         tilecache.store_tile_elements(conn, tile["gx"], tile["gy"], tile["elements"], source=source)
@@ -695,11 +680,7 @@ def import_tiles(
         )
     conn.commit()
 
-    if _try_start_import(conn, area_id):
-        threading.Thread(target=_run_finish_only_job, args=(area_id,), daemon=True).start()
-    else:
-        conn.execute("UPDATE areas SET last_used_at = ? WHERE area_id = ?", (now, area_id))
-        conn.commit()
+    _start_job_or_touch(conn, area_id, now, _run_finish_only_job)
     return get_area_status(conn, area_id)
 
 

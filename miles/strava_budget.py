@@ -59,7 +59,6 @@ def wait_for_next_window(on_wait: Callable[[str], None] | None = None) -> None:
     if on_wait is not None:
         on_wait((now + timedelta(seconds=wait)).strftime("%H:%M"))
     time.sleep(wait)
-    strava_client.note_window_elapsed()
 
 
 class Gate:

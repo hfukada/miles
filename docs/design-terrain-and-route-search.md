@@ -39,7 +39,7 @@ for the agent to reason about and explain them.
 2. **Area import** — open map data and terrain-model elevation for an area,
    fetched once and cached aggressively.
 3. **Network and scoring** — a trail/road graph built from an area, with
-   per-edge grade, surface, technicality, and road comfort.
+   per-edge grade, surface, and road comfort.
 4. **Route search** — candidate routes over that graph from a start point or a
    set of drive-to trailheads.
 5. **MCP tools, skill, and UI.**
@@ -88,8 +88,8 @@ cadence, elapsed time and distance into the run, and the activity's
 temperature from the weather table, falling back to the device's own `temp`
 stream when there's no weather record.
 
-A segment is **walking** when cadence is below a walk threshold (default 130
-spm, editable), falling back to speed when cadence is missing. Stops (the
+A segment is **walking** when cadence is below a walk threshold (130
+spm), falling back to speed when cadence is missing. Stops (the
 `moving` stream false) are dropped.
 
 ### What the model holds
@@ -176,23 +176,18 @@ overlapping areas and repeated searches share downloads.
 - **Map tiles:** a fixed lat/lng grid (0.05°, about 5.5 km). Each tile's
   payload is Overpass-JSON-shaped (a format miles keeps, not a service it
   calls), stored gzipped with its sha256, source (`extract:<region>`, or the
-  regions comma-separated for a tile cut from several extracts; older rows
-  may say `overpass`), query version, `fetched_at`, and the per-file
+  regions comma-separated for a tile cut from several extracts), query version, `fetched_at`, and the per-file
   `inputs` stamps. A way crossing tiles appears whole in each.
   Tiles are ground truth, as raw GPX is in ADR 0002; everything below is
   derived from them.
-- **Regional extracts:** registered with their bounds, sha256, fetch time,
+- **Regional extracts:** registered with their sha256, fetch time,
   the server's ETag and Last-Modified, and the date their data is as of. An
-  import uses, in order: the smallest extract registered from a local file
-  whose header bounds contain the area; the regions the athlete names,
+  import uses, in order: the regions the athlete names,
   validated against Geofabrik's index (unchecked when the index has never
   been fetched and cannot be); the cheapest set of regions in the index that
-  covers the area by boundary, reusing any already registered. A header bbox
-  is a rectangle that reaches across borders, so it decides coverage only
-  when the index has never been stored or no region in it covers the area.
+  covers the area by boundary, reusing any already registered.
   **Tile rule:** a tile is always cut afresh from every registered extract
-  whose region touches it (by the stored index's polygons, by header bbox for
-  a region the index lacks or when none is stored), not only the extracts the
+  whose region touches it (by the stored index's polygons), not only the extracts the
   importing area chose; stored elements are never merged back in, so a way
   deleted upstream leaves the tile when its extract is refreshed and the
   tile is cut again. The tile's source lists those regions, its `fetched_at`
@@ -206,8 +201,7 @@ overlapping areas and repeated searches share downloads.
   file is registered only after its size and MD5 check out, the MD5 fetched
   from the URL the body was served from. An area's `data_as_of` is the oldest
   date among the extracts its tiles were cut from.
-- **Elevation tiles:** stored as fetched, keyed by provider/zoom/x/y (the provider is always
-  `terrarium`). They never expire.
+- **Elevation tiles:** stored as fetched, keyed by zoom/x/y. They never expire.
 - **Areas** are what the athlete names: a center, a radius, a label, a
   `pinned` flag, and `last_used_at`. An area references the tiles it covers.
   - A **pinned** area (home) is kept until unpinned.
@@ -282,12 +276,12 @@ model changing never requires a network rebuild.
   or when nearly all of it runs within a few meters of a street. Tracks are
   not streets for this purpose, so a trail beside a fire road stays a trail.
   Sidewalks score like pavement and never count as trail.
-- **technicality:** `sac_scale`, `mtb:scale`, `trail_visibility`, `smoothness`
-  where tagged; unknown is reported as unknown, not as easy
 - **road comfort** (below)
-- **proximity:** distance to the nearest road of class `primary` or above,
-  for trails that run alongside one
-- nearby water and toilets
+
+Not built: technicality (`sac_scale`, `mtb:scale`, `trail_visibility`,
+`smoothness`), distance to a major road for trails that run alongside one,
+and nearby water and toilets. Nothing reads them yet, so edges do not store
+them.
 
 ### Road comfort
 
@@ -321,9 +315,9 @@ One stored, editable profile per athlete, read by scoring and search:
 
 - comfort thresholds (speeds, classes)
 - maximum continuous distance on uncomfortable road (default 0.5 mi)
-- surface preferences (e.g. unpaved road weighted like trail)
-- technicality tolerance
-- trail-alongside-highway distance and penalty
+
+Not built: surface weights, a technicality tolerance, and a
+trail-alongside-highway distance and penalty.
 
 Continuous exposure is a stateful cost: a quarter mile of uncomfortable road
 is fine, a mile isn't, and two quarter miles separated by trail are fine.
@@ -376,7 +370,7 @@ On a pure-Python graph, sized for a single-board computer:
    a stem plus a loop. Shortest-path trees are computed once per start and
    cut off at the distance they're needed to.
 4. **Evaluate** each candidate in full: runnability through the terrain
-   model, surface mix, technicality, stateful road exposure, gain, drive
+   model, surface mix, stateful road exposure, gain, drive
    time. Candidates violating hard constraints are dropped.
 5. **Diversify:** generation continues past N (to a few times N, within the
    time budget) and drops repeats of the same set of edges, whichever way
@@ -464,7 +458,7 @@ for terrain matching it.
   thresholds, on the map and the elevation profile
 - a Terrain page: per-bin pace and walk fraction, thresholds, and trends
 - a climb/descent table on the activity page
-- not yet built: road-comfort and technicality map layers, and a candidate
+- not yet built: a road-comfort map layer, and a candidate
   comparison view for a search result set
 
 ## Open questions
@@ -473,7 +467,7 @@ for terrain matching it.
   sharpen road comfort but differ per state. Class-based estimates plus
   overrides come first; per-state counts are a later provider behind the
   same comfort tiers.
-- **Walk threshold.** 130 spm is the default and is editable; learning it
+- **Walk threshold.** 130 spm is a fixed constant; learning it
   from the athlete's cadence distribution (the valley between walk and run
   peaks) can come later.
 - **Directional trails.** `oneway` on paths is sparsely tagged; some

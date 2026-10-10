@@ -312,8 +312,7 @@ Off by default: set `MILES_METRICS=1` and `GET /metrics` serves the Prometheus t
 The retry, wait, and cache series are counters of the serving process only: the API server, the
 stdio MCP server, and each CLI run count separately, and a counter restarts at zero when its
 process does. Everything else is read from the database at scrape time, so it covers runs by any
-process. The registry is a small module (`miles/metrics.py`) rather than `prometheus_client`, to
-avoid a dependency for a few dozen series.
+process. The exposition is rendered by `prometheus_client`; sample values print as floats.
 
 ### Outbound request ledger
 

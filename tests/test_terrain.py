@@ -219,44 +219,6 @@ def test_a_trend_needs_a_known_metric_and_a_grade_range_for_bin_metrics(conn: sq
         terrain.get_terrain_trend(conn, metric)
 
 
-def test_init_terrain_schema_drops_legacy_terrain_segments_table():
-    # An existing DB built before the compact-int/WITHOUT ROWID layout: a
-    # bare CREATE TABLE with the old columns and a row in it.
-    legacy = sqlite3.connect(":memory:")
-    legacy.row_factory = sqlite3.Row
-    legacy.execute("""
-        CREATE TABLE terrain_segments (
-            activity_id INTEGER NOT NULL, idx INTEGER NOT NULL, start_date TEXT NOT NULL,
-            dist_m REAL NOT NULL, elapsed_s REAL, grade_pct REAL NOT NULL, speed_mps REAL,
-            heartrate REAL, cadence_spm REAL, is_walking INTEGER NOT NULL, temp_c REAL,
-            ele_source TEXT NOT NULL, PRIMARY KEY (activity_id, idx)
-        )
-    """)
-    legacy.execute(
-        "INSERT INTO terrain_segments VALUES (1, 0, '2024-01-01', 0.0, 0.0, 5.0, 3.0, 140.0, 170.0, 0, 15.0, 'recorded')"
-    )
-    legacy.commit()
-
-    db.init_db(legacy)
-
-    cols = {r["name"] for r in legacy.execute("PRAGMA table_info(terrain_segments)").fetchall()}
-    assert "grade_dpct" in cols
-    assert "start_date" not in cols
-    assert legacy.execute("SELECT COUNT(*) FROM terrain_segments").fetchone()[0] == 0
-    assert terrain.segment_and_store_activity(legacy, 1, _synthetic_stream_df(), "2024-06-01", 15.0, 130.0) > 0
-
-
-def test_changing_the_walk_threshold_rebuilds_the_model_and_an_unchanged_one_does_not(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    rebuilds: list[bool] = []
-    monkeypatch.setattr(terrain, "rebuild_terrain", lambda c, full=False: rebuilds.append(full))
-
-    terrain.update_settings(conn, walk_threshold_spm=90.0)
-    terrain.update_settings(conn, walk_threshold_spm=90.0)
-
-    assert rebuilds == [True]
-    assert terrain.get_settings(conn)["walk_threshold_spm"] == 90.0
-
-
 def test_ensure_terrain_derived_stamps_the_current_version(conn: sqlite3.Connection):
     terrain.ensure_terrain_derived(conn)
     row = conn.execute("SELECT value FROM meta WHERE key = 'terrain_model_version'").fetchone()
@@ -308,14 +270,14 @@ def test_an_unknown_route_raises(conn: sqlite3.Connection, function):
 
 
 def test_analyze_activity_terrain_requires_cached_streams(conn: sqlite3.Connection, monkeypatch):
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda activity_id: True)
+    monkeypatch.setattr(streams, "has_cached_streams", lambda activity_id: False)
     with pytest.raises(terrain.TerrainDataError):
         terrain.analyze_activity_terrain(conn, 1)
 
 
 def test_analyze_activity_terrain_reports_climbs(conn: sqlite3.Connection, monkeypatch):
     df = _synthetic_stream_df()
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda activity_id: False)
+    monkeypatch.setattr(streams, "has_cached_streams", lambda activity_id: True)
     monkeypatch.setattr(streams, "fetch_and_cache_streams", lambda activity_id: df)
 
     analysis = terrain.analyze_activity_terrain(conn, 1)
@@ -338,8 +300,8 @@ def _segmented(conn: sqlite3.Connection) -> set[int]:
 def test_virtual_runs_are_not_segmented(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     insert_activity(conn, 1, sport_type="TrailRun")
     insert_activity(conn, 2, sport_type="VirtualRun")
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: False)
-    monkeypatch.setattr(streams, "fetch_and_cache_streams", lambda aid: _synthetic_stream_df())
+    monkeypatch.setattr(streams, "has_cached_streams", lambda aid: True)
+    monkeypatch.setattr(streams, "get_stream_dataframe", lambda aid: _synthetic_stream_df())
 
     terrain.rebuild_terrain(conn, full=True)
 
@@ -349,7 +311,7 @@ def test_virtual_runs_are_not_segmented(conn: sqlite3.Connection, monkeypatch: p
 def test_one_unreadable_stream_file_does_not_fail_the_rebuild_and_is_discarded_for_a_refetch(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     insert_activity(conn, 1)
     insert_activity(conn, 2)
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: False)
+    monkeypatch.setattr(streams, "has_cached_streams", lambda aid: True)
     discarded: list[int] = []
     monkeypatch.setattr(streams, "discard_raw_streams", discarded.append)
 
@@ -358,7 +320,7 @@ def test_one_unreadable_stream_file_does_not_fail_the_rebuild_and_is_discarded_f
             raise OSError("stream file is truncated")
         return _synthetic_stream_df()
 
-    monkeypatch.setattr(streams, "fetch_and_cache_streams", fetch)
+    monkeypatch.setattr(streams, "get_stream_dataframe", fetch)
 
     terrain.rebuild_terrain(conn, full=True)
 
@@ -375,8 +337,8 @@ def test_a_segmentation_failure_keeps_the_file_and_is_not_retried_until_the_mode
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch,
 ):
     insert_activity(conn, 1)
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: False)
-    monkeypatch.setattr(streams, "fetch_and_cache_streams", lambda aid: _synthetic_stream_df())
+    monkeypatch.setattr(streams, "has_cached_streams", lambda aid: True)
+    monkeypatch.setattr(streams, "get_stream_dataframe", lambda aid: _synthetic_stream_df())
     discarded: list[int] = []
     monkeypatch.setattr(streams, "discard_raw_streams", discarded.append)
     attempts: list[int] = []
@@ -403,7 +365,7 @@ def test_a_segmentation_failure_keeps_the_file_and_is_not_retried_until_the_mode
 def test_rebuild_drops_segments_of_activities_that_no_longer_qualify(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     insert_activity(conn, 2, sport_type="VirtualRun")
     terrain.segment_and_store_activity(conn, 2, _synthetic_stream_df(), "2024-06-01", 15.0, 130.0)
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: True)
+    monkeypatch.setattr(streams, "has_cached_streams", lambda aid: False)
 
     terrain.rebuild_terrain(conn, full=True)
 
@@ -428,7 +390,6 @@ def _bin(lo: float, hi: float, speed: float, samples: int) -> dict:
 
 
 def test_trend_returns_one_point_per_date_for_the_current_window_and_ignores_bins_with_too_few_samples(conn: sqlite3.Connection):
-    terrain.update_settings(conn, rolling_window_days=90)
     _snapshot(conn, "2024-06-01", 90, [_bin(0, 2, 3.0, 50), _bin(2, 4, 9.0, 1)])
     _snapshot(conn, "2024-06-01", 30, [_bin(0, 2, 5.0, 50)])
     _snapshot(conn, "2024-07-01", 90, [_bin(0, 2, 3.0, terrain.MIN_SAMPLES_FOR_BIN - 1)])
@@ -504,10 +465,9 @@ def test_a_rebuild_commits_as_it_goes_instead_of_holding_one_transaction(monkeyp
         )
         return 0
 
-    monkeypatch.setattr(terrain, "REBUILD_COMMIT_EVERY", 1)
     monkeypatch.setattr(terrain, "segment_and_store_activity", segment)
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: False)
-    monkeypatch.setattr(streams, "fetch_and_cache_streams", lambda aid: pd.DataFrame())
+    monkeypatch.setattr(streams, "has_cached_streams", lambda aid: True)
+    monkeypatch.setattr(streams, "get_stream_dataframe", lambda aid: pd.DataFrame())
     monkeypatch.setattr(terrain, "activity_temp_c", lambda *a: None)
     monkeypatch.setattr(terrain, "backfill_snapshots", lambda *a, **k: 0)
 

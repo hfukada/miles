@@ -5,7 +5,7 @@ import pytest
 from helpers import ORIGIN_LAT, ORIGIN_LNG, FakeOsrm, by_deg_lat, call_tool, node, none_sampler, way
 from mcp.server.fastmcp import FastMCP
 
-from miles import db, network, route_search, search_api, search_mcp
+from miles import db, network, route_search, search_mcp
 
 # A single 400m trail with a named trailhead at its near end, a mile or so
 # from the drive origin -- enough distance for OSRM drive time to matter,
@@ -60,26 +60,13 @@ def test_drive_mode_fans_out_over_osrm_and_carries_each_starts_label_and_drive_t
         assert summary["start"]["label"] == candidate["start"]["label"] in labels
         assert (summary["start"]["drive_minutes"] == 0.0) is (candidate["start"]["label"] == "Out the door")
 
-    seen: list[route_search.RouteSearchRequest] = []
-    monkeypatch.setattr(db, "connect", lambda: conn)
-    monkeypatch.setattr(route_search, "find_routes", lambda c, request: seen.append(request))  # type: ignore[arg-type,return-value]
-    search_api.find_routes(search_api.FindRoutesBody(
-        area_id=1,
-        drive_origin=search_api.StartBody(lat=ORIGIN_LAT, lng=ORIGIN_LNG),
-        max_drive_minutes=10.0,
-        distance_m_min=100.0,
-        distance_m_max=800.0,
-    ))
-    assert {s.get("label") for s in seen[0]["starts"]} == labels
-    assert seen[0]["n"] == route_search.DEFAULT_N and seen[0]["time_budget_s"] == route_search.DEFAULT_TIME_BUDGET_S
-
 
 @pytest.mark.parametrize(
     "arguments, message",
     [
         ({"starts": [{"lat": 1.0, "lng": 1.0}], "origin": (ORIGIN_LAT, ORIGIN_LNG), "max_drive_minutes": 10.0}, "mutually exclusive"),
         ({"starts": None, "origin": None, "max_drive_minutes": None}, "start_lat/start_lng"),
-        ({"starts": None, "origin": None, "max_drive_minutes": 10.0, "origin_field": "drive_origin"}, "drive_origin"),
+        ({"starts": None, "origin": None, "max_drive_minutes": 10.0}, "start_lat/start_lng"),
     ],
 )
 def test_resolve_starts_refuses_contradictory_or_missing_start_arguments(conn: sqlite3.Connection, arguments: dict, message: str):
@@ -135,16 +122,6 @@ def test_every_search_tool_closes_its_connection_even_on_an_error(tool, name: st
 
     assert "error" in result
     assert [b.closed for b in tool.lent] == [True]
-
-
-@pytest.mark.parametrize(
-    "parse, raw, message",
-    [(search_mcp._parse_starts, raw, "starts") for raw in ['{"lat": 1, "lng": 2}', "[]", "[1, 2]", '[{"lat": 1}]', '[{"lat": "a", "lng": 2}]', "5"]]
-    + [(lambda raw: search_mcp._parse_way_ids("avoid_way_ids", raw), raw, "way ids") for raw in ['{"a": 1}', '["x"]', "3", "[1.5]"]],
-)
-def test_malformed_starts_and_way_id_lists_get_a_clear_error(parse, raw: str, message: str):
-    with pytest.raises(ValueError, match=message):
-        parse(raw)
 
 
 @pytest.mark.parametrize("as_json_text", [False, True])

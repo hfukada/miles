@@ -18,7 +18,7 @@ import json
 import sqlite3
 import time
 from datetime import datetime, timezone
-from typing import Literal, cast
+from typing import Literal, NamedTuple, cast
 from typing_extensions import NotRequired, TypedDict
 from xml.sax.saxutils import escape as xml_escape
 
@@ -319,6 +319,26 @@ def _drape_from_dem(conn: sqlite3.Connection, resampled_latlng: list[tuple[float
     return cast(list[float], values)
 
 
+class _ElevationStats(NamedTuple):
+    smoothed: list[float]
+    half_window_m: float
+    gain_m: float
+    loss_m: float
+    min_ele_m: float
+    max_ele_m: float
+    ft_per_mi: float | None
+
+
+def _elevation_stats(dist_m: list[float], elevations: list[float], total_distance: float) -> _ElevationStats:
+    """The profile smoothed with a window chosen from its own roughness, and
+    its gain, loss, extremes, and gain per mile."""
+    half_window_m = gpx_parse.smoothing_half_window_for(gpx_parse.profile_roughness_m(dist_m, elevations))
+    smoothed = gpx_parse.smoothed_elevations(elevations, dist_m, half_window_m)
+    gain_m, loss_m = gpx_parse.gain_loss_m(smoothed)
+    ft_per_mi = (gain_m * FT_PER_M) / (total_distance / MILE_M) if total_distance > 0 else None
+    return _ElevationStats(smoothed, half_window_m, gain_m, loss_m, min(elevations), max(elevations), ft_per_mi)
+
+
 def _apply_derived(
     conn: sqlite3.Connection,
     route_id: int,
@@ -345,13 +365,9 @@ def _apply_derived(
     ele_source: str | None = None
 
     if use_file:
-        elevations = cast(list[float], [p[2] for p in points])
-        half_window_m = gpx_parse.smoothing_half_window_for(gpx_parse.profile_roughness_m(dist_m, elevations))
-        smoothed = gpx_parse.smoothed_elevations(elevations, dist_m, half_window_m)
-        gain_m, loss_m = gpx_parse.gain_loss_m(smoothed)
-        min_ele_m, max_ele_m = min(elevations), max(elevations)
-        if total_distance > 0:
-            ft_per_mi = (gain_m * FT_PER_M) / (total_distance / MILE_M)
+        stats = _elevation_stats(dist_m, cast(list[float], [p[2] for p in points]), total_distance)
+        half_window_m = stats.half_window_m
+        gain_m, loss_m, min_ele_m, max_ele_m, ft_per_mi = stats[2:]
         ele_source = ELE_SOURCE_FILE
 
     south, west, north, east = gpx_parse.bbox(points)
@@ -381,16 +397,10 @@ def _apply_derived(
                 resampled_ele = [None] * len(resampled_dist)
             # preference == "auto": already without elevation (use_file was False).
         else:
-            dem_half_window_m = gpx_parse.smoothing_half_window_for(
-                gpx_parse.profile_roughness_m(resampled_dist, dem_values)
-            )
-            smoothed_dem = gpx_parse.smoothed_elevations(dem_values, resampled_dist, dem_half_window_m)
-            gain_m, loss_m = gpx_parse.gain_loss_m(smoothed_dem)
-            min_ele_m, max_ele_m = min(dem_values), max(dem_values)
-            if total_distance > 0:
-                ft_per_mi = (gain_m * FT_PER_M) / (total_distance / MILE_M)
+            stats = _elevation_stats(resampled_dist, dem_values, total_distance)
+            gain_m, loss_m, min_ele_m, max_ele_m, ft_per_mi = stats[2:]
             ele_source = ELE_SOURCE_DEM
-            resampled_ele = cast(list[float | None], smoothed_dem)
+            resampled_ele = cast(list[float | None], stats.smoothed)
 
     has_ele = ele_source is not None
 

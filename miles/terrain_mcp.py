@@ -32,11 +32,11 @@ def _reporting_rebuild(tool: Callable[P, str]) -> Callable[P, str]:
 def register_terrain_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     @_reporting_rebuild
-    def get_terrain_profile(window_days: int | None = None) -> str:
+    def get_terrain_profile(window_days: int = terrain.ROLLING_WINDOW_DAYS) -> str:
         """
         The athlete's terrain model: per-2%-grade-bin median speed,
         grade-adjusted efficiency, walk fraction, and sample count over a
-        rolling window (window_days, default the configured one), plus the
+        rolling window (window_days, default 90), plus the
         walk-onset grade, comfortable-descent grade, and a confidence level.
         Bins with too little data use a generic default (sample_count 0).
         """

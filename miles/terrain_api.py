@@ -6,7 +6,6 @@ import logging
 import threading
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
 
 from . import db, terrain, terrain_backfill
 from .errors import describe_error
@@ -16,7 +15,7 @@ _logger = logging.getLogger(__name__)
 
 
 @router.get("/api/terrain/profile")
-def get_terrain_profile(window_days: int | None = None) -> terrain.TerrainProfile:
+def get_terrain_profile(window_days: int = terrain.ROLLING_WINDOW_DAYS) -> terrain.TerrainProfile:
     with db.connection(terrain.connect) as conn:
         return terrain.get_terrain_profile(conn, window_days=window_days)
 
@@ -55,25 +54,6 @@ def get_route_terrain_score(route_id: int) -> terrain.RouteTerrainScore:
 def get_route_terrain_points(route_id: int) -> list[terrain.RoutePointClass]:
     with db.connection(terrain.connect) as conn:
         return terrain.route_point_classes(conn, route_id)
-
-
-class TerrainSettingsPatch(BaseModel):
-    walk_threshold_spm: float | None = None
-    rolling_window_days: int | None = None
-
-
-@router.get("/api/terrain/settings")
-def get_terrain_settings() -> terrain.TerrainSettings:
-    with db.connection(terrain.connect) as conn:
-        return terrain.get_settings(conn)
-
-
-@router.patch("/api/terrain/settings")
-def patch_terrain_settings(body: TerrainSettingsPatch) -> terrain.TerrainSettings:
-    with db.connection(terrain.connect) as conn:
-        return terrain.update_settings(
-            conn, walk_threshold_spm=body.walk_threshold_spm, rolling_window_days=body.rolling_window_days
-        )
 
 
 def _run_terrain_backfill_in_background() -> None:
