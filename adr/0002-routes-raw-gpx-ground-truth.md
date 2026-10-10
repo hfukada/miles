@@ -38,10 +38,18 @@ derivation logic changes.
   elevation can't support gain/grade math any more honestly than absent
   elevation, and averaging over a mix would silently bias the smoothing
   window with fabricated flat spots. DEM enrichment (filling elevation from
-  a terrain model instead of the file) is future work and deliberately
-  hasn't been started, but the schema already keeps elevation a
-  separable layer (`route_points.ele_m`, `routes.has_elevation`) so adding
-  it later is a derive-step change, not a schema change.
+  a terrain model instead of the file) was deliberately left as a future
+  derive-step change rather than a schema change, since elevation was
+  already a separable layer (`route_points.ele_m`, `routes.has_elevation`).
+
+  **2026-09-27 amendment:** that derive-step change has been made. A route
+  now carries an athlete preference (`routes.elevation_source`: auto/file/
+  dem) and, separately, which source actually populated its points last
+  derive (`routes.ele_source`: file/dem/null). Every derive path other than
+  an explicit `redrape_route` call only reads whatever DEM tiles are
+  already cached (never the network), so a route whose tiles aren't cached
+  yet comes back with no elevation and `elevation_pending = true` rather
+  than failing or blocking derivation on a fetch.
 - **No GIS library.** Junction/overlap detection, shape classification, and
   proximity queries all run on an equirectangular flat-earth approximation
   (accurate to well under a meter at the point spacing and geographic extent
@@ -50,10 +58,23 @@ derivation logic changes.
   would buy correctness margin this problem doesn't need and would be a
   meaningfully heavier dependency than everything else in this project.
 - **Elevation gain is smoothed, then thresholded.** A centered moving
-  average removes point-to-point GPS/DEM jitter, then a hysteresis threshold
-  counts a climb or descent only once elevation has moved past the noise
-  floor. Summing raw deltas inflates gain badly on real exports, because the
-  jitter is the same order of magnitude as a gentle grade.
+  average over a fixed *distance* window (not a point count, since point
+  spacing varies widely between export sources) removes point-to-point
+  GPS/DEM jitter, then a hysteresis threshold counts a climb or descent
+  only once elevation has moved past the noise floor. Summing raw deltas
+  inflates gain badly on real exports, because the jitter is the same
+  order of magnitude as a gentle grade.
+
+  **2026-09-27 amendment:** the smoothing window is now chosen from a
+  profile's own roughness (`gpx_parse.profile_roughness_m`: the RMS second
+  difference of elevation resampled onto an even grid) rather than fixed at
+  the constant above for every source. Terrain-model elevation — draped
+  from a DEM onto a route or activity with no usable recorded elevation, or
+  already present inside an uploaded file that was itself DEM-derived — is
+  smooth enough that the old fixed window could flatten a real short
+  roller; a rough, GPS-jitter-like profile still gets the full window this
+  bullet always used. `gpx_parse.smoothing_half_window_for` maps roughness
+  to a window between the two.
 - **A `connector` leg is a distance/gain estimate the athlete supplies, not
   a routed path.** `compose_route` accepts them precisely because most real
   stitched runs include a bit of road or unmapped trail between two GPX

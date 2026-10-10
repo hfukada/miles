@@ -1,31 +1,11 @@
-import sqlite3
-
 import pytest
+from helpers import line_points, make_gpx, memory_db, trkpt as _trkpt
 
-from miles import db, routes as routes_service
-
-
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    db.init_db(conn)
-    return conn
+from miles import routes as routes_service
 
 
-def _trkpt(lat: float, lng: float, ele: float | None) -> str:
-    if ele is None:
-        return f'<trkpt lat="{lat}" lon="{lng}"/>'
-    return f'<trkpt lat="{lat}" lon="{lng}"><ele>{ele}</ele></trkpt>'
-
-
-def _gpx_single_track(n: int = 40, lat0: float = 40.0, step_deg: float = 0.0002, ele0: float | None = 100.0, name: str = "Test Track", creator: str = "Test") -> bytes:
-    pts = []
-    for i in range(n):
-        ele = None if ele0 is None else ele0 + 2.0 * i
-        pts.append(_trkpt(lat0 + i * step_deg, -105.0, ele))
-    body = f"<trk><name>{name}</name><trkseg>{''.join(pts)}</trkseg></trk>"
-    return f"""<?xml version="1.0"?>
-<gpx version="1.1" creator="{creator}" xmlns="http://www.topografix.com/GPX/1/1">{body}</gpx>""".encode("utf-8")
+def _gpx_single_track(n: int = 40, ele0: float | None = 100.0) -> bytes:
+    return make_gpx(line_points(n, ele0=ele0), name="Test Track")
 
 
 def _gpx_multi_track(names: list[str]) -> bytes:
@@ -38,7 +18,7 @@ def _gpx_multi_track(names: list[str]) -> bytes:
 
 
 def test_upload_and_derive_single_track():
-    conn = _conn()
+    conn = memory_db()
     route_ids = routes_service.upload_gpx(conn, _gpx_single_track(), "track.gpx", name="Ridge Loop", source="alltrails", tags=["hike"])
     assert len(route_ids) == 1
     detail = routes_service.get_route(conn, route_ids[0])
@@ -52,7 +32,7 @@ def test_upload_and_derive_single_track():
 
 
 def test_upload_no_elevation_route_has_null_gain():
-    conn = _conn()
+    conn = memory_db()
     route_ids = routes_service.upload_gpx(conn, _gpx_single_track(ele0=None), "flat.gpx", name="No Ele")
     detail = routes_service.get_route(conn, route_ids[0])
     assert detail["has_elevation"] is False
@@ -64,7 +44,7 @@ def test_upload_no_elevation_route_has_null_gain():
 
 
 def test_upload_multi_track_names_each_route():
-    conn = _conn()
+    conn = memory_db()
     route_ids = routes_service.upload_gpx(
         conn, _gpx_multi_track(["Leg 1", "Leg 2"]), "course.gpx", name="Race", source="caltopo"
     )
@@ -74,7 +54,7 @@ def test_upload_multi_track_names_each_route():
 
 
 def test_upload_dedupes_identical_bytes_by_sha256():
-    conn = _conn()
+    conn = memory_db()
     data = _gpx_single_track()
     ids1 = routes_service.upload_gpx(conn, data, "a.gpx", name="First")
     ids2 = routes_service.upload_gpx(conn, data, "a.gpx", name="Second")
@@ -86,8 +66,7 @@ def test_upload_dedupes_identical_bytes_by_sha256():
 
 
 def test_waypoints_are_snapped_along_the_route():
-    conn = _conn()
-    data = _gpx_single_track(ele0=None)
+    conn = memory_db()
     # Insert a waypoint near the 5th point manually by re-uploading a file with a wpt.
     body = f"""<?xml version="1.0"?>
 <gpx version="1.1" creator="Test" xmlns="http://www.topografix.com/GPX/1/1">
@@ -104,7 +83,7 @@ def test_waypoints_are_snapped_along_the_route():
 
 
 def test_update_route_name_notes_tags():
-    conn = _conn()
+    conn = memory_db()
     route_ids = routes_service.upload_gpx(conn, _gpx_single_track(), "a.gpx", name="Old")
     updated = routes_service.update_route(conn, route_ids[0], name="New", tags=["x", "y"])
     assert updated["name"] == "New"
@@ -114,21 +93,51 @@ def test_update_route_name_notes_tags():
 
 
 def test_update_route_missing_raises():
-    conn = _conn()
+    conn = memory_db()
     with pytest.raises(routes_service.RouteNotFoundError):
         routes_service.update_route(conn, 999, name="x")
 
 
-def test_delete_route():
-    conn = _conn()
+def test_a_deleted_route_is_gone_and_stays_deleted_after_a_full_derive():
+    conn = memory_db()
     route_ids = routes_service.upload_gpx(conn, _gpx_single_track(), "a.gpx")
     routes_service.delete_route(conn, route_ids[0])
     with pytest.raises(routes_service.RouteNotFoundError):
         routes_service.get_route(conn, route_ids[0])
 
+    routes_service.derive_all_routes(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM gpx_files").fetchone()[0] == 0
+    for table in ("route_points", "route_climbs", "route_grade_bands", "route_waypoints"):
+        assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_deleting_one_track_of_a_multi_track_file_keeps_it_deleted_and_the_others():
+    conn = memory_db()
+    route_ids = routes_service.upload_gpx(conn, _gpx_multi_track(["A", "B", "C"]), "m.gpx")
+    routes_service.delete_route(conn, route_ids[1])
+
+    routes_service.derive_all_routes(conn)
+
+    remaining = {r["route_id"] for r in routes_service.list_routes(conn)}
+    assert remaining == {route_ids[0], route_ids[2]}
+    assert conn.execute("SELECT COUNT(*) FROM gpx_files").fetchone()[0] == 1
+
+
+def test_uploading_a_file_again_restores_its_deleted_tracks():
+    conn = memory_db()
+    data = _gpx_multi_track(["A", "B"])
+    route_ids = routes_service.upload_gpx(conn, data, "m.gpx")
+    routes_service.delete_route(conn, route_ids[0])
+
+    routes_service.upload_gpx(conn, data, "m.gpx")
+
+    assert len(routes_service.list_routes(conn)) == 2
+
 
 def test_list_routes_filters_by_distance_and_tag():
-    conn = _conn()
+    conn = memory_db()
     short_ids = routes_service.upload_gpx(conn, _gpx_single_track(n=10), "short.gpx", name="Short", tags=["a"])
     long_ids = routes_service.upload_gpx(conn, _gpx_single_track(n=200), "long.gpx", name="Long", tags=["b"])
     all_routes = routes_service.list_routes(conn)
@@ -143,7 +152,7 @@ def test_list_routes_filters_by_distance_and_tag():
 
 
 def test_derive_all_routes_is_idempotent():
-    conn = _conn()
+    conn = memory_db()
     route_ids = routes_service.upload_gpx(conn, _gpx_single_track(), "a.gpx", name="A")
     before = routes_service.get_route(conn, route_ids[0])
     routes_service.derive_all_routes(conn)
@@ -154,7 +163,7 @@ def test_derive_all_routes_is_idempotent():
 
 
 def test_ensure_routes_derived_reruns_on_version_bump(monkeypatch: pytest.MonkeyPatch):
-    conn = _conn()
+    conn = memory_db()
     routes_service.upload_gpx(conn, _gpx_single_track(), "a.gpx")
     conn.execute("UPDATE meta SET value = '0' WHERE key = 'route_derive_version'")
     conn.commit()

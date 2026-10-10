@@ -1,38 +1,13 @@
-import sqlite3
 from xml.etree import ElementTree as ET
 
 import pytest
+from helpers import memory_db, upload_line_route as _straight_route
 
-from miles import db, gpx_parse, routes as routes_service
-
-
-def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
-    db.init_db(conn)
-    return conn
-
-
-def _trkpt(lat: float, lng: float, ele: float | None) -> str:
-    if ele is None:
-        return f'<trkpt lat="{lat}" lon="{lng}"/>'
-    return f'<trkpt lat="{lat}" lon="{lng}"><ele>{ele}</ele></trkpt>'
-
-
-def _gpx(points: list[tuple[float, float, float | None]], name: str = "T") -> bytes:
-    body = f"<trk><name>{name}</name><trkseg>{''.join(_trkpt(*p) for p in points)}</trkseg></trk>"
-    return f"""<?xml version="1.0"?>
-<gpx version="1.1" creator="Test" xmlns="http://www.topografix.com/GPX/1/1">{body}</gpx>""".encode("utf-8")
-
-
-def _straight_route(conn: sqlite3.Connection, lat0: float, lng0: float, n: int = 60, step_deg: float = 0.0002, ele0: float | None = 100.0, name: str = "R") -> int:
-    points = [(lat0 + i * step_deg, lng0, None if ele0 is None else ele0 + 1.0 * i) for i in range(n)]
-    route_ids = routes_service.upload_gpx(conn, _gpx(points, name), f"{name}.gpx", name=name)
-    return route_ids[0]
+from miles import gpx_parse, routes as routes_service
 
 
 def test_compose_single_leg_partial_span():
-    conn = _conn()
+    conn = memory_db()
     route_id = _straight_route(conn, 40.0, -105.0)
     detail = routes_service.get_route(conn, route_id)
     half = detail["distance_m"] / 2
@@ -43,7 +18,7 @@ def test_compose_single_leg_partial_span():
 
 
 def test_compose_reversed_leg():
-    conn = _conn()
+    conn = memory_db()
     route_id = _straight_route(conn, 40.0, -105.0)
     detail = routes_service.get_route(conn, route_id)
     total = detail["distance_m"]
@@ -55,7 +30,7 @@ def test_compose_reversed_leg():
 
 
 def test_compose_two_legs_with_gap_warns():
-    conn = _conn()
+    conn = memory_db()
     route_a = _straight_route(conn, 40.0, -105.0, name="A")
     route_b = _straight_route(conn, 41.0, -105.0, name="B")  # ~111km away
     detail_a = routes_service.get_route(conn, route_a)
@@ -71,7 +46,7 @@ def test_compose_two_legs_with_gap_warns():
 
 
 def test_compose_connector_leg_adds_distance_and_optional_gain():
-    conn = _conn()
+    conn = memory_db()
     route_a = _straight_route(conn, 40.0, -105.0, name="A")
     detail_a = routes_service.get_route(conn, route_a)
     result = routes_service.compose_route(
@@ -87,7 +62,7 @@ def test_compose_connector_leg_adds_distance_and_optional_gain():
 
 
 def test_compose_no_elevation_route_leaves_gain_partial_with_warning():
-    conn = _conn()
+    conn = memory_db()
     route_id = _straight_route(conn, 40.0, -105.0, ele0=None)
     detail = routes_service.get_route(conn, route_id)
     result = routes_service.compose_route(conn, [{"route_id": route_id, "from_m": 0.0, "to_m": detail["distance_m"]}])
@@ -95,8 +70,8 @@ def test_compose_no_elevation_route_leaves_gain_partial_with_warning():
     assert any("no elevation" in w for w in result["warnings"])
 
 
-def test_compose_save_creates_a_new_route_with_legs():
-    conn = _conn()
+def test_compose_save_creates_a_new_route_with_legs_and_a_namespaced_gpx_that_round_trips():
+    conn = memory_db()
     route_id = _straight_route(conn, 40.0, -105.0, name="Base")
     detail = routes_service.get_route(conn, route_id)
     result = routes_service.compose_route(
@@ -112,17 +87,6 @@ def test_compose_save_creates_a_new_route_with_legs():
     assert saved["legs"] is not None and len(saved["legs"]) == 1
     assert saved["legs"][0]["route_id"] == route_id
 
-
-def test_compose_save_generates_gpx_with_namespace_and_round_trips():
-    conn = _conn()
-    route_id = _straight_route(conn, 40.0, -105.0, name="Base")
-    detail = routes_service.get_route(conn, route_id)
-    result = routes_service.compose_route(
-        conn,
-        [{"route_id": route_id, "from_m": 0.0, "to_m": detail["distance_m"]}],
-        save=True,
-        name="Composed With Namespace",
-    )
     filename, gpx_bytes = routes_service.get_route_gpx(conn, result["route_id"])
     assert filename.startswith("composed-")
 
@@ -132,12 +96,12 @@ def test_compose_save_generates_gpx_with_namespace_and_round_trips():
     doc = gpx_parse.parse_gpx_bytes(gpx_bytes)
     assert doc["creator"] == "miles"
     assert len(doc["tracks"]) == 1
-    assert doc["tracks"][0]["gpx_name"] == "Composed With Namespace"
+    assert doc["tracks"][0]["gpx_name"] == "My Composed Run"
     assert len(doc["tracks"][0]["points"]) > 1
 
 
 def test_compose_out_of_range_leg_warns_and_is_skipped():
-    conn = _conn()
+    conn = memory_db()
     route_id = _straight_route(conn, 40.0, -105.0)
     detail = routes_service.get_route(conn, route_id)
     total = detail["distance_m"]

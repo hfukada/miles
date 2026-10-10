@@ -10,6 +10,7 @@ Elevation gain/loss is a centered moving average followed by a hysteresis
 threshold: raw point-to-point deltas count GPS/DEM jitter as climbing.
 """
 
+import math
 from typing import Literal
 from typing_extensions import TypedDict
 
@@ -22,18 +23,46 @@ from .routes_spatial import equirect_distance_m
 # Elevation deltas smaller than this, measured from the last point that
 # itself cleared the threshold, are GPS/barometric noise rather than real
 # climb or descent -- without a floor, jitter on flat ground sums to a
-# large fake gain over a long track.
-ELEVATION_NOISE_M = 3.0
+# large fake gain over a long track. Distance-based smoothing (below)
+# already removes most of this noise before it reaches gain_loss_m, so the
+# floor only needs to catch what survives smoothing.
+ELEVATION_NOISE_M = 1.0
 
-# Points on either side included in the centered moving average applied
-# before the hysteresis threshold above (window size is 2x this plus 1).
-# A point count, not a distance, because consumer GPX tracks are recorded
-# at roughly even point spacing, so a fixed point count already behaves
-# like a fixed distance within one file.
-ELEVATION_SMOOTHING_RADIUS = 5
+# Half-width, in meters of along-route distance, of the centered moving
+# average applied before the hysteresis threshold above (the window spans
+# every point within this distance on either side of the point being
+# smoothed). A distance, not a point count: point spacing varies widely
+# between GPX sources -- dense GPS tracks sample every few meters,
+# route-planner/DEM exports every twenty-plus -- so a fixed point count
+# smooths over a different physical distance depending on the file, while a
+# distance window gives the same physical smoothing regardless of sampling
+# density.
+ELEVATION_SMOOTHING_HALF_WINDOW_M = 50.0
+
+# Noise floor used only when pairing turning points into climb/descent
+# segments (segment_climbs). Kept separate from ELEVATION_NOISE_M so a
+# tighter gain/loss noise floor doesn't fragment one sustained climb into
+# many small segments.
+CLIMB_SEGMENTATION_NOISE_M = 3.0
 
 # Target spacing for the resampled route_points table.
 RESAMPLE_SPACING_M = 20.0
+
+# Even reference spacing profile_roughness_m resamples onto before measuring
+# second differences, so the estimate reflects a profile's own smoothness
+# rather than how densely its source happened to sample the ground (dense
+# GPS tracks vs. sparse route-planner exports).
+ROUGHNESS_GRID_SPACING_M = 20.0
+
+# Roughness (see profile_roughness_m) at or below this is a smooth,
+# terrain-model-like profile -- real short rollers change slope gradually
+# from one grid step to the next, so little or no smoothing is needed to
+# keep their gain. At or above ROUGHNESS_NOISY_M it's GPS/DEM-jitter-grade
+# noise, needing the full window this project has always smoothed consumer
+# GPX with; between the two the window scales linearly. See
+# adr/0002-routes-raw-gpx-ground-truth.md's 2026-09-27 amendment.
+ROUGHNESS_SMOOTH_M = 0.3
+ROUGHNESS_NOISY_M = 1.5
 
 # Minimum |elevation change| for a turning-point pair to count as a
 # reported climb/descent segment -- well above ELEVATION_NOISE_M, which
@@ -219,9 +248,14 @@ def has_full_elevation(points: list[GpxPoint]) -> bool:
     return all(p[2] is not None for p in points)
 
 
-def smoothed_elevations(elevations: list[float]) -> list[float]:
-    """Centered moving average, ELEVATION_SMOOTHING_RADIUS points either
-    side; edge points average over whatever falls inside the series.
+def smoothed_elevations(
+    elevations: list[float], dist_m: list[float], half_window_m: float = ELEVATION_SMOOTHING_HALF_WINDOW_M
+) -> list[float]:
+    """Centered moving average over a +/-half_window_m window of cumulative
+    distance; edge points average over whatever falls inside the series.
+    `dist_m` must be the cumulative distance for each point in `elevations`
+    (same length, non-decreasing). half_window_m of 0 is a no-op smoothing
+    pass (each point averages only itself and any co-located duplicates).
 
     Run before the hysteresis threshold in gain_loss_m, not after: at
     typical consumer GPX point spacing, per-point elevation jitter is on
@@ -229,14 +263,29 @@ def smoothed_elevations(elevations: list[float]) -> list[float]:
     double count a real climb that arrives as a staircase of small steps.
     Averaging first removes the jitter's amplitude while leaving the
     climb's shape (which unfolds over many points) intact.
+
+    Two-pointer sliding window: as i advances, both window edges are
+    non-decreasing in cumulative distance, so each edge only ever moves
+    forward, giving O(n) instead of O(n * window size).
     """
     n = len(elevations)
-    radius = ELEVATION_SMOOTHING_RADIUS
-    return [
-        sum(elevations[max(0, i - radius) : min(n, i + radius + 1)])
-        / len(elevations[max(0, i - radius) : min(n, i + radius + 1)])
-        for i in range(n)
-    ]
+    half = half_window_m
+    out = [0.0] * n
+    lo = 0
+    hi = -1
+    total = 0.0
+    count = 0
+    for i in range(n):
+        while hi + 1 < n and dist_m[hi + 1] - dist_m[i] <= half:
+            hi += 1
+            total += elevations[hi]
+            count += 1
+        while dist_m[i] - dist_m[lo] > half:
+            total -= elevations[lo]
+            count -= 1
+            lo += 1
+        out[i] = total / count
+    return out
 
 
 def gain_loss_m(smoothed: list[float]) -> tuple[float, float]:
@@ -262,30 +311,22 @@ def gain_loss_m(smoothed: list[float]) -> tuple[float, float]:
     return gain, loss
 
 
-def resample_points(points: list[GpxPoint], dist_m: list[float], spacing_m: float = RESAMPLE_SPACING_M) -> list[tuple[float, float, float, float | None]]:
-    """Resample onto an even ~spacing_m grid along cumulative distance,
-    linearly interpolating lat/lng and (when present) a caller-supplied
-    smoothed elevation series. Returns (lat, lng, dist_m, ele_m) tuples;
-    the first and last raw points are always included.
-    """
-    total = dist_m[-1]
-    n = len(points)
-    if total <= 0:
-        lat, lng, ele = points[0]
-        return [(lat, lng, 0.0, ele)]
-
-    elevations = [p[2] for p in points]
-    has_ele = all(e is not None for e in elevations)
-    smoothed = smoothed_elevations([e for e in elevations if e is not None]) if has_ele else []
-
+def _even_targets(total: float, spacing_m: float) -> list[float]:
     targets: list[float] = []
     t = 0.0
     while t < total:
         targets.append(t)
         t += spacing_m
     targets.append(total)
+    return targets
 
-    out: list[tuple[float, float, float, float | None]] = []
+
+def _linear_resample(dist_m: list[float], series: list[float], targets: list[float]) -> list[float]:
+    """Linearly interpolate `series` (aligned with dist_m) onto `targets`,
+    a non-decreasing list of cumulative distances starting at dist_m[0] or
+    later. No smoothing."""
+    n = len(dist_m)
+    out: list[float] = []
     j = 0
     for target in targets:
         while j < n - 2 and dist_m[j + 1] < target:
@@ -293,16 +334,81 @@ def resample_points(points: list[GpxPoint], dist_m: list[float], spacing_m: floa
         d0, d1 = dist_m[j], dist_m[j + 1] if j + 1 < n else dist_m[j]
         frac = 0.0 if d1 <= d0 else (target - d0) / (d1 - d0)
         frac = min(1.0, max(0.0, frac))
-        lat = points[j][0] + (points[j + 1][0] - points[j][0]) * frac if j + 1 < n else points[j][0]
-        lng = points[j][1] + (points[j + 1][1] - points[j][1]) * frac if j + 1 < n else points[j][1]
-        if has_ele:
-            e0 = smoothed[j]
-            e1 = smoothed[j + 1] if j + 1 < n else smoothed[j]
-            ele: float | None = e0 + (e1 - e0) * frac
-        else:
-            ele = None
-        out.append((lat, lng, target, ele))
+        v0, v1 = series[j], series[j + 1] if j + 1 < n else series[j]
+        out.append(v0 + (v1 - v0) * frac)
     return out
+
+
+def profile_roughness_m(dist_m: list[float], ele_m: list[float]) -> float:
+    """A profile's own smoothness, independent of its source or point
+    density: elevation is linearly resampled onto an even
+    ROUGHNESS_GRID_SPACING_M grid (no smoothing), then this is the RMS
+    second difference across that grid -- how much the slope changes from
+    one grid step to the next. Real terrain features (a roller, a
+    switchback) change slope gradually over many grid steps and leave a
+    small value; GPS/DEM jitter reverses direction almost every step and
+    leaves a large one, regardless of how densely the source happened to
+    sample the ground.
+    """
+    if len(dist_m) < 3:
+        return 0.0
+    origin = dist_m[0]
+    total = dist_m[-1] - origin
+    if total <= 0:
+        return 0.0
+    shifted = [d - origin for d in dist_m]
+    targets = _even_targets(total, ROUGHNESS_GRID_SPACING_M)
+    grid_ele = _linear_resample(shifted, ele_m, targets)
+    if len(grid_ele) < 3:
+        return 0.0
+    second_diffs = [grid_ele[i + 1] - 2 * grid_ele[i] + grid_ele[i - 1] for i in range(1, len(grid_ele) - 1)]
+    n = len(second_diffs)
+    mean = sum(second_diffs) / n
+    variance = sum((x - mean) ** 2 for x in second_diffs) / n
+    return math.sqrt(variance)
+
+
+def smoothing_half_window_for(roughness_m: float) -> float:
+    """Smoothing half-window (see smoothed_elevations) chosen from a
+    profile's own roughness rather than its source label -- a smooth
+    terrain-model-like profile needs little or none to keep real short
+    rollers; a GPS-jitter-like profile needs the full window this project
+    has always used. Linear ramp between the two thresholds."""
+    if roughness_m <= ROUGHNESS_SMOOTH_M:
+        return 0.0
+    if roughness_m >= ROUGHNESS_NOISY_M:
+        return ELEVATION_SMOOTHING_HALF_WINDOW_M
+    frac = (roughness_m - ROUGHNESS_SMOOTH_M) / (ROUGHNESS_NOISY_M - ROUGHNESS_SMOOTH_M)
+    return frac * ELEVATION_SMOOTHING_HALF_WINDOW_M
+
+
+def resample_points(
+    points: list[GpxPoint],
+    dist_m: list[float],
+    spacing_m: float = RESAMPLE_SPACING_M,
+    half_window_m: float = ELEVATION_SMOOTHING_HALF_WINDOW_M,
+) -> list[tuple[float, float, float, float | None]]:
+    """Resample onto an even ~spacing_m grid along cumulative distance,
+    linearly interpolating lat/lng and (when present) a smoothed elevation
+    series (smoothed over +/-half_window_m -- see smoothed_elevations).
+    Returns (lat, lng, dist_m, ele_m) tuples; the first and last raw points
+    are always included.
+    """
+    total = dist_m[-1]
+    if total <= 0:
+        lat, lng, ele = points[0]
+        return [(lat, lng, 0.0, ele)]
+
+    elevations = [p[2] for p in points]
+    has_ele = all(e is not None for e in elevations)
+    smoothed = smoothed_elevations([e for e in elevations if e is not None], dist_m, half_window_m) if has_ele else []
+
+    targets = _even_targets(total, spacing_m)
+
+    lats = _linear_resample(dist_m, [p[0] for p in points], targets)
+    lngs = _linear_resample(dist_m, [p[1] for p in points], targets)
+    eles: list[float | None] = list(_linear_resample(dist_m, smoothed, targets)) if has_ele else [None] * len(targets)
+    return list(zip(lats, lngs, targets, eles))
 
 
 def bbox(points: list[GpxPoint]) -> tuple[float, float, float, float]:
@@ -347,7 +453,7 @@ def segment_climbs(
     dist_m: list[float],
     ele_m: list[float],
     min_gain_m: float = CLIMB_MIN_GAIN_M,
-    noise_m: float = ELEVATION_NOISE_M,
+    noise_m: float = CLIMB_SEGMENTATION_NOISE_M,
 ) -> list[ClimbSegment]:
     """Sustained climbs and descents: pair up consecutive turning points
     from the (already smoothed) elevation series and keep only pairs whose

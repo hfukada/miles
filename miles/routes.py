@@ -2,9 +2,8 @@
 
 Raw GPX bytes (gpx_files) are ground truth; everything else about a route --
 resampled points, gain/loss, climbs, grade bands, snapped waypoints -- is
-derived from those bytes and rebuilt by derive_routes_for_file /
-derive_all_routes, gated on ROUTE_DERIVE_VERSION exactly like derive.py gates
-DERIVE_VERSION. Kept as a separate version stamp and a separate module
+derived from those bytes and rebuilt by derive_all_routes, gated on ROUTE_DERIVE_VERSION exactly like
+derive.py gates DERIVE_VERSION. Kept as a separate version stamp and a separate module
 because this pipeline is upload-driven, not Strava-sync-driven -- nothing
 here should run as part of miles-sync's derive_all pass.
 
@@ -23,14 +22,30 @@ from typing import Literal, cast
 from typing_extensions import NotRequired, TypedDict
 from xml.sax.saxutils import escape as xml_escape
 
-from . import db, gpx_parse, routes_spatial
+from . import db, elevation, gpx_parse, routes_spatial
 from .fitness import MILE_M
 
-ROUTE_DERIVE_VERSION = 2
+# Bumped for DEM draping (elevation_source preference, ele_source,
+# elevation_pending) and roughness-based smoothing -- both change what
+# _apply_derived computes from the same raw GPX bytes.
+ROUTE_DERIVE_VERSION = 4
 
 FT_PER_M = 3.28084
 
 RouteLegKind = Literal["route", "connector"]
+
+# Athlete-set preference (routes.elevation_source) for where a route's
+# elevation comes from. "auto" prefers the file and drapes from the terrain
+# model only when the file has none; "file" never drapes even when the file
+# lacks elevation; "dem" always drapes, ignoring any file elevation.
+ElevationSourcePref = Literal["auto", "file", "dem"]
+ELEVATION_SOURCE_PREFS: tuple[ElevationSourcePref, ...] = ("auto", "file", "dem")
+
+# What actually populated route_points.ele_m as of the last derive
+# (routes.ele_source). Distinct from the preference above: "auto" always
+# resolves to one of these two, or to no elevation at all.
+ELE_SOURCE_FILE = "file"
+ELE_SOURCE_DEM = "dem"
 
 
 class RouteLegInput(TypedDict):
@@ -54,6 +69,9 @@ class RouteSummary(TypedDict):
     source: str | None
     tags: list[str]
     has_elevation: bool
+    elevation_source: str
+    ele_source: str | None
+    elevation_pending: bool
     distance_m: float | None
     gain_m: float | None
     loss_m: float | None
@@ -133,7 +151,6 @@ def connect() -> sqlite3.Connection:
     api.py's Strava-side _conn(), since route derivation runs on its own
     version stamp (see module docstring)."""
     conn = db.connect()
-    db.init_db(conn)
     ensure_routes_derived(conn)
     return conn
 
@@ -177,6 +194,8 @@ def upload_gpx(
         file_id = int(cur.lastrowid) if cur.lastrowid is not None else 0
         conn.commit()
 
+    # Uploading a file again is a request for all of its tracks.
+    conn.execute("DELETE FROM route_tombstones WHERE file_id = ?", [file_id])
     total_tracks = len(doc["tracks"])
     route_ids: list[int] = []
     for track in doc["tracks"]:
@@ -244,8 +263,7 @@ def _ensure_route_shell(
 
 
 def ensure_routes_derived(conn: sqlite3.Connection) -> None:
-    row = conn.execute("SELECT value FROM meta WHERE key = 'route_derive_version'").fetchone()
-    if row is None or row["value"] != str(ROUTE_DERIVE_VERSION):
+    if db.get_meta(conn, "route_derive_version") != str(ROUTE_DERIVE_VERSION):
         derive_all_routes(conn)
 
 
@@ -259,31 +277,46 @@ def derive_all_routes(conn: sqlite3.Connection) -> dict[str, int]:
     for file_id in file_ids:
         counts["routes"] += _derive_file(conn, file_id, None)
         counts["files"] += 1
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('route_derive_version', ?)",
-        [str(ROUTE_DERIVE_VERSION)],
-    )
+    db.set_meta(conn, "route_derive_version", str(ROUTE_DERIVE_VERSION))
     conn.commit()
     return counts
 
 
-def derive_routes_for_file(conn: sqlite3.Connection, file_id: int) -> int:
-    n = _derive_file(conn, file_id, None)
-    conn.commit()
-    return n
+def _load_doc(conn: sqlite3.Connection, file_id: int) -> gpx_parse.GpxDocument | None:
+    row = conn.execute("SELECT data FROM gpx_files WHERE file_id = ?", [file_id]).fetchone()
+    if row is None:
+        return None
+    return gpx_parse.parse_gpx_bytes(bytes(row["data"]))
 
 
 def _derive_file(conn: sqlite3.Connection, file_id: int, doc: gpx_parse.GpxDocument | None) -> int:
     if doc is None:
-        row = conn.execute("SELECT data FROM gpx_files WHERE file_id = ?", [file_id]).fetchone()
-        if row is None:
+        doc = _load_doc(conn, file_id)
+        if doc is None:
             return 0
-        doc = gpx_parse.parse_gpx_bytes(bytes(row["data"]))
     total_tracks = len(doc["tracks"])
+    deleted = {
+        r["track_index"]
+        for r in conn.execute("SELECT track_index FROM route_tombstones WHERE file_id = ?", [file_id]).fetchall()
+    }
+    derived = 0
     for track in doc["tracks"]:
+        if track["track_index"] in deleted:
+            continue
         route_id = _ensure_route_shell(conn, file_id, track, total_tracks)
         _apply_derived(conn, route_id, track, doc["waypoints"])
-    return total_tracks
+        derived += 1
+    return derived
+
+
+def _drape_from_dem(conn: sqlite3.Connection, resampled_latlng: list[tuple[float, float]]) -> list[float] | None:
+    """Elevation for every resampled point from the cached terrain model, or
+    None if any point falls outside its coverage -- callers treat a partial
+    drape as no drape at all, per adr/0002's DEM-draping amendment."""
+    values = elevation.sampler_for(conn).sample(resampled_latlng)
+    if any(v is None for v in values):
+        return None
+    return cast(list[float], values)
 
 
 def _apply_derived(
@@ -292,47 +325,94 @@ def _apply_derived(
     track: gpx_parse.GpxTrack,
     file_waypoints: list[gpx_parse.GpxWaypoint],
 ) -> None:
+    """Rebuild everything about a route from its raw GPX track. A DEM drape
+    (elevation_source 'auto' without file elevation, or 'dem') reads only the
+    tile cache, so this never blocks startup or a request on a fetch;
+    redrape_route fetches the tiles first."""
     points = track["points"]
     dist_m = gpx_parse.cumulative_distances_m(points)
     total_distance = dist_m[-1]
-    has_ele = gpx_parse.has_full_elevation(points)
+    has_file_ele = gpx_parse.has_full_elevation(points)
 
+    pref_row = conn.execute("SELECT elevation_source FROM routes WHERE route_id = ?", [route_id]).fetchone()
+    preference = cast(ElevationSourcePref, (pref_row["elevation_source"] if pref_row else None) or "auto")
+
+    use_file = has_file_ele and preference != "dem"
+    want_dem = preference == "dem" or (preference == "auto" and not has_file_ele)
+
+    half_window_m = gpx_parse.ELEVATION_SMOOTHING_HALF_WINDOW_M
     gain_m = loss_m = min_ele_m = max_ele_m = ft_per_mi = None
-    if has_ele:
+    ele_source: str | None = None
+
+    if use_file:
         elevations = cast(list[float], [p[2] for p in points])
-        smoothed = gpx_parse.smoothed_elevations(elevations)
+        half_window_m = gpx_parse.smoothing_half_window_for(gpx_parse.profile_roughness_m(dist_m, elevations))
+        smoothed = gpx_parse.smoothed_elevations(elevations, dist_m, half_window_m)
         gain_m, loss_m = gpx_parse.gain_loss_m(smoothed)
         min_ele_m, max_ele_m = min(elevations), max(elevations)
         if total_distance > 0:
             ft_per_mi = (gain_m * FT_PER_M) / (total_distance / MILE_M)
+        ele_source = ELE_SOURCE_FILE
 
     south, west, north, east = gpx_parse.bbox(points)
     start_lat, start_lng = points[0][0], points[0][1]
     end_lat, end_lng = points[-1][0], points[-1][1]
 
-    resampled = gpx_parse.resample_points(points, dist_m)
+    # Positions always resample the same way regardless of elevation source;
+    # half_window_m only matters when use_file left resample_points' own
+    # elevation column in play below.
+    resampled = gpx_parse.resample_points(points, dist_m, half_window_m=half_window_m)
     resampled_latlng = [(p[0], p[1]) for p in resampled]
     resampled_dist = [p[2] for p in resampled]
+    resampled_ele: list[float | None] = [p[3] for p in resampled] if use_file else [None] * len(resampled)
     shape = routes_spatial.classify_shape(resampled_latlng, resampled_dist)
+
+    elevation_pending = False
+    if want_dem:
+        dem_values = _drape_from_dem(conn, resampled_latlng)
+        if dem_values is None:
+            elevation_pending = True
+            if preference == "dem":
+                # An explicit DEM preference ignores file elevation entirely,
+                # so a failed drape leaves the route without elevation --
+                # never a silent fall back to a source the athlete opted out of.
+                ele_source = None
+                gain_m = loss_m = min_ele_m = max_ele_m = ft_per_mi = None
+                resampled_ele = [None] * len(resampled_dist)
+            # preference == "auto": already without elevation (use_file was False).
+        else:
+            dem_half_window_m = gpx_parse.smoothing_half_window_for(
+                gpx_parse.profile_roughness_m(resampled_dist, dem_values)
+            )
+            smoothed_dem = gpx_parse.smoothed_elevations(dem_values, resampled_dist, dem_half_window_m)
+            gain_m, loss_m = gpx_parse.gain_loss_m(smoothed_dem)
+            min_ele_m, max_ele_m = min(dem_values), max(dem_values)
+            if total_distance > 0:
+                ft_per_mi = (gain_m * FT_PER_M) / (total_distance / MILE_M)
+            ele_source = ELE_SOURCE_DEM
+            resampled_ele = cast(list[float | None], smoothed_dem)
+
+    has_ele = ele_source is not None
 
     conn.execute("DELETE FROM route_points WHERE route_id = ?", [route_id])
     conn.execute("DELETE FROM route_climbs WHERE route_id = ?", [route_id])
     conn.execute("DELETE FROM route_grade_bands WHERE route_id = ?", [route_id])
     conn.execute("DELETE FROM route_waypoints WHERE route_id = ?", [route_id])
 
+    point_rows = zip(resampled_latlng, resampled_dist, resampled_ele)
     conn.executemany(
         "INSERT INTO route_points (route_id, idx, lat, lng, dist_m, ele_m) VALUES (?, ?, ?, ?, ?, ?)",
-        [(route_id, idx, lat, lng, d, ele) for idx, (lat, lng, d, ele) in enumerate(resampled)],
+        [(route_id, idx, lat, lng, d, ele) for idx, ((lat, lng), d, ele) in enumerate(point_rows)],
     )
 
     if has_ele:
-        resampled_ele = cast(list[float], [p[3] for p in resampled])
-        climbs = gpx_parse.segment_climbs(resampled_dist, resampled_ele)
+        final_ele = cast(list[float], resampled_ele)
+        climbs = gpx_parse.segment_climbs(resampled_dist, final_ele)
         conn.executemany(
             "INSERT INTO route_climbs (route_id, idx, kind, start_m, end_m, gain_m, avg_grade) VALUES (?, ?, ?, ?, ?, ?, ?)",
             [(route_id, i, c["kind"], c["start_m"], c["end_m"], c["gain_m"], c["avg_grade"]) for i, c in enumerate(climbs)],
         )
-        bands = gpx_parse.grade_band_histogram(resampled_dist, resampled_ele)
+        bands = gpx_parse.grade_band_histogram(resampled_dist, final_ele)
         conn.executemany(
             "INSERT INTO route_grade_bands (route_id, band, share) VALUES (?, ?, ?)",
             [(route_id, band, share) for band, share in bands.items()],
@@ -354,14 +434,14 @@ def _apply_derived(
     conn.execute(
         """
         UPDATE routes SET
-            gpx_name = ?, derive_version = ?, has_elevation = ?,
+            gpx_name = ?, derive_version = ?, has_elevation = ?, ele_source = ?, elevation_pending = ?,
             distance_m = ?, gain_m = ?, loss_m = ?, min_ele_m = ?, max_ele_m = ?, ft_per_mi = ?,
             bbox_south = ?, bbox_west = ?, bbox_north = ?, bbox_east = ?,
             start_lat = ?, start_lng = ?, end_lat = ?, end_lng = ?, shape = ?
         WHERE route_id = ?
         """,
         [
-            track["gpx_name"], ROUTE_DERIVE_VERSION, int(has_ele),
+            track["gpx_name"], ROUTE_DERIVE_VERSION, int(has_ele), ele_source, int(elevation_pending),
             total_distance, gain_m, loss_m, min_ele_m, max_ele_m, ft_per_mi,
             south, west, north, east,
             start_lat, start_lng, end_lat, end_lng, shape,
@@ -384,6 +464,9 @@ def _row_to_summary(row: sqlite3.Row) -> RouteSummary:
         "source": row["source"],
         "tags": json.loads(row["tags_json"] or "[]"),
         "has_elevation": bool(row["has_elevation"]),
+        "elevation_source": row["elevation_source"],
+        "ele_source": row["ele_source"],
+        "elevation_pending": bool(row["elevation_pending"]),
         "distance_m": row["distance_m"],
         "gain_m": row["gain_m"],
         "loss_m": row["loss_m"],
@@ -564,11 +647,19 @@ def update_route(
     name: str | None = None,
     notes: str | None = None,
     tags: list[str] | None = None,
+    elevation_source: str | None = None,
 ) -> RouteDetail:
     """Partial update: only fields passed as non-None are changed. There is
     no way to blank out name/notes back to NULL through this call -- pass a
-    new value instead; tags can be cleared with an empty list."""
-    _get_route_row(conn, route_id)
+    new value instead; tags can be cleared with an empty list.
+
+    Changing elevation_source (auto/file/dem) re-derives the route's
+    elevation immediately under the new preference, cache-only -- the same
+    no-network guarantee as every other derive path. If the new preference
+    needs a tile that isn't cached yet, the route comes back pending; call
+    redrape_route to fetch it now instead of waiting for the next derive.
+    """
+    row = _get_route_row(conn, route_id)
     sets: list[str] = []
     params: list[object] = []
     if name is not None:
@@ -580,16 +671,62 @@ def update_route(
     if tags is not None:
         sets.append("tags_json = ?")
         params.append(json.dumps(tags))
+    if elevation_source is not None:
+        if elevation_source not in ELEVATION_SOURCE_PREFS:
+            raise ValueError(f"elevation_source must be one of {ELEVATION_SOURCE_PREFS}, got {elevation_source!r}")
+        sets.append("elevation_source = ?")
+        params.append(elevation_source)
     if sets:
         params.append(route_id)
         conn.execute(f"UPDATE routes SET {', '.join(sets)} WHERE route_id = ?", params)
         conn.commit()
+    if elevation_source is not None and elevation_source != row["elevation_source"]:
+        _redrape_route(conn, route_id)
+    return get_route(conn, route_id)
+
+
+def _redrape_route(conn: sqlite3.Connection, route_id: int, *, fetch_tiles: bool = False) -> None:
+    row = _get_route_row(conn, route_id)
+    doc = _load_doc(conn, row["file_id"])
+    if doc is None:
+        raise RouteNotFoundError(f"No route {route_id}")
+    track = next((t for t in doc["tracks"] if t["track_index"] == row["track_index"]), None)
+    if track is None:
+        raise RouteNotFoundError(f"No route {route_id}")
+    if fetch_tiles:
+        elevation.ensure_tiles(conn, points=[(p[0], p[1]) for p in track["points"]])
+    _apply_derived(conn, route_id, track, doc["waypoints"])
+    conn.commit()
+
+
+def redrape_route(conn: sqlite3.Connection, route_id: int) -> RouteDetail:
+    """Re-derive one route's elevation with network fetches allowed, unlike
+    every other derive path here (upload, full rebuild, a preference
+    change), which only read the elevation tile cache. Use after an area
+    import has cached tiles the route needed, or any time a pending drape
+    should be retried now instead of waiting for the next derive."""
+    _redrape_route(conn, route_id, fetch_tiles=True)
     return get_route(conn, route_id)
 
 
 def delete_route(conn: sqlite3.Connection, route_id: int) -> None:
-    _get_route_row(conn, route_id)
+    """Remove a route and what was derived for it. Its GPX file goes too when
+    no other track of that file still has a route; otherwise the track is
+    tombstoned so a re-derivation does not bring it back."""
+    row = _get_route_row(conn, route_id)
+    file_id, track_index = row["file_id"], row["track_index"]
+    for table in ("route_points", "route_waypoints", "route_climbs", "route_grade_bands", "route_legs"):
+        conn.execute(f"DELETE FROM {table} WHERE route_id = ?", [route_id])
+    conn.execute("UPDATE route_legs SET leg_route_id = NULL WHERE leg_route_id = ?", [route_id])
     conn.execute("DELETE FROM routes WHERE route_id = ?", [route_id])
+    siblings = conn.execute("SELECT COUNT(*) FROM routes WHERE file_id = ?", [file_id]).fetchone()[0]
+    if siblings:
+        conn.execute(
+            "INSERT OR IGNORE INTO route_tombstones (file_id, track_index) VALUES (?, ?)", [file_id, track_index]
+        )
+    else:
+        conn.execute("DELETE FROM gpx_files WHERE file_id = ?", [file_id])
+        conn.execute("DELETE FROM route_tombstones WHERE file_id = ?", [file_id])
     conn.commit()
 
 
@@ -834,7 +971,7 @@ def compose_route(
     return result
 
 
-def _build_gpx(name: str, points: list[tuple[float, float, float | None]]) -> bytes:
+def build_gpx(name: str, points: list[tuple[float, float, float | None]]) -> bytes:
     lines = [
         '<?xml version="1.0"?>',
         f'<gpx version="1.1" creator="miles" xmlns="{gpx_parse.GPX_NAMESPACE}">',
@@ -863,7 +1000,7 @@ def _save_composed_route(
 ) -> int:
     route_name = name or "Composed route"
     points = list(zip(profile_lat, profile_lng, profile_ele))
-    gpx_bytes = _build_gpx(route_name, points)
+    gpx_bytes = build_gpx(route_name, points)
     # A composed GPX from live legs is effectively unique every time (even
     # identical legs re-run now carry a fresh timestamp in the filename);
     # sha256 dedup still protects against re-saving the exact same bytes.

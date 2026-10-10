@@ -1,15 +1,10 @@
 import math
+import random
 
 import pytest
+from helpers import trkpt as _trkpt
 
 from miles import gpx_parse
-from miles.routes_spatial import equirect_distance_m
-
-
-def _trkpt(lat: float, lng: float, ele: float | None) -> str:
-    if ele is None:
-        return f'<trkpt lat="{lat}" lon="{lng}"/>'
-    return f'<trkpt lat="{lat}" lon="{lng}"><ele>{ele}</ele></trkpt>'
 
 
 def _gpx(body: str, creator: str = "Test") -> bytes:
@@ -73,14 +68,12 @@ def test_parse_rte_rtept():
     assert len(doc["tracks"][0]["points"]) == 4
 
 
-def test_parse_no_elevation_track():
-    points = _line_points(4)  # ele=None for every point
-    doc = gpx_parse.parse_gpx_bytes(_gpx(_track_xml(points)))
-    assert not gpx_parse.has_full_elevation(doc["tracks"][0]["points"])
-
-
-def test_parse_partial_elevation_counts_as_no_elevation():
-    points = [(40.0, -105.0, 100.0), (40.001, -105.0, None), (40.002, -105.0, 102.0)]
+@pytest.mark.parametrize(
+    "points",
+    [_line_points(4), [(40.0, -105.0, 100.0), (40.001, -105.0, None), (40.002, -105.0, 102.0)]],
+    ids=["no elevation", "partial elevation"],
+)
+def test_a_track_without_elevation_on_every_point_counts_as_having_none(points):
     doc = gpx_parse.parse_gpx_bytes(_gpx(_track_xml(points)))
     assert not gpx_parse.has_full_elevation(doc["tracks"][0]["points"])
 
@@ -99,39 +92,26 @@ def test_parse_drops_tracks_with_fewer_than_two_points():
     assert len(doc["tracks"]) == 1
 
 
-def test_parse_invalid_xml_raises():
+@pytest.mark.parametrize("data", [b"not xml at all <<<", _gpx('<wpt lat="1" lon="2"/>')], ids=["invalid xml", "no tracks"])
+def test_parse_rejects_a_file_with_no_usable_track(data: bytes):
     with pytest.raises(gpx_parse.GpxParseError):
-        gpx_parse.parse_gpx_bytes(b"not xml at all <<<")
-
-
-def test_parse_no_usable_tracks_raises():
-    with pytest.raises(gpx_parse.GpxParseError):
-        gpx_parse.parse_gpx_bytes(_gpx("<wpt lat=\"1\" lon=\"2\"/>"))
-
-
-def test_cumulative_distances_matches_equirect_sum():
-    points = _line_points(4)
-    dist = gpx_parse.cumulative_distances_m(points)
-    assert dist[0] == 0.0
-    expected_total = sum(
-        equirect_distance_m(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1])
-        for i in range(len(points) - 1)
-    )
-    assert dist[-1] == pytest.approx(expected_total)
+        gpx_parse.parse_gpx_bytes(data)
 
 
 def test_smoothed_elevations_reduces_jitter_amplitude():
-    # A flat line with alternating +/-1m jitter every point -- smoothing
+    # A flat line with alternating +/-1m jitter every 7m -- smoothing
     # should collapse this toward the mean.
     raw = [100.0 + (1.0 if i % 2 == 0 else -1.0) for i in range(21)]
-    smoothed = gpx_parse.smoothed_elevations(raw)
+    dist = [float(i * 7) for i in range(21)]
+    smoothed = gpx_parse.smoothed_elevations(raw, dist)
     assert max(smoothed) - min(smoothed) < max(raw) - min(raw)
 
 
 def test_gain_loss_ignores_sub_threshold_jitter():
     # Flat ground with jitter well under ELEVATION_NOISE_M should read ~0 gain/loss.
     raw = [100.0 + 0.5 * math.sin(i) for i in range(40)]
-    smoothed = gpx_parse.smoothed_elevations(raw)
+    dist = [float(i * 7) for i in range(40)]
+    smoothed = gpx_parse.smoothed_elevations(raw, dist)
     gain, loss = gpx_parse.gain_loss_m(smoothed)
     assert gain < 1.0
     assert loss < 1.0
@@ -146,10 +126,67 @@ def test_gain_loss_sums_a_real_climb_then_descent():
     plateau = [up[-1]] * 15
     down = [up[-1] - 2.0 * i for i in range(1, 26)]
     tail = [down[-1]] * 10
-    smoothed = gpx_parse.smoothed_elevations(lead_in + up + plateau + down + tail)
+    raw = lead_in + up + plateau + down + tail
+    dist = [float(i * 7) for i in range(len(raw))]
+    smoothed = gpx_parse.smoothed_elevations(raw, dist)
     gain, loss = gpx_parse.gain_loss_m(smoothed)
     assert gain == pytest.approx(50.0, abs=5.0)
     assert loss == pytest.approx(50.0, abs=5.0)
+
+
+def test_steady_climb_with_jitter_recovers_true_gain_at_dense_spacing():
+    # A steady climb at 7m spacing with +/-2m jitter riding on top should
+    # still recover close to the true elevation gain.
+    rng = random.Random(1234)
+    n = 200
+    spacing = 7.0
+    true_gain_per_point = 0.5
+    raw = [100.0 + true_gain_per_point * i + rng.uniform(-2.0, 2.0) for i in range(n)]
+    dist = [i * spacing for i in range(n)]
+    smoothed = gpx_parse.smoothed_elevations(raw, dist)
+    gain, _ = gpx_parse.gain_loss_m(smoothed)
+    true_gain = true_gain_per_point * (n - 1)
+    assert gain == pytest.approx(true_gain, rel=0.10)
+
+
+def test_smoothing_gain_matches_across_sample_spacing_for_short_steep_pitches():
+    # A series of ~60m-long steep up-and-over pitches (real short punchy
+    # climbs) on an otherwise flat course, sampled at two different point
+    # spacings along the same physical route. A fixed distance window
+    # smooths the same physical width regardless of how densely the points
+    # are sampled, so the total recovered gain should come out close either
+    # way -- a fixed point-count window would not, since it spans a much
+    # wider physical distance at the sparser spacing and flattens each pitch.
+    def build(spacing_m: float, n_pitches: int = 8, pitch_len: float = 60.0, pitch_gain: float = 18.0, gap_m: float = 140.0) -> tuple[list[float], list[float]]:
+        period = pitch_len + gap_m
+        total_m = n_pitches * period + 200.0
+        n = int(total_m / spacing_m) + 1
+        dist = [i * spacing_m for i in range(n)]
+        ele: list[float] = []
+        for d in dist:
+            offset = d - 100.0
+            if offset < 0:
+                ele.append(100.0)
+                continue
+            pos = offset % period
+            if pos < pitch_len / 2:
+                ele.append(100.0 + pitch_gain * pos / (pitch_len / 2))
+            elif pos < pitch_len:
+                ele.append(100.0 + pitch_gain * (pitch_len - pos) / (pitch_len / 2))
+            else:
+                ele.append(100.0)
+        return dist, ele
+
+    dist_dense, ele_dense = build(7.0)
+    dist_sparse, ele_sparse = build(25.0)
+
+    smoothed_dense = gpx_parse.smoothed_elevations(ele_dense, dist_dense)
+    smoothed_sparse = gpx_parse.smoothed_elevations(ele_sparse, dist_sparse)
+    gain_dense, _ = gpx_parse.gain_loss_m(smoothed_dense)
+    gain_sparse, _ = gpx_parse.gain_loss_m(smoothed_sparse)
+
+    assert gain_dense > 0
+    assert gain_sparse == pytest.approx(gain_dense, rel=0.10)
 
 
 def test_resample_points_hits_target_spacing():
@@ -165,18 +202,12 @@ def test_resample_points_hits_target_spacing():
     assert all(g == pytest.approx(20.0, abs=0.5) for g in gaps)
 
 
-def test_resample_carries_elevation_when_present():
-    points = _line_points(10, step_deg=0.0002, ele=[100.0 + i for i in range(10)])
+@pytest.mark.parametrize("with_elevation", [True, False])
+def test_resample_carries_elevation_only_when_every_point_has_it(with_elevation: bool):
+    points = _line_points(10, step_deg=0.0002, ele=[100.0 + i for i in range(10)] if with_elevation else None)
     dist = gpx_parse.cumulative_distances_m(points)
     resampled = gpx_parse.resample_points(points, dist)
-    assert all(p[3] is not None for p in resampled)
-
-
-def test_resample_ele_is_none_without_full_elevation():
-    points = _line_points(10, step_deg=0.0002)
-    dist = gpx_parse.cumulative_distances_m(points)
-    resampled = gpx_parse.resample_points(points, dist)
-    assert all(p[3] is None for p in resampled)
+    assert all((p[3] is not None) is with_elevation for p in resampled)
 
 
 def test_segment_climbs_finds_sustained_climb_and_descent():
@@ -197,17 +228,52 @@ def test_segment_climbs_drops_small_bumps():
     assert segments == []
 
 
-def test_grade_band_histogram_buckets_a_constant_grade_and_sums_to_one():
-    # Constant +7% grade for the whole profile -- lands in the 5..10 band.
+@pytest.mark.parametrize("grade, band", [(0.07, "5..10"), (0.0, "flat")])
+def test_grade_band_histogram_buckets_a_constant_grade_and_sums_to_one(grade: float, band: str):
     dist = [float(i * 20) for i in range(20)]
-    ele = [100.0 + 0.07 * d for d in dist]
-    bands = gpx_parse.grade_band_histogram(dist, ele)
-    assert bands["5..10"] == pytest.approx(1.0)
+    bands = gpx_parse.grade_band_histogram(dist, [100.0 + grade * d for d in dist])
+    assert bands[band] == pytest.approx(1.0)
     assert sum(bands.values()) == pytest.approx(1.0)
 
 
-def test_grade_band_histogram_flat_ground():
-    dist = [float(i * 20) for i in range(20)]
-    ele = [100.0] * 20
-    bands = gpx_parse.grade_band_histogram(dist, ele)
-    assert bands["flat"] == pytest.approx(1.0)
+def _synthetic_profile(
+    n: int, spacing_m: float, period_m: float, amplitude_m: float, grade: float,
+    jitter_m: float = 0.0, seed: int = 0,
+) -> tuple[list[float], list[float]]:
+    """A steady grade plus a sinusoidal roller, optionally with uniform
+    per-point jitter layered on top to stand in for GPS noise. Returns
+    (dist_m, ele_m); the jitter-free version is the "truth" a jittered
+    profile's smoothing is judged against."""
+    dist = [i * spacing_m for i in range(n)]
+    truth = [100.0 + d * grade + amplitude_m * math.sin(2 * math.pi * d / period_m) for d in dist]
+    if jitter_m <= 0:
+        return dist, truth
+    rng = random.Random(seed)
+    return dist, [e + rng.uniform(-jitter_m, jitter_m) for e in truth]
+
+
+def test_roughness_based_smoothing_keeps_short_rollers_gain():
+    """A smooth, terrain-model-like profile: a steady climb with real
+    short rollers riding on top. Roughness-based smoothing should pick a
+    small window and barely touch the gain."""
+    dist, ele = _synthetic_profile(n=500, spacing_m=20.0, period_m=250.0, amplitude_m=3.0, grade=0.03)
+    unsmoothed_gain, _ = gpx_parse.gain_loss_m(ele)
+    half_window = gpx_parse.smoothing_half_window_for(gpx_parse.profile_roughness_m(dist, ele))
+    smoothed_gain, _ = gpx_parse.gain_loss_m(gpx_parse.smoothed_elevations(ele, dist, half_window))
+    assert smoothed_gain == pytest.approx(unsmoothed_gain, rel=0.03)
+
+
+def test_roughness_based_smoothing_suppresses_gps_jitter():
+    """A noisy GPS-like profile: the same kind of smooth truth plus +/-3m
+    point-to-point jitter. Roughness-based smoothing should land near the
+    truth's gain, far below the raw jittery sum -- today's behavior,
+    unchanged by picking the window from roughness instead of a fixed
+    constant."""
+    dist, truth = _synthetic_profile(n=1500, spacing_m=7.0, period_m=500.0, amplitude_m=5.0, grade=0.02)
+    _, ele = _synthetic_profile(n=1500, spacing_m=7.0, period_m=500.0, amplitude_m=5.0, grade=0.02, jitter_m=3.0, seed=7)
+    truth_gain, _ = gpx_parse.gain_loss_m(truth)
+    raw_gain = sum(max(0.0, ele[i + 1] - ele[i]) for i in range(len(ele) - 1))
+    half_window = gpx_parse.smoothing_half_window_for(gpx_parse.profile_roughness_m(dist, ele))
+    smoothed_gain, _ = gpx_parse.gain_loss_m(gpx_parse.smoothed_elevations(ele, dist, half_window))
+    assert smoothed_gain == pytest.approx(truth_gain, rel=0.1)
+    assert smoothed_gain < raw_gain * 0.5
