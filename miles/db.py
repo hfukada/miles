@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -5,6 +6,15 @@ from pathlib import Path
 from typing_extensions import NotRequired, TypedDict
 
 from .weather import WeatherRow
+
+_logger = logging.getLogger(__name__)
+
+# An upsert that flags more activities than this as changed (each loses its
+# laps) is more likely a change in how values are formatted than real edits.
+CHANGED_ACTIVITIES_WARN_COUNT = 50
+# Smallest differences that count as an edit to a stored activity.
+CHANGED_DISTANCE_M = 1.0
+CHANGED_ELAPSED_S = 1.0
 
 
 class LapRow(TypedDict):
@@ -28,7 +38,7 @@ class ActivityRow(TypedDict):
     name: str | None
     description: NotRequired[str | None]
     sport_type: str
-    # Athlete-local wall time, naive (no offset/Z suffix) — e.g. "2026-07-23T18:09:03",
+    # Athlete-local wall time, naive (no offset/Z suffix) — e.g. "2026-01-04T22:00:00",
     # not Strava's UTC start_date. Every day-bucketing consumer (DATE(start_date),
     # strftime(...)) depends on this being local, so "today" (date.today() in the
     # athlete's timezone) lines up with activities that actually happened that day.
@@ -245,17 +255,62 @@ def effective_run_type_sql(alias: str = "") -> str:
     )
 
 
+def pace_sql(speed_expr: str) -> str:
+    """SQL expression for min/mile from an m/s speed expression (a column or an
+    aggregate of one); NULL when the speed is not positive."""
+    return f"CASE WHEN {speed_expr} > 0 THEN ROUND(26.8224 / {speed_expr}, 2) ELSE NULL END"
+
+
+def monday_sql(date_col: str) -> str:
+    """SQL expression for the ISO date of the Monday on or before a date column."""
+    return f"DATE({date_col}, '-' || ((CAST(strftime('%w', {date_col}) AS INTEGER) + 6) % 7) || ' days')"
+
+
 EFFECTIVE_RUN_TYPE_SQL: str = effective_run_type_sql()
 
 
-def connect(path: Path = DB_PATH) -> sqlite3.Connection:
+def connect(path: Path | None = None) -> sqlite3.Connection:
+    path = DB_PATH if path is None else path
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")  # wait out another connection's write lock rather than raising immediately
+    # WAL lets readers (queries, a backup) proceed during a write and a writer
+    # during reads; the mode is stored in the file, so this is a no-op after
+    # the first connection. It needs a local filesystem (shared-memory index).
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
+SCHEMA_VERSION = 3
+
+
+def add_missing_columns(conn: sqlite3.Connection, table: str, *columns: str) -> bool:
+    """ALTER TABLE ... ADD COLUMN for each column definition whose name the
+    table lacks. True when this call added any; a column another process
+    added in the meantime is its to report, not ours."""
+    have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    added = False
+    for column in columns:
+        if column.split()[0] in have:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+        else:
+            added = True
+    return added
+
+
 def init_db(conn: sqlite3.Connection) -> None:
+    """Create or upgrade every table, once per process at startup. A database
+    stamped with SCHEMA_VERSION (PRAGMA user_version) is left alone; changing
+    any table or column definition means bumping SCHEMA_VERSION and adding
+    the upgrade here so existing databases pick it up."""
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+        return
     conn.execute("""
         CREATE TABLE IF NOT EXISTS activities (
             activity_id   INTEGER PRIMARY KEY,
@@ -317,7 +372,9 @@ def init_db(conn: sqlite3.Connection) -> None:
             raw_json           TEXT
         )
     """)
-    for col in (
+    add_missing_columns(
+        conn,
+        "activities",
         "workout_label TEXT",
         "start_lat REAL",
         "start_lng REAL",
@@ -328,57 +385,45 @@ def init_db(conn: sqlite3.Connection) -> None:
         "dominant_intensity TEXT",
         "laps_synced_at TEXT",
         "description TEXT",
-    ):
-        try:
-            conn.execute(f"ALTER TABLE activities ADD COLUMN {col}")
-        except sqlite3.OperationalError:
-            pass
-    for col in ("raw_json TEXT", "lap_type TEXT", "intensity TEXT", "elapsed_time_s INTEGER"):
-        try:
-            conn.execute(f"ALTER TABLE laps ADD COLUMN {col}")
-        except sqlite3.OperationalError:
-            pass
-    for col in ("raw_json TEXT",):
-        try:
-            conn.execute(f"ALTER TABLE weather ADD COLUMN {col}")
-        except sqlite3.OperationalError:
-            pass
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS fitness_checkpoints (
-            month         TEXT PRIMARY KEY,
-            confidence    TEXT,
-            source_tier   INTEGER,
-            pace_5k       REAL,
-            pace_10k      REAL,
-            pace_half     REAL,
-            pace_marathon REAL
-        )
-    """)
+    )
+    add_missing_columns(conn, "laps", "raw_json TEXT", "lap_type TEXT", "intensity TEXT", "elapsed_time_s INTEGER")
+    add_missing_columns(conn, "weather", "raw_json TEXT")
+    # The seed table holds the checkpoints that include casual-effort races (derive
+    # pass 1) and is read only by pace-based race inference; fitness_checkpoints
+    # is the final table every other reader uses.
+    for checkpoint_table in ("fitness_checkpoints", "fitness_checkpoints_seed"):
+        conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {checkpoint_table} (
+                month         TEXT PRIMARY KEY,
+                confidence    TEXT,
+                source_tier   INTEGER,
+                pace_5k       REAL,
+                pace_10k      REAL,
+                pace_half     REAL,
+                pace_marathon REAL
+            )
+        """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
             value TEXT
         )
     """)
-    # One-shot backfill: activities.start_date changed meaning from Strava's UTC
-    # start_date to athlete-local wall time, stored naive (see ActivityRow.start_date
-    # above). Rows synced before this change still hold the old UTC value; rewrite
-    # them from raw_json's start_date_local, stripping its trailing 'Z' (fake — Strava
-    # tags local wall time with a 'Z' suffix as if it were UTC). Rows without raw_json
-    # or without a start_date_local in it keep their current value. Guarded by a meta
-    # stamp so this full-table rewrite runs exactly once per DB, not on every init_db
-    # call (e.g. hot reload) — safe to run on a fresh/empty db (touches zero rows) or
-    # re-run after the guard is cleared (content is already correct, so it's a no-op).
-    if conn.execute("SELECT value FROM meta WHERE key = 'start_date_local_migrated'").fetchone() is None:
-        conn.execute("""
-            UPDATE activities
-            SET start_date = rtrim(json_extract(raw_json, '$.start_date_local'), 'Z')
-            WHERE raw_json IS NOT NULL
-              AND json_extract(raw_json, '$.start_date_local') IS NOT NULL
-        """)
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('start_date_local_migrated', '1')"
-        )
+    # The start_date rewrite below once recorded itself under this key; the
+    # schema version stamp replaced it.
+    conn.execute("DELETE FROM meta WHERE key = 'start_date_local_migrated'")
+    # activities.start_date is athlete-local wall time, stored naive (see
+    # ActivityRow.start_date above). Rows synced before that held Strava's UTC
+    # value; rewrite them from raw_json's start_date_local, stripping its
+    # trailing 'Z' (Strava tags local wall time with a 'Z' suffix as if it
+    # were UTC). Rows without raw_json or a start_date_local keep their value.
+    # Re-running is a no-op on rows already rewritten.
+    conn.execute("""
+        UPDATE activities
+        SET start_date = rtrim(json_extract(raw_json, '$.start_date_local'), 'Z')
+        WHERE raw_json IS NOT NULL
+          AND json_extract(raw_json, '$.start_date_local') IS NOT NULL
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS athlete (
             id                   INTEGER PRIMARY KEY CHECK (id = 1),
@@ -418,19 +463,13 @@ def init_db(conn: sqlite3.Connection) -> None:
             UNIQUE(plan_id, version_n)
         )
     """)
-    # Migration: pre-v2 DBs have plan_versions without committed_at. Every
-    # version that existed before this column was added was committed under
-    # v1 semantics (no draft concept existed), so backfill committed_at =
-    # created_at exactly once — guarded by the ALTER succeeding only the
-    # first time a given DB is migrated. Must NOT re-run unconditionally:
-    # a real in-progress draft's committed_at is legitimately NULL forever
-    # until commit_plan stamps it, and re-running this UPDATE on every
-    # init_db call (e.g. hot reload) would silently "commit" it.
-    try:
-        conn.execute("ALTER TABLE plan_versions ADD COLUMN committed_at TEXT")
+    # Pre-v2 DBs have plan_versions without committed_at. Every version that
+    # existed before the column was added was committed (no draft concept
+    # existed), so backfill committed_at = created_at, only when the column is
+    # being added: a real in-progress draft's committed_at is legitimately
+    # NULL until commit_plan stamps it.
+    if add_missing_columns(conn, "plan_versions", "committed_at TEXT"):
         conn.execute("UPDATE plan_versions SET committed_at = created_at WHERE committed_at IS NULL")
-    except sqlite3.OperationalError:
-        pass
     conn.execute("""
         CREATE TABLE IF NOT EXISTS plan_weeks (
             version_id              INTEGER NOT NULL REFERENCES plan_versions(version_id) ON DELETE CASCADE,
@@ -498,11 +537,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (version_id, date, seq)
         )
     """)
-    for col in ("terrain TEXT", "note TEXT", "target_minutes REAL"):
-        try:
-            conn.execute(f"ALTER TABLE plan_days ADD COLUMN {col}")
-        except sqlite3.OperationalError:
-            pass
+    add_missing_columns(conn, "plan_days", "terrain TEXT", "note TEXT", "target_minutes REAL")
     # "Life happened" annotations — day-level reality that never touches the plan
     # or bumps a version. No FK to a version; scoped to the plan only.
     conn.execute("""
@@ -533,11 +568,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (plan_id, week_start)
         )
     """)
-    for col in ("actual_strength_days INTEGER",):
-        try:
-            conn.execute(f"ALTER TABLE plan_adherence ADD COLUMN {col}")
-        except sqlite3.OperationalError:
-            pass
+    add_missing_columns(conn, "plan_adherence", "actual_strength_days INTEGER")
 
     # Uploaded GPX bytes are ground truth (like activities' raw_json) --
     # everything else about a route is rebuildable from this blob. See
@@ -588,6 +619,18 @@ def init_db(conn: sqlite3.Connection) -> None:
             UNIQUE(file_id, track_index)
         )
     """)
+    # elevation_source is the athlete's preference (auto/file/dem); ele_source
+    # is which one actually populated route_points.ele_m last derive
+    # (file/dem/NULL); elevation_pending marks a 'dem'-eligible route whose
+    # last drape attempt found tiles missing from the cache, so the next
+    # derive or an explicit redrape should try again. See routes.py.
+    add_missing_columns(
+        conn,
+        "routes",
+        "elevation_source TEXT NOT NULL DEFAULT 'auto'",
+        "ele_source TEXT",
+        "elevation_pending INTEGER NOT NULL DEFAULT 0",
+    )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS route_points (
             route_id INTEGER NOT NULL REFERENCES routes(route_id) ON DELETE CASCADE,
@@ -631,6 +674,16 @@ def init_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (route_id, band)
         )
     """)
+    # A track the athlete deleted while other tracks of its file remain:
+    # derivation recreates a route for every track in a stored file, and skips
+    # these.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS route_tombstones (
+            file_id     INTEGER NOT NULL,
+            track_index INTEGER NOT NULL,
+            PRIMARY KEY (file_id, track_index)
+        )
+    """)
     # Composition definition for a route generated by compose_route (source
     # 'composed' in routes.source); kind='connector' rows have no
     # leg_route_id (a road/trail bit we don't have a GPX for).
@@ -648,7 +701,39 @@ def init_db(conn: sqlite3.Connection) -> None:
             PRIMARY KEY (route_id, idx)
         )
     """)
+
+    # These modules import this one (for connect()/DB_PATH), so importing
+    # them at module level here would cycle; function-body imports break it.
+    from .areas import init_area_schema
+    from .drive_starts import init_drive_schema
+    from .events import init_event_schema
+    from .extracts import init_extract_schema
+    from .network import init_network_schema
+    from .route_search import init_search_schema
+    from .terrain import init_terrain_schema
+    init_event_schema(conn)
+    init_terrain_schema(conn)
+    init_extract_schema(conn)
+    init_area_schema(conn)
+    init_network_schema(conn)
+    init_drive_schema(conn)
+    init_search_schema(conn)
+
+    conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+
+
+def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row is not None else default
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    """Upsert a meta row; the caller commits."""
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
 
 
 def mark_derive_dirty(conn: sqlite3.Connection, since_date: str) -> None:
@@ -666,9 +751,21 @@ def mark_derive_dirty(conn: sqlite3.Connection, since_date: str) -> None:
     )
 
 
-def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> None:
+def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list[int]:
+    """Insert or refresh the Strava-owned columns. Columns the app derives or
+    records itself (description, laps_synced_at, run_type_inferred, race and
+    intensity labels) are never in the SET list, so re-syncing an activity
+    does not wipe them. The exception is an activity whose distance, elapsed
+    time or start changed on Strava (a trimmed or merged recording): its laps
+    and description describe the old recording, so they are cleared and
+    laps_synced_at reset for the next sync to fetch them again; its terrain
+    segments and weather are dropped for the same reason. Returns the ids of
+    those activities so the caller can discard their cached raw streams once
+    the transaction has committed."""
+    changed, old_dates = _changed_activities(conn, rows)
+    rewritten_dates = _rewritten_dates(conn, rows)
     conn.executemany("""
-        INSERT OR REPLACE INTO activities (
+        INSERT INTO activities (
             activity_id, name, sport_type, start_date,
             workout_type, run_type,
             distance_m, moving_time_s, elapsed_time_s,
@@ -687,11 +784,122 @@ def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> None
             :gear_id, :strava_url, :synced_at,
             :start_lat, :start_lng, :raw_json
         )
+        ON CONFLICT(activity_id) DO UPDATE SET
+            name = excluded.name, sport_type = excluded.sport_type,
+            start_date = excluded.start_date,
+            workout_type = excluded.workout_type, run_type = excluded.run_type,
+            distance_m = excluded.distance_m, moving_time_s = excluded.moving_time_s,
+            elapsed_time_s = excluded.elapsed_time_s,
+            total_elevation_gain_m = excluded.total_elevation_gain_m,
+            average_speed_mps = excluded.average_speed_mps,
+            max_speed_mps = excluded.max_speed_mps,
+            average_heartrate = excluded.average_heartrate,
+            max_heartrate = excluded.max_heartrate,
+            average_cadence = excluded.average_cadence,
+            gear_id = excluded.gear_id, strava_url = excluded.strava_url,
+            synced_at = excluded.synced_at,
+            start_lat = excluded.start_lat, start_lng = excluded.start_lng,
+            raw_json = excluded.raw_json
     """, rows)
-    dates = [r["start_date"][:10] for r in rows if r["start_date"]]
+    if changed:
+        placeholders = ",".join("?" for _ in changed)
+        # Everything derived from the old recording goes, so the terrain
+        # backfill queues the activity again and the weather pass refetches it.
+        for table in ("terrain_segments", "terrain_segment_dates", "terrain_backfill_failures", "weather"):
+            conn.execute(f"DELETE FROM {table} WHERE activity_id IN ({placeholders})", changed)
+        conn.execute(f"DELETE FROM laps WHERE activity_id IN ({placeholders})", changed)
+        conn.execute(
+            f"UPDATE activities SET laps_synced_at = NULL, description = NULL WHERE activity_id IN ({placeholders})",
+            changed,
+        )
+    dates = rewritten_dates + old_dates
     if dates:
         mark_derive_dirty(conn, min(dates))
     conn.commit()
+    return changed
+
+
+# Excluded from the comparison of a listed row with the stored one: the key,
+# the sync stamp, and the raw payload, whose engagement counters move without
+# the activity itself changing.
+_VOLATILE_COLUMNS = frozenset({"activity_id", "synced_at", "raw_json"})
+
+
+def _rewritten(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list[ActivityRow]:
+    """The rows that are new or differ from what is stored."""
+    out: list[ActivityRow] = []
+    for row in rows:
+        columns = [c for c in row if c not in _VOLATILE_COLUMNS]
+        stored = conn.execute(
+            f"SELECT {', '.join(columns)} FROM activities WHERE activity_id = ?", [row["activity_id"]]
+        ).fetchone()
+        if stored is None or any(stored[c] != row[c] for c in columns):  # type: ignore[literal-required]
+            out.append(row)
+    return out
+
+
+def count_rewritten(conn: sqlite3.Connection, rows: list[ActivityRow]) -> int:
+    """How many of the rows upsert_activities would add or change."""
+    return len(_rewritten(conn, rows))
+
+
+def _rewritten_dates(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list[str]:
+    """Start dates of the rows that are new or differ from what is stored.
+    Listing an unchanged activity again must not dirty derived values."""
+    return [row["start_date"][:10] for row in _rewritten(conn, rows) if row["start_date"]]
+
+
+def _changed_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> tuple[list[int], list[str]]:
+    """(ids, previous start dates) of the stored activities that `rows` would
+    change in distance, elapsed time or start."""
+    changed: list[int] = []
+    old_dates: list[str] = []
+    for row in rows:
+        old = conn.execute(
+            "SELECT distance_m, elapsed_time_s, start_date FROM activities WHERE activity_id = ?",
+            [row["activity_id"]],
+        ).fetchone()
+        if old is None:
+            continue
+        start_moved = not _same_start(old["start_date"], row["start_date"])
+        if (
+            _differs(old["distance_m"], row["distance_m"], CHANGED_DISTANCE_M)
+            or _differs(old["elapsed_time_s"], row["elapsed_time_s"], CHANGED_ELAPSED_S)
+            or start_moved
+        ):
+            changed.append(row["activity_id"])
+            if old["start_date"] and start_moved:
+                old_dates.append(old["start_date"][:10])
+    if len(changed) > CHANGED_ACTIVITIES_WARN_COUNT:
+        _logger.warning(
+            "%d of %d upserted activities differ from what is stored; their laps will be refetched",
+            len(changed),
+            len(rows),
+        )
+    return changed, old_dates
+
+
+def _differs(old: float | None, new: float | None, tolerance: float) -> bool:
+    if old is None or new is None:
+        return old is not new
+    return abs(old - new) > tolerance
+
+
+def _same_start(old: str | None, new: str | None) -> bool:
+    """Whether two stored start_date strings are the same instant. Compared as
+    parsed datetimes so a change in how the string is written is not an edit;
+    a string that does not parse is compared as text."""
+    if old == new:
+        return True
+    if old is None or new is None:
+        return False
+    try:
+        a, b = datetime.fromisoformat(old), datetime.fromisoformat(new)
+    except ValueError:
+        return False
+    if (a.tzinfo is None) != (b.tzinfo is None):
+        return a.replace(tzinfo=None) == b.replace(tzinfo=None)
+    return a == b
 
 
 def upsert_weather(conn: sqlite3.Connection, rows: list[WeatherRow]) -> None:
@@ -737,6 +945,15 @@ def upsert_laps(conn: sqlite3.Connection, laps: list[LapRow]) -> None:
     conn.commit()
 
 
+def store_activity_laps(conn: sqlite3.Connection, activity_id: int, laps: list[LapRow]) -> None:
+    """Store a fetched activity's laps (there may be none) and stamp it so
+    the laps are not fetched again."""
+    if laps:
+        upsert_laps(conn, laps)
+    conn.execute("UPDATE activities SET laps_synced_at = datetime('now') WHERE activity_id = ?", (activity_id,))
+    conn.commit()
+
+
 def set_activity_description(conn: sqlite3.Connection, activity_id: int, description: str | None) -> None:
     conn.execute(
         "UPDATE activities SET description = ? WHERE activity_id = ?",
@@ -756,8 +973,7 @@ def get_last_sync_at(conn: sqlite3.Connection) -> str | None:
     since this column existed. Lets a reader answer "how stale is this data?"
     without guessing from activities.start_date, which says nothing once a
     sync completes with zero new activities."""
-    row = conn.execute("SELECT value FROM meta WHERE key = 'last_sync_at'").fetchone()
-    return row["value"] if row is not None else None
+    return get_meta(conn, "last_sync_at")
 
 
 def get_athlete(conn: sqlite3.Connection) -> AthleteRow | None:

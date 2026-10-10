@@ -1,124 +1,424 @@
+import logging
 import os
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
+from typing import cast
+from urllib.parse import urlsplit
 
-from dotenv import load_dotenv
+import requests
+import urllib3
+from dotenv import dotenv_values, find_dotenv, load_dotenv
+from requests.adapters import HTTPAdapter
 from stravalib import Client
+from stravalib.exc import Fault
 from stravalib.model import Lap, Stream, SummaryActivity
 from stravalib.protocol import RequestMethod
-from stravalib.util.limiter import RequestRate, get_rates_from_response_headers
+from stravalib.util.limiter import RateLimiter, get_rates_from_response_headers
 
+from . import envfile, http_client
 from .db import WORKOUT_TYPE_MAP, ActivityRow, LapRow
+from .errors import StravaUnavailableError
 
-load_dotenv()
+ENV_FILE_VAR = "MILES_ENV_FILE"
 
-# Latest daily/15-min usage observed from Strava's rate-limit response headers,
-# updated by _record_rate_limit on every request. Sync is single-threaded, so
-# a module global is sufficient.
-_latest_rate: RequestRate | None = None
+# Defined before the import-time environment load below, which logs.
+_logger = logging.getLogger(__name__)
 
 
-def _record_rate_limit(headers: dict[str, str], method: RequestMethod) -> None:
-    global _latest_rate
-    rate = get_rates_from_response_headers(headers, method)
+def _resolve_env_file() -> Path | None:
+    """The dotenv file the credentials come from: MILES_ENV_FILE if set, else
+    the first `.env` found walking up from this package."""
+    explicit = os.environ.get(ENV_FILE_VAR, "").strip()
+    if explicit:
+        return Path(explicit)
+    found = find_dotenv()
+    return Path(found) if found else None
+
+
+REFRESH_TOKEN_KEY = "STRAVA_REFRESH_TOKEN"
+
+
+def _load_environment(path: Path | None) -> None:
+    """Load the dotenv file into the environment. load_dotenv leaves variables
+    already set alone, but the file holds the newest refresh token: a process
+    restarted with the environment its container was created with would
+    otherwise start from a token Strava has since replaced."""
+    if path is None:
+        return
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as e:
+        # Only the exception type: a decode error's message quotes the bytes.
+        _logger.warning("could not read the Strava env file (%s); using the environment as it is", type(e).__name__)
+        return
+    load_dotenv(stream=StringIO(text))
+    on_disk = dotenv_values(stream=StringIO(text)).get(REFRESH_TOKEN_KEY)
+    if on_disk:
+        os.environ[REFRESH_TOKEN_KEY] = on_disk
+
+
+# Resolved once; a rotated refresh token is written back to this same file.
+ENV_FILE = _resolve_env_file()
+_load_environment(ENV_FILE)
+
+
+# stravalib logs every request's URL and query params at INFO. The access
+# token travels in a header, so none is exposed, but a request log line per
+# call is noise. Set here, not in an entry point, so the CLIs are covered too.
+logging.getLogger("stravalib.protocol").setLevel(logging.WARNING)
+
+# Seconds a Strava request may take to connect and to deliver a response.
+REQUEST_TIMEOUT_S = 30.0
+TOKEN_URL = "https://www.strava.com/oauth/token"
+# An access token is replaced when it has less than this long to live.
+REFRESH_MARGIN_S = 300.0
+
+# Transport failures: stravalib's own Fault (an HTTP error status) is a
+# RequestException too, and is handled before this tuple is consulted.
+_TRANSPORT_ERRORS = (requests.RequestException, urllib3.exceptions.HTTPError)
+
+WINDOW_S = 900
+
+
+@dataclass(frozen=True)
+class _RateObservation:
+    """What the most recent rate-limit headers said, and when. Strava's
+    windows are fixed: 15 minutes aligned to the hour, and the UTC day."""
+
+    daily_remaining: int
+    short_remaining: int
+    short_limit: int
+    at: datetime
+
+
+_observation: _RateObservation | None = None
+_rate_lock = threading.Lock()
+
+STRAVA_HOST = "www.strava.com"
+
+# Called with (daily_remaining, short_window_remaining) after each response
+# that carried rate-limit headers; events.install() points it at the database.
+rate_sink: Callable[[int, int], None] | None = None
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def fault_status(e: Fault) -> int | None:
+    """The HTTP status a Fault carries, None when it has no response."""
+    return e.response.status_code if e.response is not None else None
+
+
+def _report(kind: str, status: int | str) -> None:
+    http_client.report("strava", STRAVA_HOST, status, kind)
+
+
+def _kind_of(path: str) -> str:
+    """The endpoint kind of a Strava API path, for the request ledger."""
+    parts = path.rstrip("/").split("/")
+    if parts[-1] in ("activities", "laps", "streams"):
+        return parts[-1]
+    if len(parts) > 1 and parts[-2] == "activities":
+        return "detail"
+    return "other"
+
+
+@contextmanager
+def _transport_errors(kind: str) -> Iterator[None]:
+    """Turn a failure to get a response into StravaUnavailableError. The
+    library's message for it carries the request URL; none of it is kept."""
+    try:
+        yield
+    except Fault:
+        raise
+    except _TRANSPORT_ERRORS as e:
+        if not isinstance(e, requests.exceptions.JSONDecodeError):
+            # A body that would not parse arrived with a status of its own,
+            # already counted by the response hook; only a failure to get a
+            # response is an error.
+            _report(kind, "error")
+        raise StravaUnavailableError(f"Strava {kind} request failed ({type(e).__name__})") from None
+
+
+def _on_response(response: requests.Response, **_: object) -> None:
+    """Runs for every response from the Strava API, before its status is
+    checked: counts it in the request ledger by endpoint kind and status,
+    records the rate-limit headers, and drops the access token on a 401."""
+    global _observation
+    status = response.status_code
+    _report(_kind_of(urlsplit(response.url).path), status)
+    rate = get_rates_from_response_headers(
+        dict(response.headers), cast(RequestMethod, (response.request.method or "GET").upper())
+    )
     if rate is not None:
-        _latest_rate = rate
+        daily = rate.long_limit - rate.long_usage
+        short = rate.short_limit - rate.short_usage
+        with _rate_lock:
+            _observation = _RateObservation(daily, short, rate.short_limit, _now())
+        if rate_sink is not None:
+            rate_sink(daily, short)
+    if status == 401:
+        _forget_access_token()
+        http_client.report_outcome("strava", 401)
+
+
+def note_window_elapsed() -> None:
+    """A 15-minute window has passed since the last response: its allowance is
+    whole again, though no new response has said so yet. The observation keeps
+    its own time, so the daily figure is still aged by the day it was seen."""
+    global _observation
+    with _rate_lock:
+        if _observation is not None:
+            _observation = replace(_observation, short_remaining=_observation.short_limit)
+
+
+def _window(when: datetime) -> int:
+    return int(when.timestamp() // WINDOW_S)
 
 
 def daily_calls_remaining() -> int | None:
-    """Daily Strava API calls left, per the most recent response headers seen
-    in this process. None until at least one request has been made."""
-    if _latest_rate is None:
+    """Daily Strava API calls left, per the most recent response headers seen.
+    None before any request, and once the UTC day has changed since they were
+    seen: the new day's figure is not known until a response reports it."""
+    with _rate_lock:
+        seen = _observation
+    if seen is None or seen.at.date() != _now().date():
         return None
-    return _latest_rate.long_limit - _latest_rate.long_usage
+    return seen.daily_remaining
 
 
-def _refresh_and_get_token() -> str:
-    client = Client()
-    result = client.refresh_access_token(
-        client_id=int(os.environ["STRAVA_CLIENT_ID"]),
-        client_secret=os.environ["STRAVA_CLIENT_SECRET"],
-        refresh_token=os.environ["STRAVA_REFRESH_TOKEN"],
-    )
-    new_refresh = result["refresh_token"]
-    if new_refresh != os.environ["STRAVA_REFRESH_TOKEN"]:
-        _write_env_key("STRAVA_REFRESH_TOKEN", new_refresh)
-        os.environ["STRAVA_REFRESH_TOKEN"] = new_refresh
-    return result["access_token"]
+def short_window_calls_remaining() -> int | None:
+    """Calls left in the current 15-minute window, per the most recent response
+    headers seen. A window that has ended since is whole again. None before any
+    request."""
+    with _rate_lock:
+        seen = _observation
+    if seen is None:
+        return None
+    if _window(seen.at) != _window(_now()):
+        return seen.short_limit
+    return seen.short_remaining
 
 
-def _write_env_key(key: str, value: str) -> None:
-    env_path = Path(".env")
-    if not env_path.exists():
+class _TimeoutAdapter(HTTPAdapter):
+    """Applies REQUEST_TIMEOUT_S to requests that name no timeout, which is
+    every request stravalib makes."""
+
+    def send(self, request, **kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = REQUEST_TIMEOUT_S
+        return super().send(request, **kwargs)
+
+
+_session_lock = threading.Lock()
+_session: requests.Session | None = None
+# One adapter for every session, so connections are pooled across the
+# per-token sessions api_session() hands out.
+_adapter = _TimeoutAdapter()
+
+
+def _http_session() -> requests.Session:
+    global _session
+    with _session_lock:
+        if _session is None:
+            _session = requests.Session()
+            _session.mount("https://", _adapter)
+        return _session
+
+
+def _api_session(access_token: str) -> requests.Session:
+    """A session that sends the access token as a bearer header. stravalib
+    would otherwise put it in every request's query string, where request-
+    library errors and debug logs repeat it."""
+    session = requests.Session()
+    session.mount("https://", _adapter)
+    session.headers["Authorization"] = f"Bearer {access_token}"
+    session.hooks["response"].append(_on_response)
+    return session
+
+
+def oauth_token_request(form: dict[str, str]) -> dict[str, object]:
+    """POST to Strava's token endpoint with the credentials in the form body
+    (stravalib puts them in the URL query, which request-library exceptions
+    then repeat). Raises StravaUnavailableError when no response arrives and
+    Fault on an error status. The Fault carries a bare response with only the
+    status: the real one holds the request, and its body holds the secret."""
+    try:
+        response = _http_session().post(TOKEN_URL, data=form, timeout=REQUEST_TIMEOUT_S)
+    except _TRANSPORT_ERRORS as e:
+        _report("token", "error")
+        raise StravaUnavailableError(f"Strava token request failed ({type(e).__name__})") from None
+    if not response.ok:
+        status = 401 if response.status_code in (400, 401) else response.status_code
+        _report("token", status)
+        # A 429 is the gate's to handle: it waits and retries, and records the
+        # outcome when it gives up. miles-auth's exchange runs without a gate,
+        # so a 429 there is never recorded.
+        if status != 429:
+            http_client.report_outcome("strava", status)
+        rejected = requests.Response()
+        rejected.status_code = response.status_code
+        raise Fault(f"Strava token request rejected ({response.status_code})", response=rejected)
+    _report("token", 200)
+    try:
+        payload = response.json()
+    except ValueError:
+        raise StravaUnavailableError("Strava token response was not JSON") from None
+    if not isinstance(payload, dict):
+        raise StravaUnavailableError("Strava token response was not a JSON object")
+    return payload
+
+
+def _exchange_refresh_token() -> dict[str, object]:
+    """Trade the refresh token for an access token."""
+    return oauth_token_request({
+        "client_id": os.environ["STRAVA_CLIENT_ID"],
+        "client_secret": os.environ["STRAVA_CLIENT_SECRET"],
+        "refresh_token": os.environ[REFRESH_TOKEN_KEY],
+        "grant_type": "refresh_token",
+    })
+
+
+def _persist_refresh_token(token: str) -> None:
+    """Keep a rotated refresh token: in this process's environment always, and
+    on disk in the dotenv file the credentials were loaded from. Strava
+    invalidates the old refresh token when it issues a new one, so a token
+    that is not saved is lost at the next restart."""
+    os.environ[REFRESH_TOKEN_KEY] = token
+    if ENV_FILE is None:
+        _logger.warning(
+            "Strava issued a new refresh token but no dotenv file was loaded, so it is not saved; "
+            "set %s or copy STRAVA_REFRESH_TOKEN from the environment before restarting",
+            ENV_FILE_VAR,
+        )
         return
-    lines = env_path.read_text().splitlines()
-    updated = [f"{key}={value}" if l.startswith(f"{key}=") else l for l in lines]
-    env_path.write_text("\n".join(updated) + "\n")
+    try:
+        envfile.upsert_key(ENV_FILE, REFRESH_TOKEN_KEY, token)
+    except OSError as e:
+        _logger.warning(
+            "Strava issued a new refresh token but %s could not be updated (%s); "
+            "put the new STRAVA_REFRESH_TOKEN there by hand before restarting",
+            ENV_FILE,
+            type(e).__name__,
+        )
+
+
+_token_lock = threading.Lock()
+_access_token: str | None = None
+_access_token_expires_at = 0.0
+
+
+def _forget_access_token() -> None:
+    global _access_token
+    with _token_lock:
+        _access_token = None
+
+
+def _current_access_token() -> tuple[str, float]:
+    """The access token and its expiry, refreshed when it is missing or within
+    REFRESH_MARGIN_S of expiring. Held in memory only: the database is backed
+    up and readable by queries, so no token goes there."""
+    global _access_token, _access_token_expires_at
+    with _token_lock:
+        if _access_token is None or _access_token_expires_at - time.time() <= REFRESH_MARGIN_S:
+            result = _exchange_refresh_token()
+            try:
+                token = str(result["access_token"])
+                expires_at = float(result["expires_at"])  # type: ignore[arg-type]
+                new_refresh = str(result["refresh_token"])
+            except (KeyError, TypeError, ValueError):
+                raise StravaUnavailableError("Strava token response was missing fields") from None
+            _access_token = token
+            _access_token_expires_at = expires_at
+            if new_refresh != os.environ[REFRESH_TOKEN_KEY]:
+                _persist_refresh_token(new_refresh)
+        return _access_token, _access_token_expires_at
+
+
+def _secs(td: int | timedelta | None) -> int | None:
+    if td is None:
+        return None
+    return int(td.total_seconds()) if isinstance(td, timedelta) else int(td)
+
+
+def _flt(q: float | None) -> float | None:
+    return float(q) if q is not None else None
 
 
 def _lap_row(lap: Lap, activity_id: int) -> LapRow:
-    def secs(td: int | timedelta | None) -> int | None:
-        if td is None:
-            return None
-        return int(td.total_seconds()) if isinstance(td, timedelta) else int(td)
-
-    def flt(q: float | None) -> float | None:
-        return float(q) if q is not None else None
-
     assert lap.id is not None, "Lap must have an id"
     assert lap.lap_index is not None, "Lap must have a lap_index"
     return {
         "lap_id": lap.id,
         "activity_id": activity_id,
         "lap_index": lap.lap_index,
-        "distance_m": flt(lap.distance),
-        "moving_time_s": secs(lap.moving_time),
-        "elapsed_time_s": secs(lap.elapsed_time),
-        "average_speed_mps": flt(lap.average_speed),
+        "distance_m": _flt(lap.distance),
+        "moving_time_s": _secs(lap.moving_time),
+        "elapsed_time_s": _secs(lap.elapsed_time),
+        "average_speed_mps": _flt(lap.average_speed),
         "average_heartrate": lap.average_heartrate,
         "max_heartrate": lap.max_heartrate,
         "average_cadence": lap.average_cadence,
-        "total_elevation_gain_m": flt(lap.total_elevation_gain),
+        "total_elevation_gain_m": _flt(lap.total_elevation_gain),
         "pace_zone": lap.pace_zone,
         "raw_json": lap.model_dump_json(),
     }
 
 
 def _get_client() -> Client:
-    access_token = _refresh_and_get_token()
-    client = Client(access_token=access_token)
-    client.refresh_token = os.environ.get("STRAVA_REFRESH_TOKEN", "")
-    client.token_expires = int(time.time()) + 3600
-    client.protocol.rate_limiter.rules.append(_record_rate_limit)
+    access_token, expires_at = _current_access_token()
+    # No refresh token or app credentials are handed to stravalib: its own
+    # refresh would replace the token inside a long-lived client, and a
+    # rotated refresh token would never reach the dotenv file. The access
+    # token is not handed over either; the session sends it as a header.
+    # stravalib's default limiter can sleep a request until the next UTC
+    # midnight; this one has no rules, the session's response hook records the
+    # allowance, and waiting is the callers' decision (strava_budget).
+    client = Client(
+        token_expires=int(expires_at),
+        requests_session=_api_session(access_token),
+        rate_limiter=RateLimiter(),
+    )
+    client.protocol.client_id = None
+    client.protocol.client_secret = None
     return client
 
 
-def get_activity_laps_batch(activity_ids: list[int]) -> Iterator[tuple[int, list[LapRow]]]:
-    """Yield (activity_id, laps) for each id using a single token refresh."""
+def get_activity_laps(activity_id: int) -> list[LapRow]:
     client = _get_client()
-    for aid in activity_ids:
-        yield aid, [_lap_row(lap, aid) for lap in client.get_activity_laps(aid)]
+    with _transport_errors("laps"):
+        return [_lap_row(lap, activity_id) for lap in client.get_activity_laps(activity_id)]
+
+
+def get_activity_detail(activity_id: int) -> tuple[str, list[LapRow] | None]:
+    """(description, laps) from one DetailedActivity request, which carries
+    both. The description is "" when the activity has none, so "has none" can
+    be stored and told apart from "not fetched". laps is None when the response
+    did not include any."""
+    client = _get_client()
+    with _transport_errors("detail"):
+        detail = client.get_activity(activity_id)
+    laps = None if detail.laps is None else [_lap_row(lap, activity_id) for lap in detail.laps]
+    return detail.description or "", laps
 
 
 def get_activities(after_ts: str | None = None) -> Iterator[ActivityRow]:
     client = _get_client()
-    for activity in client.get_activities(after=after_ts):
-        yield row_from_activity(activity)
+    with _transport_errors("activities"):
+        for activity in client.get_activities(after=after_ts):
+            yield row_from_activity(activity)
 
 
 def row_from_activity(activity: SummaryActivity) -> ActivityRow:
     wt = int(activity.workout_type or 0)
     sport = str(activity.sport_type.root) if activity.sport_type is not None else ""
-
-    def secs(td: int | timedelta | None) -> int | None:
-        if td is None:
-            return None
-        return int(td.total_seconds()) if isinstance(td, timedelta) else int(td)
-
-    def flt(q: float | None) -> float | None:
-        return float(q) if q is not None else None
 
     latlng = activity.start_latlng
     start_lat: float | None = latlng.lat if latlng is not None else None
@@ -138,12 +438,12 @@ def row_from_activity(activity: SummaryActivity) -> ActivityRow:
         "start_date": start_date,
         "workout_type": wt,
         "run_type": WORKOUT_TYPE_MAP.get(wt, "easy"),
-        "distance_m": flt(activity.distance),
-        "moving_time_s": secs(activity.moving_time),
-        "elapsed_time_s": secs(activity.elapsed_time),
-        "total_elevation_gain_m": flt(activity.total_elevation_gain),
-        "average_speed_mps": flt(activity.average_speed),
-        "max_speed_mps": flt(activity.max_speed),
+        "distance_m": _flt(activity.distance),
+        "moving_time_s": _secs(activity.moving_time),
+        "elapsed_time_s": _secs(activity.elapsed_time),
+        "total_elevation_gain_m": _flt(activity.total_elevation_gain),
+        "average_speed_mps": _flt(activity.average_speed),
+        "max_speed_mps": _flt(activity.max_speed),
         "average_heartrate": activity.average_heartrate,
         "max_heartrate": activity.max_heartrate,
         "average_cadence": activity.average_cadence,
@@ -156,19 +456,14 @@ def row_from_activity(activity: SummaryActivity) -> ActivityRow:
     }
 
 
-def get_activity_description(activity_id: int) -> str | None:
-    client = _get_client()
-    detail = client.get_activity(activity_id)
-    return detail.description
-
-
 STREAM_TYPES = [
-    "time", "distance", "altitude", "velocity_smooth",
-    "heartrate", "cadence", "grade_smooth", "moving",
+    "time", "distance", "latlng", "altitude", "velocity_smooth",
+    "heartrate", "cadence", "watts", "temp", "moving", "grade_smooth",
 ]
 
 
-def get_activity_streams_raw(activity_id: int) -> dict[str, Stream]:
+def get_activity_streams(activity_id: int) -> dict[str, Stream]:
     client = _get_client()
-    streams = client.get_activity_streams(activity_id, types=STREAM_TYPES)
+    with _transport_errors("streams"):
+        streams = client.get_activity_streams(activity_id, types=STREAM_TYPES)
     return {str(k): v for k, v in streams.items()}

@@ -10,10 +10,12 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.30",
     "aiofiles>=23.0",
+    "anyio>=4.0",
     "pandas>=2.2",
-    "pyarrow>=17.0",
     "defusedxml>=0.7.1",
     "requests>=2.31",
+    "pillow>=12.3.0",
+    "osmium>=4.3.1",
 ]
 
 [project.scripts]
@@ -23,6 +25,10 @@ miles-mcp = "miles.mcp_server:main"
 miles-api = "miles.api:main"
 miles-derive = "miles.derive:main"
 miles-route-import = "miles.route_import:main"
+miles-terrain-backfill = "miles.terrain_backfill:main"
+miles-terrain-rebuild = "miles.terrain_backfill:rebuild_main"
+miles-area-import = "miles.area_import:main"
+miles-area-refresh = "miles.area_refresh:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -31,8 +37,11 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "playwright>=1.52",
+    # Only to write legacy .parquet fixtures in tests/test_streams.py.
+    "pyarrow>=17.0",
     "pyright>=1.1.411",
     "pytest>=8.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.pyright]

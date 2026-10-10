@@ -1,10 +1,40 @@
 import json
+import logging
 import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing_extensions import TypedDict
+
+from . import http_client
+
+_logger = logging.getLogger(__name__)
+
+
+class WeatherRefusedError(ValueError):
+    """The service refused every request window for a location."""
+
+
+# Statuses that mean this window's request can never be answered; a no-data
+# marker is stored for its activities. Any other client error (credentials,
+# a moved endpoint) says nothing about the window and stops the pass.
+UNANSWERABLE_WINDOW_STATUSES = (400, 422)
+
+ATTRIBUTION = "Weather data by Open-Meteo.com (https://open-meteo.com/), CC BY 4.0"
+
+HOURLY_VARIABLES = (
+    "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,windspeed_10m"
+)
+
+# Open-Meteo weighs a request by its date span (one unit per 14 days) and
+# variable count (one per 10). A window never spans more than this many days,
+# so every request weighs one call.
+MAX_WINDOW_DAYS = 14
+
+# An activity whose successful response held no matching hours is not asked
+# about again until this long after the attempt.
+NO_DATA_RETRY_DAYS = 30
 
 
 class WeatherRow(TypedDict):
@@ -18,7 +48,7 @@ class WeatherRow(TypedDict):
     humidity_avg: float | None
     precip_mm: float | None
     wind_kph_avg: float | None
-    hourly_json: str
+    hourly_json: str | None
     raw_json: str
 
 
@@ -26,6 +56,16 @@ class WeatherSpec(TypedDict):
     activity_id: int
     start_dt: datetime
     duration_s: int
+
+
+@dataclass(frozen=True)
+class Window:
+    """One request: the specs it covers and the inclusive date span asked for."""
+
+    specs: list[WeatherSpec]
+    start_date: date
+    end_date: date
+    use_archive: bool
 
 
 def _api_url(start_date: date, end_date: date, lat: float, lng: float, use_archive: bool) -> str:
@@ -39,7 +79,7 @@ def _api_url(start_date: date, end_date: date, lat: float, lng: float, use_archi
         "longitude": round(lng, 4),
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "hourly": "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation,windspeed_10m",
+        "hourly": HOURLY_VARIABLES,
         "timezone": "UTC",
         "wind_speed_unit": "kmh",
     })
@@ -101,6 +141,10 @@ def _build_weather_row(
     run_wind = _floats("wind_kph")
     run_precip = _floats("precip_mm")
 
+    # Hours that exist but carry no value are no data and make no real row.
+    if not (run_temps or run_apparent or run_humid or run_wind or run_precip):
+        return None
+
     return {
         "activity_id": activity_id,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -117,46 +161,97 @@ def _build_weather_row(
     }
 
 
-def fetch_weather_bulk(
+def no_data_row(activity_id: int) -> WeatherRow:
+    """A weather row with no values: the service answered but had no hours for
+    this activity. Distinguished from real rows by a NULL `hourly_json`."""
+    return {
+        "activity_id": activity_id,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "temp_c_start": None,
+        "temp_c_end": None,
+        "temp_c_avg": None,
+        "temp_c_max": None,
+        "apparent_temp_c_max": None,
+        "humidity_avg": None,
+        "precip_mm": None,
+        "wind_kph_avg": None,
+        "hourly_json": None,
+        "raw_json": json.dumps({"no_data": True}),
+    }
+
+
+def _utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
+def plan_windows(specs: list[WeatherSpec], today: date | None = None) -> list[Window]:
+    """Group specs (all at one location) into request windows. Recent runs go
+    to the forecast endpoint, older ones to the archive; within each, a new
+    window starts when the window would pass MAX_WINDOW_DAYS."""
+    today = today or date.today()
+    archive_cutoff = today - timedelta(days=5)
+    spans = sorted(
+        (
+            (
+                _utc(s["start_dt"]).date(),
+                (_utc(s["start_dt"]) + timedelta(seconds=s["duration_s"])).date(),
+                s,
+            )
+            for s in specs
+        ),
+        key=lambda t: t[0],
+    )
+    windows: list[Window] = []
+    for use_archive in (True, False):
+        subset = [t for t in spans if (t[0] <= archive_cutoff) == use_archive]
+        current: list[WeatherSpec] = []
+        first = last = date.min
+        for start, end, spec in subset:
+            if current and (max(last, end) - first).days + 1 > MAX_WINDOW_DAYS:
+                windows.append(Window(current, first, last, use_archive))
+                current = []
+            if not current:
+                first, last = start, end
+            else:
+                last = max(last, end)
+            current.append(spec)
+        if current:
+            windows.append(Window(current, first, last, use_archive))
+    return windows
+
+
+def fetch_weather_windows(
     specs: list[WeatherSpec],
     lat: float,
     lng: float,
-) -> list[WeatherRow]:
-    """Fetch weather for multiple activities at the same location.
+) -> Iterator[tuple[list[WeatherRow], list[WeatherRow]]]:
+    """Fetch weather for activities at one location, one request per window.
 
-    Makes at most 2 API calls (one archive + one forecast) regardless of batch size.
-    The archive endpoint covers all data older than 5 days; forecast covers recent runs.
+    Yields (rows, no_data_rows) per window as it completes, so a caller can
+    store progress before a later request fails. A request refused with one of
+    UNANSWERABLE_WINDOW_STATUSES yields no-data rows for its specs and the
+    next window is tried; if every window is refused that way, the
+    refusals are no longer about the windows and WeatherRefusedError is
+    raised once their markers are yielded. Any other failure raises (after
+    http_client's retries) and nothing past it is attempted.
     raw_json stores compact metadata (not the full response) to avoid per-activity bloat.
     """
-    if not specs:
-        return []
-
-    today = date.today()
-    archive_cutoff = today - timedelta(days=5)
-
-    archive_specs = [s for s in specs if s["start_dt"].date() <= archive_cutoff]
-    forecast_specs = [s for s in specs if s["start_dt"].date() > archive_cutoff]
-
-    results: list[WeatherRow] = []
-
-    for subset, use_archive in [(archive_specs, True), (forecast_specs, False)]:
-        if not subset:
-            continue
-
-        # Date range spanning all activities in this subset (including their end times)
-        all_dates: list[date] = []
-        for s in subset:
-            all_dates.append(s["start_dt"].date())
-            all_dates.append((s["start_dt"] + timedelta(seconds=s["duration_s"])).date())
-        start_date = min(all_dates)
-        end_date = max(all_dates)
-
-        url = _api_url(start_date, end_date, lat, lng, use_archive)
+    windows = plan_windows(specs)
+    refused = 0
+    for window in windows:
+        url = _api_url(window.start_date, window.end_date, lat, lng, window.use_archive)
         try:
-            with urllib.request.urlopen(url, timeout=60) as resp:
-                data = json.loads(resp.read())
-        except (urllib.error.URLError, OSError, json.JSONDecodeError):
-            continue
+            data = json.loads(http_client.request(http_client.OPEN_METEO, url))
+        except urllib.error.HTTPError as e:
+            if e.code in UNANSWERABLE_WINDOW_STATUSES:
+                _logger.warning(
+                    "weather window %s to %s refused with status %s",
+                    window.start_date, window.end_date, e.code,
+                )
+                refused += 1
+                yield [], [no_data_row(spec["activity_id"]) for spec in window.specs]
+                continue
+            raise
 
         hourly = data.get("hourly", {})
         times: list[str] = hourly.get("time", [])
@@ -171,37 +266,25 @@ def fetch_weather_bulk(
             "bulk_fetch": True,
             "lat": lat,
             "lng": lng,
-            "start_date": start_date.isoformat(),
-            "end_date": end_date.isoformat(),
+            "start_date": window.start_date.isoformat(),
+            "end_date": window.end_date.isoformat(),
         })
 
-        for spec in subset:
-            start_dt = spec["start_dt"]
-            if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=timezone.utc)
+        rows: list[WeatherRow] = []
+        empty: list[WeatherRow] = []
+        for spec in window.specs:
+            start_dt = _utc(spec["start_dt"])
             end_dt = start_dt + timedelta(seconds=spec["duration_s"])
-
             run_hours = _extract_run_hours(
                 time_index, temps, apparent, humidity_list, precip_list, wind_list,
                 start_dt, end_dt,
             )
             row = _build_weather_row(run_hours, spec["activity_id"], bulk_meta)
-            if row is not None:
-                results.append(row)
+            if row is None:
+                empty.append(no_data_row(spec["activity_id"]))
+            else:
+                rows.append(row)
+        yield rows, empty
 
-    return results
-
-
-def fetch_weather(
-    activity_id: int,
-    lat: float,
-    lng: float,
-    start_dt: datetime,
-    duration_s: int,
-) -> WeatherRow | None:
-    """Fetch weather for a single activity. Use fetch_weather_bulk for batches."""
-    rows = fetch_weather_bulk(
-        [{"activity_id": activity_id, "start_dt": start_dt, "duration_s": duration_s}],
-        lat, lng,
-    )
-    return rows[0] if rows else None
+    if windows and refused == len(windows):
+        raise WeatherRefusedError(f"every weather window at {lat:.1f},{lng:.1f} was refused")

@@ -6,11 +6,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import click
-from dotenv import load_dotenv
 from stravalib import Client
-from stravalib.protocol import AccessInfo
 
-load_dotenv()
+from . import envfile, outbound, strava_client
 
 _auth_code: str | None = None
 
@@ -29,25 +27,9 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
-def _upsert_env(key: str, value: str) -> None:
-    env_path = Path(".env")
-    content = env_path.read_text() if env_path.exists() else ""
-    lines = content.splitlines()
-    found = False
-    new_lines = []
-    for line in lines:
-        if line.startswith(f"{key}="):
-            new_lines.append(f"{key}={value}")
-            found = True
-        else:
-            new_lines.append(line)
-    if not found:
-        new_lines.append(f"{key}={value}")
-    env_path.write_text("\n".join(new_lines) + "\n")
-
-
 @click.command()
 def main() -> None:
+    outbound.claim()
     client_id = os.environ.get("STRAVA_CLIENT_ID")
     client_secret = os.environ.get("STRAVA_CLIENT_SECRET")
     if not client_id or not client_secret:
@@ -81,15 +63,15 @@ def main() -> None:
     if not _auth_code:
         raise SystemExit("No authorization code received.")
 
-    result = client.exchange_code_for_token(
-        client_id=int(client_id),
-        client_secret=client_secret,
-        code=_auth_code,
-    )
-    token: AccessInfo = result[0] if isinstance(result, tuple) else result
-    _upsert_env("STRAVA_ACCESS_TOKEN", token["access_token"])
-    _upsert_env("STRAVA_REFRESH_TOKEN", token["refresh_token"])
-    print("Tokens saved to .env — you're ready to run `miles-sync`.")
+    token = strava_client.oauth_token_request({
+        "client_id": str(client_id_int),
+        "client_secret": client_secret,
+        "code": _auth_code,
+        "grant_type": "authorization_code",
+    })
+    env_file = strava_client.ENV_FILE or Path(".env")
+    envfile.upsert_key(env_file, "STRAVA_REFRESH_TOKEN", str(token["refresh_token"]))
+    print(f"Refresh token saved to {env_file} — you're ready to run `miles-sync`.")
 
 
 if __name__ == "__main__":
