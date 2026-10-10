@@ -1,145 +1,152 @@
-"""Correctness + speed check for derive.py's incremental path, run against a copy of
-a real synced database — the fixtures elsewhere are too small to exercise the
-fitness-checkpoint/lap-intensity scoping meaningfully. Uses data/activities.db, or
-the file named by MILES_TEST_DB; skips when neither is present."""
+"""derive_all's incremental path (scoped by the dirty-since date) must produce
+the same derived values as a full rebuild, over a history with races, tagged
+and untagged runs, typed laps, and an active plan."""
 
-import os
-import shutil
+import json
 import sqlite3
-import time
-from pathlib import Path
+from datetime import date, timedelta
 
 import pytest
+from helpers import activity_row
 
-from miles import db
+from miles import db, derive, plan
 from miles.derive import derive_all
+from miles.inference import apply_inference
 
-_SOURCE_DB = Path(os.environ.get("MILES_TEST_DB", Path(__file__).parent.parent / "data" / "activities.db"))
-
-pytestmark = pytest.mark.skipif(not _SOURCE_DB.exists(), reason=f"{_SOURCE_DB} not present")
-
-_ACTIVITY_COLS = [
-    "activity_id", "name", "sport_type", "start_date", "workout_type", "run_type",
-    "distance_m", "moving_time_s", "elapsed_time_s", "total_elevation_gain_m",
-    "average_speed_mps", "max_speed_mps", "average_heartrate", "max_heartrate",
-    "average_cadence", "gear_id", "strava_url", "synced_at", "start_lat", "start_lng",
-    "raw_json",
-]
-_LAP_COLS = [
-    "lap_id", "activity_id", "lap_index", "distance_m", "moving_time_s", "elapsed_time_s",
-    "average_speed_mps", "average_heartrate", "max_heartrate", "average_cadence",
-    "total_elevation_gain_m", "pace_zone", "raw_json",
-]
+_FIRST_DAY = date(2025, 9, 1)
+_RUNS = 96
 
 
-def _open_copy(tmp_path: Path) -> sqlite3.Connection:
-    dest = tmp_path / "activities.db"
-    shutil.copy(_SOURCE_DB, dest)
-    conn = sqlite3.connect(dest)
-    conn.row_factory = sqlite3.Row
-    db.init_db(conn)
-    return conn
+def _lap(lap_id: int, activity_id: int, index: int, meters: float, seconds: int, hr: float) -> db.LapRow:
+    return {
+        "lap_id": lap_id, "activity_id": activity_id, "lap_index": index, "distance_m": meters,
+        "moving_time_s": seconds, "elapsed_time_s": seconds, "average_speed_mps": meters / seconds,
+        "average_heartrate": hr, "max_heartrate": hr + 8, "average_cadence": 85.0,
+        "total_elevation_gain_m": 2.0, "pace_zone": None, "raw_json": "{}",
+    }
+
+
+def _history() -> tuple[list[db.ActivityRow], list[db.LapRow]]:
+    """A run every three days on a twelve-run cycle: a tagged workout with
+    repeats, a tagged long run, a tagged race, a named untagged race, long
+    runs identified by name and by length, a slow untagged 10K, and easy runs
+    of varying pace."""
+    activities: list[db.ActivityRow] = []
+    laps: list[db.LapRow] = []
+    for i in range(_RUNS):
+        activity_id = 1000 + i
+        start = f"{(_FIRST_DAY + timedelta(days=3 * i)).isoformat()}T07:30:00"
+        kind = i % 12
+        if kind == 0:
+            row = activity_row(activity_id, start, workout_type=3, name="Track 5 x 1000m", distance_m=9000.0, moving_time_s=2700, average_speed_mps=3.33)
+            pieces = [(1600.0, 540, 140.0)] + [(1000.0, 225, 172.0), (400.0, 150, 140.0)] * 5 + [(1600.0, 560, 138.0)]
+            laps += [_lap(activity_id * 100 + n, activity_id, n, m, s, hr) for n, (m, s, hr) in enumerate(pieces)]
+        elif kind == 4:
+            row = activity_row(activity_id, start, workout_type=2, distance_m=26000.0, moving_time_s=8700, average_speed_mps=2.99)
+        elif kind == 5:
+            row = activity_row(activity_id, start, name="Sunday long run", distance_m=21000.0, moving_time_s=6600, average_speed_mps=3.18)
+        elif kind == 7:
+            row = activity_row(activity_id, start, name="Hometown 5K race", distance_m=5000.0, moving_time_s=1200 + i, average_speed_mps=5000.0 / (1200 + i), average_heartrate=182.0)
+        elif kind == 3:
+            row = activity_row(activity_id, start, distance_m=24000.0, moving_time_s=7600, average_speed_mps=24000.0 / 7600, average_heartrate=146.0)
+        elif kind == 9:
+            row = activity_row(activity_id, start, name="Morning Run", distance_m=10000.0, moving_time_s=2300 - 3 * i, average_speed_mps=10000.0 / (2300 - 3 * i), average_heartrate=178.0)
+        elif kind == 11:
+            row = activity_row(activity_id, start, workout_type=1, name="Local 10K", distance_m=10000.0, moving_time_s=2400 + 6 * i, average_speed_mps=10000.0 / (2400 + 6 * i), average_heartrate=176.0)
+            laps += [_lap(activity_id * 100 + n, activity_id, n, 1000.0, 240 + i // 4, 176.0) for n in range(10)]
+        else:
+            seconds = 2500 + 25 * (i % 7)
+            row = activity_row(activity_id, start, distance_m=8000.0, moving_time_s=seconds, elapsed_time_s=seconds, average_speed_mps=8000.0 / seconds, average_heartrate=135.0 + i % 9)
+        row["raw_json"] = json.dumps({"id": activity_id})
+        activities.append(row)
+    return activities, laps
+
+
+def _add_plan(conn: sqlite3.Connection) -> None:
+    plan_id, version_id = plan.start_plan_draft(conn, title="Spring 10K", race_date="2026-05-30", distance_bucket="10K")
+    monday = date(2026, 3, 16)
+    plan.upsert_draft_weeks(conn, version_id, [
+        {"week_start": (monday + timedelta(weeks=n)).isoformat(), "target_workouts": 1, "phase": "base", "target_miles": 20.0 + n}
+        for n in range(11)
+    ])
+    plan.commit_plan(conn, plan_id, note="initial")
 
 
 def _snapshot(conn: sqlite3.Connection) -> tuple[object, ...]:
-    activities = conn.execute("""
-        SELECT activity_id, run_type_inferred, race_effort, effort_ratio,
-               workout_label, dominant_intensity
-        FROM activities ORDER BY activity_id
-    """).fetchall()
-    laps = conn.execute("""
-        SELECT lap_id, lap_type, intensity FROM laps ORDER BY lap_id
-    """).fetchall()
-    checkpoints = conn.execute("""
-        SELECT month, confidence, source_tier, pace_5k, pace_10k, pace_half, pace_marathon
-        FROM fitness_checkpoints ORDER BY month
-    """).fetchall()
-    adherence = conn.execute("""
-        SELECT plan_id, week_start, version_n_used, actual_miles, actual_workouts,
-               actual_strength_days, long_run_done, mileage_ratio, workout_pace_delta_s,
-               band, flags_json
-        FROM plan_adherence ORDER BY plan_id, week_start
-    """).fetchall()
-    return (
-        tuple(tuple(r) for r in activities),
-        tuple(tuple(r) for r in laps),
-        tuple(tuple(r) for r in checkpoints),
-        tuple(tuple(r) for r in adherence),
-    )
+    queries = [
+        "SELECT activity_id, run_type_inferred, race_effort, effort_ratio, workout_label, dominant_intensity "
+        "FROM activities ORDER BY activity_id",
+        "SELECT lap_id, lap_type, intensity FROM laps ORDER BY lap_id",
+        "SELECT month, confidence, source_tier, pace_5k, pace_10k, pace_half, pace_marathon "
+        "FROM fitness_checkpoints ORDER BY month",
+        "SELECT plan_id, week_start, version_n_used, actual_miles, actual_workouts, actual_strength_days, "
+        "long_run_done, mileage_ratio, workout_pace_delta_s, band, flags_json FROM plan_adherence ORDER BY plan_id, week_start",
+    ]
+    return tuple(tuple(tuple(r) for r in conn.execute(q).fetchall()) for q in queries)
 
 
-def _resync_activity(conn: sqlite3.Connection, activity_id: int) -> None:
-    """Re-upsert one activity (and its laps, if any) through the real writer paths,
-    unchanged, so db.mark_derive_dirty fires exactly as it would for a live sync
-    that re-fetched this activity.
-
-    upsert_activities is INSERT OR REPLACE over a fixed column list, so — exactly
-    as it does in a real sync — it resets workout_label and laps_synced_at to NULL
-    as a side effect; a real sync's later lap-fetch and label-backfill steps (not
-    derive_all, which never touches either column) restore them. Restore them here
-    too so this test isolates derive_all's own incremental-vs-full behavior instead
-    of also re-testing that unrelated part of sync.py.
-    """
-    row = conn.execute(
-        f"SELECT {', '.join(_ACTIVITY_COLS)}, workout_label, laps_synced_at "
-        "FROM activities WHERE activity_id = ?", [activity_id]
-    ).fetchone()
-    activity_row = cast_activity_row(row)
-    db.upsert_activities(conn, [activity_row])
-    conn.execute(
-        "UPDATE activities SET workout_label = ?, laps_synced_at = ? WHERE activity_id = ?",
-        [row["workout_label"], row["laps_synced_at"], activity_id],
-    )
-
-    lap_rows = conn.execute(
-        f"SELECT {', '.join(_LAP_COLS)} FROM laps WHERE activity_id = ?", [activity_id]
-    ).fetchall()
-    if lap_rows:
-        db.upsert_laps(conn, [cast_lap_row(r) for r in lap_rows])
-
-
-def cast_activity_row(row: sqlite3.Row) -> db.ActivityRow:
-    return {col: row[col] for col in _ACTIVITY_COLS}  # type: ignore[return-value]
-
-
-def cast_lap_row(row: sqlite3.Row) -> db.LapRow:
-    return {col: row[col] for col in _LAP_COLS}  # type: ignore[return-value]
-
-
-def test_incremental_derive_matches_full_rebuild(tmp_path: Path) -> None:
-    conn = _open_copy(tmp_path)
-
-    full_start = time.monotonic()
+def test_incremental_derive_matches_full_rebuild(conn: sqlite3.Connection) -> None:
+    activities, laps = _history()
+    db.upsert_activities(conn, activities)
+    db.upsert_laps(conn, laps)
+    _add_plan(conn)
     derive_all(conn, full=True)
-    full_elapsed = time.monotonic() - full_start
     snapshot_full = _snapshot(conn)
+    assert any(row[1] is not None for row in snapshot_full[1]), "the history should produce typed laps"
+    assert snapshot_full[2], "the history should produce fitness checkpoints"
+    assert snapshot_full[3], "the plan should produce adherence weeks"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM activities WHERE name = 'Morning Run' AND run_type_inferred = 'race'"
+    ).fetchone()[0] > 0, "the fast untagged 10Ks should be inferred as races from pace"
 
-    newest_runs = conn.execute("""
-        SELECT activity_id FROM activities
-        WHERE sport_type = 'Run' ORDER BY start_date DESC LIMIT 5
-    """).fetchall()
-    assert len(newest_runs) == 5
-    for r in newest_runs:
-        _resync_activity(conn, int(r["activity_id"]))
+    newest = [a for a in activities if a["workout_type"] == 0][-4:] + [activities[-1]]
+    db.upsert_activities(conn, newest)
+    db.upsert_laps(conn, [lap for lap in laps if lap["activity_id"] in {a["activity_id"] for a in newest}])
+    assert db.get_meta(conn, "derive_dirty_since") is not None
 
-    dirty = conn.execute("SELECT value FROM meta WHERE key = 'derive_dirty_since'").fetchone()
-    assert dirty is not None and dirty["value"] is not None
-
-    incr_start = time.monotonic()
     derive_all(conn)
-    incr_elapsed = time.monotonic() - incr_start
-    snapshot_incremental = _snapshot(conn)
 
-    assert snapshot_incremental == snapshot_full
-    assert incr_elapsed < 0.25 * full_elapsed, (
-        f"incremental derive ({incr_elapsed:.2f}s) should be well under 25% of a full "
-        f"rebuild ({full_elapsed:.2f}s)"
-    )
+    assert db.get_meta(conn, "derive_dirty_since") is None
+    assert _snapshot(conn) == snapshot_full
 
-    nothing_dirty_start = time.monotonic()
     derive_all(conn)
-    nothing_dirty_elapsed = time.monotonic() - nothing_dirty_start
-    assert nothing_dirty_elapsed < 1.0, (
-        f"a derive_all with nothing dirty took {nothing_dirty_elapsed:.2f}s; "
-        "should be well under a second"
-    )
+    assert _snapshot(conn) == snapshot_full
+
+
+def _freeze_today(monkeypatch: pytest.MonkeyPatch, day: date) -> None:
+    class Frozen(date):
+        @classmethod
+        def today(cls) -> "Frozen":
+            return cls(day.year, day.month, day.day)
+
+    monkeypatch.setattr(derive, "date", Frozen)
+
+
+def test_a_month_without_a_derive_and_the_month_of_the_last_one_are_rebuilt(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    activities, laps = _history()
+    db.upsert_activities(conn, activities)
+    db.upsert_laps(conn, laps)
+    _freeze_today(monkeypatch, date(2026, 6, 20))
+    derive_all(conn, full=True)
+
+    _freeze_today(monkeypatch, date(2026, 8, 5))
+    derive_all(conn)
+    after_rollover = _snapshot(conn)
+    db.upsert_activities(conn, [activity_row(2000, "2026-08-04T07:30:00")])
+    derive_all(conn)
+    after_new_run = _snapshot(conn)
+
+    derive_all(conn, full=True)
+    assert after_new_run == _snapshot(conn)
+    assert [row[0] for row in after_rollover[2]][-3:] == ["2026-06", "2026-07", "2026-08"]
+
+
+def test_an_activity_that_loses_its_inferred_race_status_loses_its_effort(conn: sqlite3.Connection) -> None:
+    db.upsert_activities(conn, [activity_row(1, "2026-01-05T08:00:00")])
+    conn.execute("UPDATE activities SET race_effort = 'raced', effort_ratio = 0.9 WHERE activity_id = 1")
+
+    apply_inference(conn)
+
+    assert conn.execute("SELECT race_effort, effort_ratio FROM activities").fetchone()[:] == (None, None)

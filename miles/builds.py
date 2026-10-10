@@ -9,7 +9,7 @@ Pure function of weekly aggregates, race references, and periods; no SQL, no I/O
 from datetime import date, timedelta
 from typing_extensions import TypedDict
 
-from .periods import Period, WeekAgg, zero_fill
+from .periods import Period, WeekAgg, monday_of, zero_fill
 
 # Longest a build window can be, regardless of volume history.
 MAX_BUILD_WEEKS = 18
@@ -53,10 +53,6 @@ class Build(TypedDict):
     thin: bool
 
 
-def _monday(d: date) -> date:
-    return d - timedelta(days=d.weekday())
-
-
 def _rolling_3wk(miles: list[float]) -> list[float]:
     """Backward-looking 3-week average; the first two entries average what's available."""
     return [
@@ -80,7 +76,7 @@ def detect_builds(weeks: list[WeekAgg], races: list[RaceRef], periods: list[Peri
 
     for race in anchors:
         race_dt = date.fromisoformat(race["date"])
-        race_monday = _monday(race_dt)
+        race_monday = monday_of(race_dt)
 
         period = next((p for p in periods if p["start"] <= race["date"] <= p["end"]), None)
         if period is None:

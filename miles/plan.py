@@ -29,6 +29,7 @@ from .fitness import (
     estimate_fitness,
     zones_from_predicted,
 )
+from .periods import monday_of
 from .races import classify_race_distance
 
 # Closed vocabularies — validation rejects anything outside them.
@@ -97,7 +98,7 @@ class DayTarget(TypedDict, total=False):
 
 
 class WeekInput(TypedDict):
-    """add_version/upsert_draft_weeks input for one plan_weeks row.
+    """upsert_draft_weeks input for one plan_weeks row.
     target_miles is the range floor (point week = lo only, no hi); omitting
     both target_miles and target_miles_hi is a deliberately unspecified week,
     scored on workout count alone. target_miles_hi/target_long_run_minutes/
@@ -115,7 +116,7 @@ class WeekInput(TypedDict):
 
 
 class DayInput(TypedDict):
-    """add_version/upsert_draft_days input for one plan_days row. target is
+    """upsert_draft_days input for one plan_days row. target is
     resolved/frozen before storage in a committed version; see
     _freeze_day_target (drafts store it validated but unresolved — see
     _validate_day_target)."""
@@ -267,7 +268,7 @@ def _get_plan(conn: sqlite3.Connection, plan_id: int) -> PlanRow | None:
 
 def get_active_plan(conn: sqlite3.Connection) -> PlanRow | None:
     """The one active plan, or None. (One active plan at a time is enforced by
-    create_plan, so at most one row can ever have status='active'.)"""
+    commit_plan, so at most one row can ever have status='active'.)"""
     row = conn.execute(
         "SELECT plan_id, title, race_date, distance_bucket, goal_time_s, status, created_at "
         "FROM plans WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
@@ -445,45 +446,6 @@ def completed_plans_by_race_date(conn: sqlite3.Connection) -> dict[str, PlanRow]
     return out
 
 
-def create_plan(
-    conn: sqlite3.Connection,
-    *,
-    title: str,
-    race_date: str,
-    distance_bucket: str,
-    goal_time_s: int | None = None,
-) -> int:
-    """Creates a new active plan. Rejects a second active plan (v1 constraint —
-    abandon/complete the existing one first)."""
-    if not title.strip():
-        raise PlanValidationError("plan title must not be empty")
-    try:
-        date.fromisoformat(race_date)
-    except ValueError as e:
-        raise PlanValidationError(f"race_date {race_date!r} is not a valid ISO date") from e
-    if not distance_bucket.strip():
-        raise PlanValidationError("distance_bucket must not be empty")
-    if goal_time_s is not None and goal_time_s < 0:
-        raise PlanValidationError(f"goal_time_s must be non-negative, got {goal_time_s}")
-
-    existing = conn.execute("SELECT plan_id, title FROM plans WHERE status = 'active'").fetchone()
-    if existing is not None:
-        raise PlanValidationError(
-            f"an active plan already exists (plan_id={int(existing['plan_id'])}, "
-            f"title={existing['title']!r}); abandon or complete it before creating a new one"
-        )
-
-    created_at = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        "INSERT INTO plans (title, race_date, distance_bucket, goal_time_s, status, created_at) "
-        "VALUES (?, ?, ?, ?, 'active', ?)",
-        (title, race_date, distance_bucket, goal_time_s, created_at),
-    )
-    conn.commit()
-    assert cur.lastrowid is not None
-    return int(cur.lastrowid)
-
-
 def _validate_day_target(day: DayInput, target: DayTarget) -> DayTarget:
     """Pure field-level validation of one day's target — no conn, no
     resolution. Shared by _freeze_day_target (committed versions: also
@@ -577,10 +539,10 @@ def _freeze_day_target(
 
 
 def _validate_week_fields(w: WeekInput) -> None:
-    """Field-level checks for one week input, shared by add_version and
-    upsert_draft_weeks. Structural checks that need the whole set (Mondays
-    relative to each other, contiguity, ending at the race week) are each
-    caller's job — a single week never has enough context for those."""
+    """Field-level checks for one week input. Structural checks that need the
+    whole set (Mondays relative to each other, contiguity, ending at the race
+    week) are commit_plan's job — a single week never has enough context for
+    those."""
     lo = w.get("target_miles")
     if lo is not None and lo < 0:
         raise PlanValidationError(f"week {w['week_start']}: target_miles must be non-negative")
@@ -613,8 +575,7 @@ def _validate_week_fields(w: WeekInput) -> None:
 
 def _validate_day_fields(d: DayInput) -> None:
     """Field-level checks for one day input (excluding target, validated
-    separately by _validate_day_target/_freeze_day_target), shared by
-    add_version and upsert_draft_days."""
+    separately by _validate_day_target/_freeze_day_target)."""
     if d["slot"] not in SLOTS:
         raise PlanValidationError(f"day {d['date']}: slot {d['slot']!r} must be one of {SLOTS}")
     seq = d.get("seq", 1)
@@ -629,125 +590,6 @@ def _validate_day_fields(d: DayInput) -> None:
     terrain = d.get("terrain")
     if terrain is not None and terrain not in TERRAIN_VALUES:
         raise PlanValidationError(f"day {d['date']}: terrain {terrain!r} must be one of {TERRAIN_VALUES}")
-
-
-def add_version(
-    conn: sqlite3.Connection,
-    plan_id: int,
-    *,
-    weeks: list[WeekInput],
-    days: list[DayInput],
-    note: str | None,
-    author: Literal["agent", "manual"],
-    created_at: datetime | None = None,
-) -> int:
-    """Appends a new immutable version (version_n = prior max + 1) — there is
-    no update path. Validates weeks (Mondays, contiguous, ending at the race
-    week, non-negative targets, known phase) and days (known slot, non-negative
-    target_miles, date falls within one of the given weeks), then freezes each
-    day's target via _freeze_day_target. created_at defaults to now and is also
-    the as_of date for resolving zone-anchored targets."""
-    plan = _get_plan(conn, plan_id)
-    if plan is None:
-        raise PlanValidationError(f"plan {plan_id} does not exist")
-    if not weeks:
-        raise PlanValidationError("a plan version must include at least one week")
-
-    created_dt = created_at if created_at is not None else datetime.now(timezone.utc)
-    creation_date = created_dt.date()
-
-    sorted_weeks = sorted(weeks, key=lambda w: w["week_start"])
-    parsed_weeks: list[tuple[date, WeekInput]] = []
-    for w in sorted_weeks:
-        try:
-            wd = date.fromisoformat(w["week_start"])
-        except ValueError as e:
-            raise PlanValidationError(f"week_start {w['week_start']!r} is not a valid ISO date") from e
-        if wd.weekday() != 0:
-            raise PlanValidationError(f"week {w['week_start']} is not a Monday")
-        _validate_week_fields(w)
-        parsed_weeks.append((wd, w))
-
-    for (prev_d, prev_w), (cur_d, cur_w) in zip(parsed_weeks, parsed_weeks[1:]):
-        gap = (cur_d - prev_d).days
-        if gap != 7:
-            raise PlanValidationError(
-                f"weeks are not contiguous: {prev_w['week_start']} to {cur_w['week_start']} "
-                f"is {gap} days apart, expected 7"
-            )
-
-    race_dt = date.fromisoformat(plan["race_date"])
-    race_monday = race_dt - timedelta(days=race_dt.weekday())
-    last_week_date = parsed_weeks[-1][0]
-    if last_week_date != race_monday:
-        raise PlanValidationError(
-            f"plan must end at the race week ({race_monday.isoformat()}); "
-            f"last week given is {last_week_date.isoformat()}"
-        )
-
-    week_starts = {wd.isoformat() for wd, _ in parsed_weeks}
-
-    frozen_days: list[tuple[DayInput, DayTarget | None]] = []
-    for d in days:
-        try:
-            dd = date.fromisoformat(d["date"])
-        except ValueError as e:
-            raise PlanValidationError(f"day date {d['date']!r} is not a valid ISO date") from e
-        _validate_day_fields(d)
-
-        day_week_start = (dd - timedelta(days=dd.weekday())).isoformat()
-        if day_week_start not in week_starts:
-            raise PlanValidationError(
-                f"day {d['date']} falls in week {day_week_start}, which is not among the given weeks"
-            )
-
-        target = d.get("target")
-        frozen_target = _freeze_day_target(conn, d, target, creation_date) if target else None
-        frozen_days.append((d, frozen_target))
-
-    version_n_row = conn.execute(
-        "SELECT COALESCE(MAX(version_n), 0) AS n FROM plan_versions WHERE plan_id = ?", [plan_id]
-    ).fetchone()
-    version_n = int(version_n_row["n"]) + 1
-
-    # add_version has no draft concept — every version it creates is
-    # committed immediately (committed_at = created_at), matching v1
-    # semantics exactly for callers that still use this entry point.
-    cur = conn.execute(
-        "INSERT INTO plan_versions (plan_id, version_n, created_at, committed_at, note, author) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (plan_id, version_n, created_dt.isoformat(), created_dt.isoformat(), note, author),
-    )
-    assert cur.lastrowid is not None
-    version_id = int(cur.lastrowid)
-
-    conn.executemany(
-        "INSERT INTO plan_weeks (version_id, week_start, target_miles, target_miles_hi, "
-        "target_workouts, target_long_run_miles, target_long_run_minutes, target_strength_days, "
-        "phase, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            (
-                version_id, wd.isoformat(), w.get("target_miles"), w.get("target_miles_hi"),
-                w["target_workouts"], w.get("target_long_run_miles"), w.get("target_long_run_minutes"),
-                w.get("target_strength_days"), w["phase"], w.get("note"),
-            )
-            for wd, w in parsed_weeks
-        ],
-    )
-    conn.executemany(
-        "INSERT INTO plan_days (version_id, date, seq, slot, title, target_miles, target_json, "
-        "terrain, note, target_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            (
-                version_id, d["date"], d.get("seq", 1), d["slot"], d.get("title"),
-                d.get("target_miles"), json.dumps(frozen_target) if frozen_target else None,
-                d.get("terrain"), d.get("note"), d.get("target_minutes"),
-            )
-            for d, frozen_target in frozen_days
-        ],
-    )
-    conn.commit()
-    return version_id
 
 
 def add_log_entry(
@@ -784,11 +626,11 @@ def add_log_entry(
 # Exactly one mutable thing: a plan_versions row with committed_at IS NULL.
 # Its weeks/days may be inserted, updated, and deleted freely, in any order,
 # with gaps (upsert_draft_weeks/upsert_draft_days/delete_draft_*). commit_plan
-# runs the same global validation add_version always ran (Mondays, contiguous,
-# ending at the race week), re-freezes zone-anchored day targets as of the
-# commit date, stamps committed_at on the SAME version_id, and the version
-# becomes immutable — no new version_id is allocated at commit, only at draft
-# creation (start_plan_draft / start_revision_draft).
+# runs the global validation (Mondays, contiguous, ending at the race week),
+# re-freezes zone-anchored day targets as of the commit date, stamps
+# committed_at on the SAME version_id, and the version becomes immutable — no
+# new version_id is allocated at commit, only at draft creation
+# (start_plan_draft / start_revision_draft).
 
 
 def _require_draft_version(conn: sqlite3.Connection, version_id: int) -> int:
@@ -807,7 +649,7 @@ def _require_draft_version(conn: sqlite3.Connection, version_id: int) -> int:
     return int(row["plan_id"])
 
 
-def _plan_start_monday(conn: sqlite3.Connection, plan_id: int) -> date | None:
+def plan_start_monday(conn: sqlite3.Connection, plan_id: int) -> date | None:
     """The plan's first week (from version 1, which always governs from the
     plan's start regardless of its own committed_at), or None if v1 has no
     weeks yet."""
@@ -828,9 +670,8 @@ def start_plan_draft(
     goal_time_s: int | None = None,
 ) -> tuple[int, int]:
     """Creates a new plan, status='draft', plus its empty first (draft)
-    version. Unlike create_plan, does NOT reject a second active plan — a
-    draft plan may coexist with an active one; commit_plan is where that
-    conflict is actually rejected. Returns (plan_id, version_id)."""
+    version. A draft plan may coexist with an active one; commit_plan is where
+    that conflict is rejected. Returns (plan_id, version_id)."""
     if not title.strip():
         raise PlanValidationError("plan title must not be empty")
     try:
@@ -1087,7 +928,7 @@ def compute_week_mileage(weeks: list[PlanWeekRow], days: list[PlanDayRow]) -> li
     days_by_week: dict[str, list[PlanDayRow]] = {}
     for d in days:
         dd = date.fromisoformat(d["date"])
-        wk = (dd - timedelta(days=dd.weekday())).isoformat()
+        wk = monday_of(dd).isoformat()
         days_by_week.setdefault(wk, []).append(d)
 
     out: list[WeekMileageCheck] = []
@@ -1156,7 +997,7 @@ def _draft_gap_report(plan: PlanRow, weeks: list[PlanWeekRow], days: list[PlanDa
     week_starts = sorted(w["week_start"] for w in weeks)
     plan_start = date.fromisoformat(week_starts[0])
     race_dt = date.fromisoformat(plan["race_date"])
-    race_monday = race_dt - timedelta(days=race_dt.weekday())
+    race_monday = monday_of(race_dt)
     last_authored = date.fromisoformat(week_starts[-1])
 
     have = {date.fromisoformat(w) for w in week_starts}
@@ -1182,7 +1023,7 @@ def _draft_gap_report(plan: PlanRow, weeks: list[PlanWeekRow], days: list[PlanDa
 
     week_start_set = set(week_starts)
     day_weeks = sorted({
-        (date.fromisoformat(d["date"]) - timedelta(days=date.fromisoformat(d["date"]).weekday())).isoformat()
+        monday_of(date.fromisoformat(d["date"])).isoformat()
         for d in days
     })
     for wk in day_weeks:
@@ -1220,8 +1061,8 @@ def _snapshot_past_weeks(conn: sqlite3.Connection, plan_id: int, version_id: int
     week/its days. Makes rewriting history to look adherent structurally
     impossible no matter which write path produced the draft. Returns the
     week_starts that were overridden this way."""
-    this_monday = date.today() - timedelta(days=date.today().weekday())
-    plan_start = _plan_start_monday(conn, plan_id)
+    this_monday = monday_of(date.today())
+    plan_start = plan_start_monday(conn, plan_id)
     if plan_start is None:
         return []
 
@@ -1334,7 +1175,7 @@ def commit_plan(conn: sqlite3.Connection, plan_id: int, *, note: str) -> int:
             )
 
     race_dt = date.fromisoformat(plan["race_date"])
-    race_monday = race_dt - timedelta(days=race_dt.weekday())
+    race_monday = monday_of(race_dt)
     last_week = date.fromisoformat(weeks[-1]["week_start"])
     if last_week != race_monday:
         raise PlanValidationError(
@@ -1350,7 +1191,7 @@ def commit_plan(conn: sqlite3.Connection, plan_id: int, *, note: str) -> int:
     ).fetchall()]
     for d in days:
         dd = date.fromisoformat(d["date"])
-        wk = (dd - timedelta(days=dd.weekday())).isoformat()
+        wk = monday_of(dd).isoformat()
         if wk not in week_starts:
             raise PlanValidationError(
                 f"day {d['date']} falls in week {wk}, which is not among the committed weeks"

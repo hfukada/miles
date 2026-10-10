@@ -70,7 +70,9 @@ from . import db
 from .classifier import classify_workout
 from .db import PlanAdherenceRow
 from .fitness import MILE_M
+from .periods import monday_of
 from .plan import PlanDayRow, PlanWeekRow, current_version_for_week
+from .races import run_sport_filter
 
 # --- tunable constants (see adr/0001-training-plans-as-versioned-ground-truth.md)
 
@@ -90,8 +92,6 @@ LONG_RUN_ON_RATIO = 0.85
 # Seconds/mile slack added to a frozen workout pace range before judging
 # actual work-lap pace against it (see workout_pace_delta_s in the docstring above).
 PACE_TOLERANCE = 10.0
-
-_RUN_TYPES: tuple[str, ...] = ("Run", "TrailRun", "VirtualRun")
 
 # Strength activities counted into actual_strength_days — displayed only,
 # never banded or flagged (see the module docstring).
@@ -422,11 +422,6 @@ def _build_flags(rows: list[_WeekCalc]) -> dict[str, list[FlagEntry]]:
 
 # --- conn-taking orchestrator --------------------------------------------------
 
-def _type_clause() -> tuple[str, list[str]]:
-    ph = ",".join("?" * len(_RUN_TYPES))
-    return f"sport_type IN ({ph})", list(_RUN_TYPES)
-
-
 def _strength_type_clause() -> tuple[str, list[str]]:
     ph = ",".join("?" * len(STRENGTH_SPORT_TYPES))
     return f"sport_type IN ({ph})", list(STRENGTH_SPORT_TYPES)
@@ -451,7 +446,7 @@ def _work_lap_pace(conn: sqlite3.Connection, activity_id: int) -> tuple[float, f
 
 def _gather_actuals(conn: sqlite3.Connection, week_start: date, week_end: date) -> WeekActuals:
     effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
+    tc, tp = run_sport_filter()
     rows = conn.execute(
         f"""
         SELECT activity_id, name, DATE(start_date) AS date, {effective} AS run_type,
@@ -576,7 +571,7 @@ def _compute_for_plan(
 
     plan_start = date.fromisoformat(plan_start_str)
     race_dt = date.fromisoformat(race_date_str)
-    race_monday = race_dt - timedelta(days=race_dt.weekday())
+    race_monday = monday_of(race_dt)
 
     calc_rows: list[_WeekCalc] = []
     week_start = plan_start

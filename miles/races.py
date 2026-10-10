@@ -4,11 +4,22 @@ GPS reads long on certified courses, so bucket ranges skew above nominal distanc
 """
 
 import sqlite3
+from typing_extensions import TypedDict
 
 from . import db
+from .builds import Build, RaceRef, detect_builds
 from .format import fmt_time
+from .periods import Period, WeekAgg, detect_periods
 
 RUN_SPORT_TYPES: tuple[str, ...] = ("Run", "TrailRun", "VirtualRun")
+
+
+def run_sport_filter(alias: str = "", exclude: tuple[str, ...] = ()) -> tuple[str, list[str]]:
+    """A WHERE condition selecting run activities (minus any `exclude`d sport
+    types), optionally qualified by a table alias, and its parameters."""
+    prefix = f"{alias}." if alias else ""
+    sports = [t for t in RUN_SPORT_TYPES if t not in exclude]
+    return f"{prefix}sport_type IN ({','.join('?' * len(sports))})", sports
 
 RACE_BUCKETS: list[tuple[str, float, float]] = [
     ("5K", 4800, 5600),
@@ -63,8 +74,8 @@ def race_rows(
     filter the returned rows afterward, so filtering never changes an is_pr verdict.
     """
     effective_run_type = db.effective_run_type_sql("a")
-    placeholders = ",".join("?" * len(RUN_SPORT_TYPES))
-    where = f"WHERE a.sport_type IN ({placeholders}) AND {effective_run_type} = 'race'"
+    sport_clause, sport_params = run_sport_filter("a")
+    where = f"WHERE {sport_clause} AND {effective_run_type} = 'race'"
 
     rows = conn.execute(f"""
         SELECT
@@ -74,9 +85,7 @@ def race_rows(
             a.distance_m,
             ROUND(a.distance_m / 1609.34, 2) AS distance_miles,
             a.moving_time_s,
-            CASE WHEN a.average_speed_mps > 0
-                 THEN ROUND(26.8224 / a.average_speed_mps, 2)
-                 ELSE NULL END AS pace_min_per_mile,
+            {db.pace_sql("a.average_speed_mps")} AS pace_min_per_mile,
             ROUND(a.average_heartrate, 1) AS avg_hr,
             CASE WHEN a.workout_type = 0 AND a.run_type_inferred IS NOT NULL
                  THEN 'inferred' ELSE 'strava' END AS run_type_source,
@@ -86,7 +95,7 @@ def race_rows(
         FROM activities a
         {where}
         ORDER BY date ASC
-    """, list(RUN_SPORT_TYPES)).fetchall()
+    """, sport_params).fetchall()
 
     best_finish_s: dict[str, int] = {}
     out: list[dict[str, object]] = []
@@ -125,3 +134,99 @@ def race_rows(
             "strava_url": r["strava_url"],
         })
     return out
+
+
+def marathon_races(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Marathon-length activities tagged as races in Strava, ascending by date."""
+    return conn.execute(f"""
+        SELECT
+            name,
+            DATE(start_date) AS race_date,
+            ROUND(distance_m / 1609.34, 2) AS distance_miles,
+            moving_time_s,
+            {db.pace_sql("average_speed_mps")} AS pace_min_per_mile
+        FROM activities
+        WHERE run_type = 'race'
+          AND distance_m BETWEEN ? AND ?
+        ORDER BY race_date
+    """, [MARATHON_MIN_M, MARATHON_MAX_M]).fetchall()
+
+
+def week_aggs(conn: sqlite3.Connection, start_date: str | None = None) -> list[WeekAgg]:
+    """Every calendar week with at least one run (from start_date on, if given),
+    Monday-aligned: the input detect_periods and detect_builds take."""
+    sport_clause, params = run_sport_filter()
+    where = f"WHERE {sport_clause}"
+    if start_date:
+        where += " AND start_date >= ?"
+        params.append(start_date)
+    rows = conn.execute(f"""
+        SELECT
+            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
+            COUNT(*) AS runs,
+            SUM(CASE WHEN {db.effective_run_type_sql()} = 'workout' THEN 1 ELSE 0 END) AS workouts
+        FROM activities
+        {where}
+        GROUP BY monday
+        ORDER BY monday
+    """, params).fetchall()
+    return [
+        {"monday": r["monday"], "miles": r["miles"] or 0.0, "runs": r["runs"], "workouts": r["workouts"] or 0}
+        for r in rows
+    ]
+
+
+class RaceActivityRow(TypedDict):
+    date: str
+    name: str | None
+    distance_m: float | None
+    distance_miles: float | None
+    moving_time_s: int | None
+    race_effort: str | None
+
+
+def effective_race_activities(conn: sqlite3.Connection) -> list[RaceActivityRow]:
+    """Every effective-race run, ascending by date."""
+    sport_clause, params = run_sport_filter()
+    rows = conn.execute(f"""
+        SELECT DATE(start_date) AS date, name, distance_m, ROUND(distance_m / 1609.34, 2) AS distance_miles,
+               moving_time_s, race_effort
+        FROM activities
+        WHERE {sport_clause} AND {db.effective_run_type_sql()} = 'race'
+        ORDER BY date
+    """, params).fetchall()
+    return [
+        {
+            "date": r["date"],
+            "name": r["name"],
+            "distance_m": r["distance_m"],
+            "distance_miles": r["distance_miles"],
+            "moving_time_s": r["moving_time_s"],
+            "race_effort": r["race_effort"],
+        }
+        for r in rows
+    ]
+
+
+def race_refs(rows: list[RaceActivityRow]) -> list[RaceRef]:
+    return [
+        {
+            "date": r["date"],
+            "name": r["name"],
+            "distance_category": classify_race_distance(r["distance_m"]) or "other",
+            "distance_m": r["distance_m"],
+        }
+        for r in rows
+        if r["distance_m"] is not None
+    ]
+
+
+def full_periods_and_builds(conn: sqlite3.Connection) -> tuple[list[Period], list[Build], list[WeekAgg]]:
+    """Periods, race-anchored builds, and the weekly aggregates they came from,
+    over the whole history, for locating the one enclosing an arbitrary race date."""
+    weeks = week_aggs(conn)
+    periods, _gaps = detect_periods(weeks)
+    if not periods:
+        return [], [], weeks
+    return periods, detect_builds(weeks, race_refs(effective_race_activities(conn)), periods), weeks

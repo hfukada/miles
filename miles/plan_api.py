@@ -1,18 +1,18 @@
-"""Plan API: read-only endpoints backing plan.html — the active plan, its
-current (latest) version's weeks/days with actual mileage/workouts joined in
-from synced activities, version history, and version-to-version diffs.
+"""Plan API: read-only endpoints for the active plan, its latest version's
+weeks/days joined with actual mileage/workouts from synced activities,
+version history, and version diffs.
 
-Plans are athlete-authored ground truth (miles/plan.py); this module only
-reads and joins, never writes (the agent + MCP tools are the editor — see
-adr/0001-training-plans-as-versioned-ground-truth.md). /api/plan itself only
-reports plain planned-vs-actual numbers, no judgment; /api/plan-adherence
-(below) layers bands/flags from the derived plan_adherence table on top.
+Plans are athlete-authored ground truth (miles/plan.py, see
+adr/0001-training-plans-as-versioned-ground-truth.md); this module never
+writes them. /api/plan reports plain planned-vs-actual numbers with no
+judgment; /api/plan-adherence layers bands/flags from the derived
+plan_adherence table on top.
 """
 
 import json
 import sqlite3
 from datetime import date, timedelta
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import cast, get_args
 
 from typing_extensions import TypedDict
@@ -20,31 +20,18 @@ from typing_extensions import TypedDict
 from fastapi import APIRouter, HTTPException
 
 from . import db, plan, plan_adherence
-from .builds import Build, RaceRef, detect_builds
+from .builds import Build
 from .classifier import classify_workout
-from .derive import ensure_derived
+from .derive import CHECKPOINT_PACE_COL, connect_derived as _conn, predicted_pace_for_race
+from .periods import monday_of
 from .distance_builds import Bucket, get_distance_builds
 from .fitness import MILE_M, estimate_fitness
 from .format import fmt_pace, fmt_time
-from .periods import WeekAgg, detect_periods
 from .plan import DayTarget, PlanDayRow, PlanRow, PlanValidationError, PlanVersionRow, PlanWeekRow, VersionDiff
-from .races import NOMINAL_METERS, classify_race_distance
+from .races import NOMINAL_METERS, classify_race_distance, full_periods_and_builds, run_sport_filter
+from .weather import ATTRIBUTION as WEATHER_ATTRIBUTION
 
 router = APIRouter()
-
-_RUN_TYPES = ("Run", "TrailRun", "VirtualRun")
-
-
-def _conn() -> sqlite3.Connection:
-    conn = db.connect()
-    db.init_db(conn)
-    ensure_derived(conn)
-    return conn
-
-
-def _type_clause() -> tuple[str, list[str]]:
-    ph = ",".join("?" * len(_RUN_TYPES))
-    return f"sport_type IN ({ph})", list(_RUN_TYPES)
 
 
 class PlanActivity(TypedDict):
@@ -121,13 +108,11 @@ class RemainingDayOut(TypedDict):
 
 
 class TodayOut(TypedDict):
-    """Today's slice of the plan — always present for an active plan whose
-    window covers today, regardless of sync freshness (the planned session
-    itself isn't sync-derived; only the actual-so-far numbers in
-    week_so_far/vs_last_week are). `sessions` is every plan_days row for
-    today, seq order (a double run day, or a run plus a strength day, both
-    surface); empty when today has no explicit plan_days row — an implied
-    rest day (planners may skip emitting them)."""
+    """Today's slice of the plan. Present for any active plan regardless of
+    sync freshness (only week_so_far/vs_last_week depend on synced data).
+    `sessions` is every plan_days row for today in seq order (a double run
+    day, or a run plus a strength day); empty when today has no explicit row,
+    i.e. an implied rest day."""
     date: str
     sessions: list[PlanDayOut]
     is_race_day: bool
@@ -136,13 +121,11 @@ class TodayOut(TypedDict):
 
 
 class WeekSoFarOut(TypedDict):
-    """"How's the week going?" — actual so far against the week's target, plus
-    an expected-by-now marker pro-rated by planned (non-rest) days' target
-    mileage elapsed over total planned mileage this week, NOT calendar
-    sevenths or a plain day count (a rest-day-heavy front half, or a single
-    long-run day, must not read as behind/ahead out of proportion to what was
-    actually scheduled). actual_* are truncated to week_cutoff_date, the
-    week-local clamp of the sync cutoff — see _week_elapsed_days."""
+    """Actual so far against the week's target, plus an expected-by-now
+    marker pro-rated by the target mileage of planned (non-rest) days elapsed
+    over the week's total planned mileage, not by calendar days. actual_* are
+    truncated to week_cutoff_date, the week-local clamp of the sync cutoff
+    (see _week_elapsed_days)."""
     week_start: str
     week_cutoff_date: str  # actual_* summed over [week_start, week_cutoff_date]
     week_started: bool  # False when the sync cutoff predates this week's Monday entirely
@@ -167,10 +150,10 @@ class VsLastWeekDayOut(TypedDict):
 
 
 class VsLastWeekOut(TypedDict):
-    """"vs last week at this point" — actual miles through the same weekday
-    cutoff last week, both sides truncated to the sync cutoff so this is never
-    stale-current vs complete-last. None (at the PlanResponse level) whenever
-    the cutoff predates this week's Monday — there is nothing yet to compare."""
+    """Actual miles through the same weekday cutoff last week, both sides
+    truncated to the sync cutoff so a stale sync never compares a partial
+    week to a complete one. None (at the response level) when the cutoff
+    predates this week's Monday."""
     week_start: str
     last_week_start: str
     cutoff_offset: int  # last elapsed weekday index (0=Mon), inclusive, both weeks
@@ -199,12 +182,12 @@ class PlanResponse(TypedDict):
 
 def _actual_by_week(conn: sqlite3.Connection, start: str, end: str) -> dict[str, tuple[float, int]]:
     """Monday-aligned actual miles/workout counts per week over [start, end]
-    (inclusive), same convention as api.py's _week_aggs / EFFECTIVE_RUN_TYPE_SQL."""
+    (inclusive), same convention as races.week_aggs."""
     effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
+    tc, tp = run_sport_filter()
     rows = conn.execute(f"""
         SELECT
-            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            {db.monday_sql("start_date")} AS monday,
             ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
             SUM(CASE WHEN {effective} = 'workout' THEN 1 ELSE 0 END) AS workouts
         FROM activities
@@ -219,7 +202,7 @@ def _actual_totals(conn: sqlite3.Connection, start: str, end: str) -> tuple[floa
     — a plain range aggregate (unlike _actual_by_week, not grouped by
     Monday), for a partial-week window such as "this week so far"."""
     effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
+    tc, tp = run_sport_filter()
     row = conn.execute(f"""
         SELECT ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
                SUM(CASE WHEN {effective} = 'workout' THEN 1 ELSE 0 END) AS workouts,
@@ -231,10 +214,8 @@ def _actual_totals(conn: sqlite3.Connection, start: str, end: str) -> tuple[floa
 
 
 def _daily_miles(conn: sqlite3.Connection, start: str, end: str) -> dict[str, float]:
-    """Per-date actual miles over [start, end] inclusive, keyed by ISO date —
-    the day-level series behind the vs-last-week comparison."""
-    effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
+    """Per-date actual miles over [start, end] inclusive, keyed by ISO date."""
+    tc, tp = run_sport_filter()
     rows = conn.execute(f"""
         SELECT DATE(start_date) AS date, ROUND(SUM(distance_m) / 1609.34, 2) AS miles
         FROM activities
@@ -248,11 +229,11 @@ def _strength_days_by_week(conn: sqlite3.Connection, start: str, end: str) -> di
     """Monday-aligned count of distinct dates with a synced
     plan_adherence.STRENGTH_SPORT_TYPES activity — same shape/convention as
     _actual_by_week, kept separate since strength activities fall outside
-    _type_clause's run-only sport types."""
+    run_sport_filter's run-only sport types."""
     ph = ",".join("?" * len(plan_adherence.STRENGTH_SPORT_TYPES))
     rows = conn.execute(f"""
         SELECT
-            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            {db.monday_sql("start_date")} AS monday,
             COUNT(DISTINCT DATE(start_date)) AS strength_days
         FROM activities
         WHERE sport_type IN ({ph}) AND DATE(start_date) >= ? AND DATE(start_date) <= ?
@@ -262,18 +243,15 @@ def _strength_days_by_week(conn: sqlite3.Connection, start: str, end: str) -> di
 
 
 def _activities_by_date(conn: sqlite3.Connection, start: str, end: str) -> dict[str, list[PlanActivity]]:
-    """Every synced run in [start, end] (inclusive), keyed by calendar date —
-    the calendar's "actual run(s) filled over the planned slot" layer."""
+    """Every synced run in [start, end] (inclusive), keyed by calendar date."""
     effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
+    tc, tp = run_sport_filter()
     rows = conn.execute(f"""
         SELECT
             activity_id, name, DATE(start_date) AS date, {effective} AS run_type,
             ROUND(distance_m / 1609.34, 2) AS distance_mi,
             moving_time_s,
-            CASE WHEN average_speed_mps > 0
-                 THEN ROUND(26.8224 / average_speed_mps, 2)
-                 ELSE NULL END AS pace_min_per_mile
+            {db.pace_sql("average_speed_mps")} AS pace_min_per_mile
         FROM activities
         WHERE {tc} AND DATE(start_date) >= ? AND DATE(start_date) <= ?
         ORDER BY start_date
@@ -292,8 +270,7 @@ def _activities_by_date(conn: sqlite3.Connection, start: str, end: str) -> dict[
 
 
 def _log_by_date(conn: sqlite3.Connection, plan_id: int, start: str, end: str) -> dict[str, list[PlanLogEntry]]:
-    """plan_log entries in [start, end] (inclusive), keyed by date — the
-    calendar's small annotation markers ("skipped Tue, slept badly")."""
+    """plan_log entries in [start, end] (inclusive), keyed by date."""
     rows = conn.execute(
         "SELECT log_id, date, action, reason FROM plan_log "
         "WHERE plan_id = ? AND date >= ? AND date <= ? ORDER BY date, log_id",
@@ -309,10 +286,9 @@ def _log_by_date(conn: sqlite3.Connection, plan_id: int, start: str, end: str) -
 
 def _week_elapsed_days(monday: date, week_cutoff: date) -> int | None:
     """Days elapsed into the week [0=Monday..6=Sunday] as of week_cutoff,
-    clamped to that range, or None when week_cutoff predates monday entirely
-    (the sync cutoff hasn't reached this week yet — nothing has "happened"
-    in it as far as the data can say, so callers must not report a partial
-    week at all rather than defaulting to zero elapsed days)."""
+    clamped to that range, or None when week_cutoff predates monday (the sync
+    hasn't reached this week; callers must not report a partial week rather
+    than defaulting to zero days elapsed)."""
     raw = (week_cutoff - monday).days
     if raw < 0:
         return None
@@ -320,10 +296,9 @@ def _week_elapsed_days(monday: date, week_cutoff: date) -> int | None:
 
 
 class ActualWeekTotals(TypedDict):
-    """The plan-independent half of "how's this week going" — actual-only
-    totals for the calendar week starting at monday, truncated to the global
-    sync cutoff. Shared by /api/today (which reports this as-is) and
-    _today_blocks (which layers plan targets/expected-by-now on top)."""
+    """Plan-independent actual totals for the calendar week starting at
+    monday, truncated to the sync cutoff. _today_blocks layers plan targets
+    on top."""
     week_start: str
     week_cutoff_date: str
     week_started: bool
@@ -354,9 +329,8 @@ def _actual_week_totals(conn: sqlite3.Connection, monday: date, cutoff_date: dat
 
 
 def _vs_last_week_block(conn: sqlite3.Connection, monday: date, elapsed: int) -> VsLastWeekOut:
-    """"vs last week at this point" over the first `elapsed` days of monday's
-    week vs the same weekday span the week before — the plan-independent
-    computation _today_blocks also uses once it knows the week has started."""
+    """The first `elapsed` days of monday's week vs the same weekday span the
+    week before."""
     monday_iso = monday.isoformat()
     week_cutoff_date = monday + timedelta(days=elapsed)
     last_week_monday = monday - timedelta(days=7)
@@ -402,14 +376,12 @@ def _today_blocks(
     today: date,
     cutoff_date: date,
 ) -> tuple[TodayOut | None, WeekSoFarOut | None, VsLastWeekOut | None]:
-    """Today/week_so_far/vs_last_week — computed only for an active plan; see
-    PlanResponse field docstrings for the semantics of each. cutoff_date is
-    the global sync cutoff (min(today, last_sync_at's date), or today when
-    there's never been a sync)."""
+    """Today/week_so_far/vs_last_week, computed only for an active plan.
+    cutoff_date is the sync cutoff from _sync_cutoff_date."""
     if active["status"] != "active":
         return None, None, None
 
-    monday = today - timedelta(days=today.weekday())
+    monday = monday_of(today)
     monday_iso = monday.isoformat()
     week = next((w for w in weeks_in if w["week_start"] == monday_iso), None)
 
@@ -435,12 +407,10 @@ def _today_blocks(
     elapsed_planned = [d for d in planned_days if d["date"] <= week_cutoff_date.isoformat()]
     remaining_planned = [d for d in planned_days if d["date"] > week_cutoff_date.isoformat()]
 
-    # Mileage-weighted pro-rate: a day's share of the week's expectation is its
-    # own target_miles (strength/duration-only days with target_miles = None
-    # weigh 0), not a flat 1/len(planned_days) — moving mileage between days,
-    # or a single heavy long-run day, must not distort "expected by now".
-    # Falls back to the day-count ratio only when no planned day carries a
-    # mileage target at all (the weighted ratio would be 0/0).
+    # Mileage-weighted pro-rate: a day's share is its own target_miles (days
+    # with target_miles = None weigh 0), so a heavy long-run day is not
+    # treated like an easy one. Falls back to the day-count ratio only when no
+    # planned day has a mileage target (the weighted ratio would be 0/0).
     total_planned_miles = sum(d["target_miles"] or 0.0 for d in planned_days)
     elapsed_planned_miles = sum(d["target_miles"] or 0.0 for d in elapsed_planned)
     if total_planned_miles > 0:
@@ -502,22 +472,13 @@ def _day_out(d: PlanDayRow) -> PlanDayOut:
 @router.get("/api/plan")
 def get_plan() -> PlanResponse | None:
     """
-    The active plan's latest version — weeks and days — with actual weekly
-    miles/workout counts and per-day synced runs/log annotations joined in
-    from activities/plan_log. Returns null when there's no active plan (the
-    empty state plan.html renders, pointing at the miles:miles-plan skill).
+    The active plan's latest version (highest version_n) — weeks and days —
+    with actual weekly miles/workout counts and per-day synced runs and
+    plan_log annotations joined in. This is the plan as it reads now, not the
+    per-week contemporaneous version the adherence scoring uses.
 
-    "Current version" here always means the latest authored version (highest
-    version_n), not the per-week contemporaneous version the adherence
-    scoring uses — this endpoint is "what does the plan say now", not "what
-    was a past week scored against".
-
-    When there's no active plan, falls back to the most recently raced
-    completed plan (see plan.get_current_or_recent_plan) so a
-    just-finished plan's retrospective (calendar, version history, and
-    /api/plan-retrospective) stays reachable instead of going empty the
-    moment auto-complete flips its status. Returns null only when there is
-    neither an active nor a completed plan.
+    With no active plan, falls back to the most recently raced completed plan
+    (plan.get_current_or_recent_plan). Returns null only when there is neither.
     """
     conn = _conn()
     active = plan.get_current_or_recent_plan(conn)
@@ -534,7 +495,7 @@ def get_plan() -> PlanResponse | None:
     days_in = bundle["days"] if bundle is not None else []
 
     today = date.today()
-    current_monday = (today - timedelta(days=today.weekday())).isoformat()
+    current_monday = monday_of(today).isoformat()
 
     weeks_out: list[PlanWeekOut] = []
     this_week: ThisWeekStat | None = None
@@ -582,7 +543,7 @@ def get_plan() -> PlanResponse | None:
         logs = _log_by_date(conn, active["plan_id"], window_start, window_end)
 
     race_dt = date.fromisoformat(active["race_date"])
-    race_monday = race_dt - timedelta(days=race_dt.weekday())
+    race_monday = monday_of(race_dt)
     current_monday_dt = date.fromisoformat(current_monday)
     weeks_to_race = max(0, (race_monday - current_monday_dt).days // 7)
 
@@ -623,35 +584,28 @@ def get_plan() -> PlanResponse | None:
 
 
 class TodayResponse(TypedDict):
-    """Actual-only "how's today/this week going", independent of whether any
-    plan exists at all — plan.html's Today tab falls back to this (instead of
-    /api/plan's plan-layered today/week_so_far/vs_last_week) whenever there's
-    no active plan to show targets against. Shares its week-so-far/
-    vs-last-week math with _today_blocks via _actual_week_totals/
-    _vs_last_week_block, so the two never compute "actual miles so far"
-    differently."""
+    """Actual-only today/this-week numbers, independent of any plan. Uses the
+    same _actual_week_totals/_vs_last_week_block math as /api/plan's
+    today/week_so_far/vs_last_week."""
     date: str
     week_start: str
     week_cutoff_date: str
     runs_today: list[PlanActivity]
     week_so_far: ActualWeekTotals
     vs_last_week: VsLastWeekOut | None
-    actual: dict[str, list[PlanActivity]]  # keyed by date, this week + last week — feeds the day popover
+    actual: dict[str, list[PlanActivity]]  # keyed by date, last week's Monday through this Sunday
 
 
 @router.get("/api/today")
 def get_today() -> TodayResponse:
     """
-    Plan-independent twin of /api/plan's today/week_so_far/vs_last_week
-    trio — works regardless of plan state (no plan, completed-only plan, or
-    even an active one, though plan.html prefers /api/plan's richer version
-    whenever a plan is active). `actual` spans this week plus last week
-    (Monday of last week through Sunday of this week) so the day popover has
-    everything it needs without a second request.
+    Plan-independent counterpart of /api/plan's today/week_so_far/vs_last_week;
+    valid in any plan state. `actual` spans Monday of last week through Sunday
+    of this week.
     """
     conn = _conn()
     today = date.today()
-    monday = today - timedelta(days=today.weekday())
+    monday = monday_of(today)
     cutoff_date = _sync_cutoff_date(conn, today)
 
     totals = _actual_week_totals(conn, monday, cutoff_date)
@@ -675,9 +629,9 @@ def get_today() -> TodayResponse:
 
 @router.get("/api/plan-versions")
 def get_plan_versions() -> list[PlanVersionRow]:
-    """Every version of the active plan (or the most recently completed one —
-    see plan.get_current_or_recent_plan), oldest first — the source for
-    plan.html's version history list. Empty list when there's neither."""
+    """Every version of the active plan (or the most recently completed one,
+    see plan.get_current_or_recent_plan), oldest first. Empty list when
+    there's neither."""
     conn = _conn()
     active = plan.get_current_or_recent_plan(conn)
     if active is None:
@@ -742,11 +696,9 @@ class PlanAdherenceResponse(TypedDict):
 
 
 def _adherence_rows(conn: sqlite3.Connection, plan_id: int) -> list[sqlite3.Row]:
-    """Every plan_adherence row for one plan, joined back to that same
-    week's contemporaneous targets (mileage range, long-run miles/minutes,
-    strength days) — shared by get_plan_adherence and the retrospective's
-    final-adherence rollup (get_plan_retrospective) so both read off one
-    query."""
+    """Every plan_adherence row for one plan, joined to that week's
+    contemporaneous targets (mileage range, long-run miles/minutes, strength
+    days)."""
     return conn.execute("""
         SELECT
             pa.week_start, pa.version_n_used, pa.actual_miles, pa.actual_workouts,
@@ -831,10 +783,8 @@ def get_plan_adherence() -> PlanAdherenceResponse | None:
 
 # --- progression stats -------------------------------------------------------
 #
-# Weekly mileage vs ramp (chart 1) already exists on plan.html from /api/plan +
-# /api/plan-adherence (bands); flag shading is a pure plan.html change
-# reading adherence.flags — deliberately not duplicated here. This endpoint
-# covers the other two: easy HR/pace progression and workout pace progression.
+# Easy HR/pace progression and workout pace progression. Weekly mileage vs
+# ramp comes from /api/plan and /api/plan-adherence and is not repeated here.
 
 
 class WeekEasyOut(TypedDict):
@@ -842,6 +792,7 @@ class WeekEasyOut(TypedDict):
     avg_pace_min_per_mile: float | None
     avg_hr: float | None
     avg_apparent_temp_f: float | None
+    weather_attribution: str | None
     run_count: int
 
 
@@ -877,26 +828,19 @@ class PlanProgressionResponse(TypedDict):
 
 def _easy_progression(conn: sqlite3.Connection, week_starts: list[str]) -> list[WeekEasyOut]:
     """Per-week distance-weighted easy-run avg pace/HR, aligned 1:1 with
-    week_starts (continuous plan-window Mondays) so a week with no easy runs
-    synced comes back all-None — a gap in the chart, never a missing category.
-    Filters to the effective run type 'easy' (COALESCE'd inferred type, same
-    idiom as the rest of this module — get_easy_hr_trend's mcp tool filters
-    the raw column instead, but a long_run week must never count here even
-    when Strava-untagged, so the effective type is the correct filter).
-    Distance-weighted rather than get_easy_hr_trend's flat per-run average —
-    a single 2-mile shakeout shouldn't move the week's number as much as an
-    8-mile aerobic day. avg_apparent_temp_f is an unweighted mean of the
-    week's easy-run weather rows — a context annotation, not a headline
-    number, so a plain average is enough."""
+    week_starts (Mondays); a week with no easy runs synced comes back
+    all-None. Filters on the effective run type 'easy' (explicit tag or
+    inferred), so untagged long runs are excluded. avg_apparent_temp_f is an
+    unweighted mean over the week's easy-run weather rows."""
     if not week_starts:
         return []
     effective = db.effective_run_type_sql("a")
-    ph = ",".join("?" * len(_RUN_TYPES))
+    sport_clause, sport_params = run_sport_filter("a")
     start = week_starts[0]
     end = (date.fromisoformat(week_starts[-1]) + timedelta(days=6)).isoformat()
     rows = conn.execute(f"""
         SELECT
-            DATE(a.start_date, '-' || ((CAST(strftime('%w', a.start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            {db.monday_sql("a.start_date")} AS monday,
             SUM(a.distance_m) AS total_distance_m,
             SUM(a.moving_time_s) AS total_time_s,
             SUM(CASE WHEN a.average_heartrate IS NOT NULL THEN a.distance_m * a.average_heartrate ELSE 0 END) AS hr_weighted,
@@ -905,10 +849,10 @@ def _easy_progression(conn: sqlite3.Connection, week_starts: list[str]) -> list[
             COUNT(*) AS run_count
         FROM activities a
         LEFT JOIN weather w ON w.activity_id = a.activity_id
-        WHERE a.sport_type IN ({ph}) AND {effective} = 'easy'
+        WHERE {sport_clause} AND {effective} = 'easy'
           AND DATE(a.start_date) >= ? AND DATE(a.start_date) <= ?
         GROUP BY monday
-    """, list(_RUN_TYPES) + [start, end]).fetchall()
+    """, sport_params + [start, end]).fetchall()
     by_week = {r["monday"]: r for r in rows}
 
     out: list[WeekEasyOut] = []
@@ -917,7 +861,7 @@ def _easy_progression(conn: sqlite3.Connection, week_starts: list[str]) -> list[
         if r is None or not r["total_distance_m"]:
             out.append(WeekEasyOut(
                 week_start=ws, avg_pace_min_per_mile=None, avg_hr=None,
-                avg_apparent_temp_f=None, run_count=0,
+                avg_apparent_temp_f=None, weather_attribution=None, run_count=0,
             ))
             continue
         distance_mi = float(r["total_distance_m"]) / MILE_M
@@ -930,21 +874,19 @@ def _easy_progression(conn: sqlite3.Connection, week_starts: list[str]) -> list[
             avg_pace_min_per_mile=round(pace, 2) if pace is not None else None,
             avg_hr=hr,
             avg_apparent_temp_f=temp_f,
+            weather_attribution=WEATHER_ATTRIBUTION if temp_f is not None else None,
             run_count=int(r["run_count"]),
         ))
     return out
 
 
 def _workout_points(conn: sqlite3.Connection, plan_id: int, weeks_in: list[PlanWeekRow]) -> list[WorkoutPoint]:
-    """One point per synced workout matched to its planned slot, reusing
-    plan_adherence's count/keyword matching as-is, so this chart and the
-    adherence score never disagree about which run was the workout. Each point
-    carries the frozen target band from whichever version governed its week
-    at the time — not necessarily the latest version, so a since-revised
-    target is never retroactively attributed to a workout run under the old
-    one. A week with no synced workouts contributes nothing; a matched
-    workout with no qualifying work laps contributes a point with
-    pace_min_per_mile=None (the frontend renders it as a gap, not a dot)."""
+    """One point per synced workout matched to its planned slot, using
+    plan_adherence's matching so both agree on which run was the workout. Each
+    point carries the target band from the version that governed its week,
+    not necessarily the latest. A week with no synced workouts contributes
+    nothing; a matched workout with no qualifying work laps contributes a
+    point with pace_min_per_mile=None."""
     today = date.today()
     points: list[WorkoutPoint] = []
     for w in weeks_in:
@@ -977,11 +919,8 @@ def _workout_points(conn: sqlite3.Connection, plan_id: int, weeks_in: list[PlanW
 
 
 def _checkpoints_in_window(conn: sqlite3.Connection, week_starts: list[str]) -> list[CheckpointPoint]:
-    """fitness_checkpoints months landing inside [week_starts[0], week_starts[-1]]
-    — background context for the workout-pace chart, per training.html's
-    monthly-checkpoint treatment. Takes a plain Monday list rather than
-    PlanWeekRows so it works for both the plan-scoped and plan-independent
-    (rolling-window) progression endpoints."""
+    """fitness_checkpoints months landing inside [week_starts[0], week_starts[-1]].
+    Takes a plain Monday list so both progression endpoints can use it."""
     if not week_starts:
         return []
     start_month = week_starts[0][:7]
@@ -1033,23 +972,18 @@ def _workout_caption(points: Sequence[WorkoutPoint]) -> str:
 @router.get("/api/plan-progression")
 def get_plan_progression() -> PlanProgressionResponse | None:
     """
-    The "is it working" data, scoped to the active plan's window — the other
-    two of the three progression charts (weekly mileage vs ramp already exists
-    from /api/plan + /api/plan-adherence's bands; see the module comment
-    above).
+    Easy-run and workout-pace progression scoped to the plan window.
 
-    `weeks` is the full plan-window Monday list from the latest version (the
-    same list /api/plan reports) — the shared, continuous x-axis for the easy
-    HR/pace chart, so a week with no easy runs synced renders as a gap, never
-    a missing category.
+    `weeks` is the full Monday list from the latest version (the same list
+    /api/plan reports), the continuous x-axis for the series.
 
     `easy`: one row per week in `weeks`; see _easy_progression.
 
-    `workouts`: one point per synced workout matched to a planned workout slot
-    (plan_adherence's matching, reused); see _workout_points.
+    `workouts`: one point per synced workout matched to a planned workout
+    slot; see _workout_points.
 
-    `checkpoints`: monthly 5K-pace fitness_checkpoints rows landing inside the
-    plan window, for the workout chart's background reference.
+    `checkpoints`: monthly 5K-pace fitness_checkpoints rows inside the plan
+    window.
 
     Returns null when there's neither an active nor a completed plan (see
     plan.get_current_or_recent_plan).
@@ -1083,21 +1017,16 @@ def get_plan_progression() -> PlanProgressionResponse | None:
     )
 
 
-# Query-param bounds for /api/progression's rolling window — 1 week is the
-# degenerate-but-valid floor, 104 (two years) is more history than the chart
-# reads sensibly at its fixed width.
+# Bounds for /api/progression's `weeks` parameter (clamped, not rejected).
 _PROGRESSION_DEFAULT_WEEKS = 16
 _PROGRESSION_MIN_WEEKS = 1
 _PROGRESSION_MAX_WEEKS = 104
 
 
 class ProgressionWorkoutPoint(WorkoutPoint):
-    """WorkoutPoint plus activity_id. /api/progression never has a frozen
-    target band or a planned slot to match against (there may be no plan at
-    all), so pace_lo/pace_hi/zone_name are always None and title carries the
-    activity's own name rather than a planned slot's — same shape otherwise,
-    so plan.html's chart renderer runs unmodified regardless of which
-    endpoint fed it."""
+    """WorkoutPoint plus activity_id. There is no planned slot to match, so
+    pace_lo/pace_hi/zone_name are always None and title is the activity's own
+    name."""
     activity_id: int
 
 
@@ -1110,24 +1039,24 @@ class ProgressionResponse(TypedDict):
 
 
 def _progression_workout_points(conn: sqlite3.Connection, week_starts: list[str]) -> list[ProgressionWorkoutPoint]:
-    """One point per synced workout in [week_starts[0], week_starts[-1] + 6d]
-    — the plan-independent twin of _workout_points: no planned-slot matching,
-    no frozen target band. Pace prefers the distance-weighted work-lap pace
-    (plan_adherence._work_lap_pace, laps.lap_type = 'work'); an activity with
-    no classified work laps falls back to its own average pace."""
+    """One point per synced workout in [week_starts[0], week_starts[-1] + 6d],
+    with no planned-slot matching or target band. Pace prefers the
+    distance-weighted work-lap pace (plan_adherence._work_lap_pace,
+    laps.lap_type = 'work'); an activity with no classified work laps falls
+    back to its own average pace."""
     if not week_starts:
         return []
     effective = db.effective_run_type_sql("a")
-    ph = ",".join("?" * len(_RUN_TYPES))
+    sport_clause, sport_params = run_sport_filter("a")
     start = week_starts[0]
     end = (date.fromisoformat(week_starts[-1]) + timedelta(days=6)).isoformat()
     rows = conn.execute(f"""
         SELECT a.activity_id, a.name, DATE(a.start_date) AS date, a.distance_m, a.average_speed_mps
         FROM activities a
-        WHERE a.sport_type IN ({ph}) AND {effective} = 'workout'
+        WHERE {sport_clause} AND {effective} = 'workout'
           AND DATE(a.start_date) >= ? AND DATE(a.start_date) <= ?
         ORDER BY a.start_date
-    """, list(_RUN_TYPES) + [start, end]).fetchall()
+    """, sport_params + [start, end]).fetchall()
 
     points: list[ProgressionWorkoutPoint] = []
     for r in rows:
@@ -1139,7 +1068,7 @@ def _progression_workout_points(conn: sqlite3.Connection, week_starts: list[str]
             distance_mi = float(r["distance_m"] or 0.0) / MILE_M
             pace = 26.8224 / r["average_speed_mps"] if r["average_speed_mps"] else None
         d = r["date"]
-        monday = (date.fromisoformat(d) - timedelta(days=date.fromisoformat(d).weekday())).isoformat()
+        monday = monday_of(date.fromisoformat(d)).isoformat()
         points.append(ProgressionWorkoutPoint(
             date=d, week_start=monday, title=r["name"], label=classify_workout(r["name"] or ""),
             pace_min_per_mile=round(pace, 2) if pace is not None else None,
@@ -1153,18 +1082,15 @@ def _progression_workout_points(conn: sqlite3.Connection, week_starts: list[str]
 @router.get("/api/progression")
 def get_progression(weeks: int = _PROGRESSION_DEFAULT_WEEKS) -> ProgressionResponse:
     """
-    Plan-independent twin of /api/plan-progression — works regardless of plan
-    state (no plan, completed-only plan, active plan) so plan.html's Trends
-    tab can render the same two charts everywhere. `weeks` is a rolling
-    window of the last N Mondays ending at the current week, clamped to
-    [_PROGRESSION_MIN_WEEKS, _PROGRESSION_MAX_WEEKS], rather than a plan's
-    own week list. Workout points carry no target band (see
-    ProgressionWorkoutPoint) — there may be no plan governing them at all.
+    Plan-independent counterpart of /api/plan-progression. `weeks` is a
+    rolling window of the last N Mondays ending at the current week, clamped
+    to [_PROGRESSION_MIN_WEEKS, _PROGRESSION_MAX_WEEKS]. Workout points carry
+    no target band (see ProgressionWorkoutPoint).
     """
     conn = _conn()
     n = max(_PROGRESSION_MIN_WEEKS, min(weeks, _PROGRESSION_MAX_WEEKS))
     today = date.today()
-    current_monday = today - timedelta(days=today.weekday())
+    current_monday = monday_of(today)
     week_starts = [(current_monday - timedelta(weeks=n - 1 - i)).isoformat() for i in range(n)]
 
     easy = _easy_progression(conn, week_starts)
@@ -1185,48 +1111,29 @@ def get_progression(weeks: int = _PROGRESSION_DEFAULT_WEEKS) -> ProgressionRespo
 
 # --- race retrospective ---------------------------------------------------
 #
-# Closes the loop once the goal race is run (see plan.auto_complete_plan,
-# called from sync.py). Everything here reads plan_id off
-# plan.get_current_or_recent_plan and 404/nulls when that plan isn't
-# 'completed' yet — the forward-looking /api/plan endpoints above already
-# work fine for a completed plan (calendar, version history), this is the
-# additional data plan.html's retrospective view needs on top.
+# Data for a plan whose goal race has been run (see plan.auto_complete_plan).
+# Reads the plan from plan.get_current_or_recent_plan and returns null unless
+# its status is 'completed'.
 
 
-def _canonical_bucket(bucket: str) -> str | None:
-    """Case-insensitive match of a plan's distance_bucket against the
-    canonical races.py classify_race_distance() vocabulary (lowercase
-    'marathon'/'half', uppercase '5K'/'10K'/...) — the vocabulary
-    NOMINAL_METERS and estimate_fitness's `predicted` dict use. The bucket
-    casing is inconsistent across the codebase (distance_builds.py's Bucket
-    type is Title Case 'Marathon'/'Half'), so this maps either convention
-    onto the canonical one rather than assuming a plan's stored casing."""
+def _match_name(bucket: str, names: Iterable[str]) -> str | None:
+    """The entry of `names` equal to a plan's distance_bucket ignoring case:
+    the codebase spells buckets both as races.py's categories ('marathon',
+    'half', '5K') and distance_builds.py's Bucket ('Marathon', 'Half')."""
     target = bucket.strip().casefold()
-    for key in NOMINAL_METERS:
-        if key.casefold() == target:
-            return key
-    return None
+    return next((name for name in names if name.casefold() == target), None)
 
 
 def _predicted_time_for_race(conn: sqlite3.Connection, race_date: date, category: str) -> tuple[float, str] | None:
     """(predicted finish time in seconds, confidence) for a race's distance
-    category, from a live fitness estimate as of the day before race_date —
-    same pattern as derive.py's _predicted_pace_for_race (the race-effort
-    classification pass), reimplemented here read-only since that helper is
-    private to the derive pass and this call is for display, not persisted
-    classification. None when the category has no tracked prediction
-    (estimate_fitness only projects 5K/10K/half/marathon) or no estimate is
+    category, from a live fitness estimate as of the day before race_date.
+    None when the category has no tracked prediction or no estimate is
     computable that far back."""
-    if category not in NOMINAL_METERS:
+    predicted = predicted_pace_for_race(conn, race_date, category)
+    if predicted is None:
         return None
-    est = estimate_fitness(conn, race_date - timedelta(days=1))
-    if est is None:
-        return None
-    pace = est["predicted"].get(category)
-    if pace is None:
-        return None
-    time_s = pace * (NOMINAL_METERS[category] / MILE_M) * 60.0
-    return round(time_s, 1), est["confidence"]
+    pace, confidence = predicted
+    return round(pace * (NOMINAL_METERS[category] / MILE_M) * 60.0, 1), confidence
 
 
 class RaceResult(TypedDict):
@@ -1303,82 +1210,23 @@ def _final_adherence_rollup(conn: sqlite3.Connection, plan_id: int) -> FinalAdhe
     )
 
 
-def _all_week_aggs(conn: sqlite3.Connection) -> list[WeekAgg]:
-    """Every calendar week with at least one run across the athlete's whole
-    history, Monday-aligned — the same shape api.py's _week_aggs builds
-    (duplicated here rather than imported, since api.py imports this router
-    and importing back would cycle)."""
-    effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
-    rows = conn.execute(f"""
-        SELECT
-            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
-            ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
-            COUNT(*) AS runs,
-            SUM(CASE WHEN {effective} = 'workout' THEN 1 ELSE 0 END) AS workouts
-        FROM activities
-        WHERE {tc}
-        GROUP BY monday
-        ORDER BY monday
-    """, tp).fetchall()
-    return [
-        WeekAgg(monday=r["monday"], miles=r["miles"] or 0.0, runs=r["runs"], workouts=r["workouts"] or 0)
-        for r in rows
-    ]
-
-
-def _all_race_refs(conn: sqlite3.Connection) -> list[RaceRef]:
-    """Every effective-race activity across the athlete's whole history, as
-    detect_builds()'s RaceRef input — same duplication rationale as
-    _all_week_aggs above."""
-    effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
-    rows = conn.execute(f"""
-        SELECT DATE(start_date) AS date, name, distance_m
-        FROM activities WHERE {tc} AND {effective} = 'race'
-        ORDER BY date
-    """, tp).fetchall()
-    return [
-        RaceRef(
-            date=r["date"], name=r["name"],
-            distance_category=classify_race_distance(r["distance_m"]) or "other",
-            distance_m=r["distance_m"],
-        )
-        for r in rows
-        if r["distance_m"] is not None
-    ]
-
-
 def _detected_build_for_race(conn: sqlite3.Connection, race_date: str) -> Build | None:
-    """The detect_builds() (builds.py — the same race-anchored detector
-    builds.html indexes) build anchored to race_date, if any. Most short
-    races never anchor a detected build (below BUILD_ANCHOR_MIN_M) — the
-    caller reports `found: false` rather than falling back to a fixed
-    window, since this comparison is explicitly "what the build detector
-    saw", not a substitute training-window stat."""
-    weeks = _all_week_aggs(conn)
-    if not weeks:
-        return None
-    periods, _gaps = detect_periods(weeks)
-    if not periods:
-        return None
-    builds = detect_builds(weeks, _all_race_refs(conn), periods)
+    """The detect_builds() build anchored to race_date, if any. Short races
+    below BUILD_ANCHOR_MIN_M never anchor one; the caller reports
+    `found: false` rather than substituting a fixed window."""
+    _periods, builds, _weeks = full_periods_and_builds(conn)
     return next((b for b in builds if b["race"]["date"] == race_date), None)
 
 
 @router.get("/api/plan-retrospective")
 def get_plan_retrospective() -> PlanRetrospectiveResponse | None:
     """
-    The closed-loop view for a completed plan: the final adherence rollup,
-    the matching race result, that race's goal vs a live pre-race fitness
-    prediction (estimate_fitness as of the day before the race — same
-    pattern as derive.py's _predicted_pace_for_race), and the plan's target
-    ramp vs what detect_builds() independently saw for the same race.
+    Retrospective for a completed plan: the final adherence rollup, the
+    matching race result, the goal vs a fitness prediction as of the day
+    before the race (derive.predicted_pace_for_race), and the plan's target
+    ramp vs the build detect_builds() found for the same race.
 
-    Reads plan.get_current_or_recent_plan like the endpoints above, but
-    returns null unless that plan's status is actually 'completed' —
-    plan.html only renders this view once /api/plan reports a completed
-    plan, so an active plan simply has nothing here yet.
+    Returns null unless the current-or-recent plan's status is 'completed'.
     """
     conn = _conn()
     current = plan.get_current_or_recent_plan(conn)
@@ -1400,7 +1248,7 @@ def get_plan_retrospective() -> PlanRetrospectiveResponse | None:
             pace_min_per_mile=pace,
         )
     if category is None:
-        category = _canonical_bucket(current["distance_bucket"])
+        category = _match_name(current["distance_bucket"], NOMINAL_METERS)
 
     predicted_time_s: float | None = None
     predicted_confidence: str | None = None
@@ -1427,8 +1275,7 @@ def get_plan_retrospective() -> PlanRetrospectiveResponse | None:
     weeks_in = bundle["weeks"] if bundle is not None else []
     plan_ramp: PlanRampSummary | None = None
     if weeks_in:
-        # Weeks authored with no mileage target (deliberately unspecified) don't
-        # contribute to the ramp average/peak — there's no target to average.
+        # Weeks with no mileage target are excluded from the average and peak.
         targets = [w["target_miles"] for w in weeks_in if w["target_miles"] is not None]
         if targets:
             plan_ramp = PlanRampSummary(
@@ -1461,14 +1308,12 @@ def get_plan_retrospective() -> PlanRetrospectiveResponse | None:
 
 # --- readiness --------------------------------------------------------------
 #
-# "Race is in N weeks. Am I ready?" — the forward-looking twin of the
-# retrospective above, for an ACTIVE plan only (a completed plan renders the
-# retrospective in the same slot). Three evidence blocks: goal vs current
-# fitness (estimate_fitness + the plan window's monthly checkpoints), the
-# in-progress block vs a completed reference build at the same distance
-# (weeks-out aligned, both sides cut at the same point — never a partial
-# block vs a complete one), and session execution (matched workouts in their
-# frozen target band + longest run vs the plan's peak long-run target).
+# Evidence for an ACTIVE plan only. Three blocks: goal vs current fitness
+# (estimate_fitness + the plan window's monthly checkpoints), the in-progress
+# block vs a completed reference build at the same distance (weeks-out
+# aligned, both sides cut at the same point), and session execution (matched
+# workouts in their frozen target band + longest run vs the plan's peak
+# long-run target).
 
 
 # source_tier -> basis vocabulary: race-confirmed (tier 1, an actual raced
@@ -1477,32 +1322,12 @@ def get_plan_retrospective() -> PlanRetrospectiveResponse | None:
 # which also encodes recency.
 _READINESS_BASIS_BY_TIER: dict[int, str] = {1: "race-confirmed", 2: "workout-anchored", 3: "training-floor"}
 
-# fitness_checkpoints pace column per canonical race category. Only the four
-# distances estimate_fitness projects are tracked; a plan at any other
-# distance (50K, Other) gets no checkpoint mini-line and no predicted time —
-# the goal block degrades to nulls rather than borrowing a proxy distance.
-_CHECKPOINT_PACE_COL: dict[str, str] = {
-    "5K": "pace_5k", "10K": "pace_10k", "half": "pace_half", "marathon": "pace_marathon",
-}
-
 # Reference candidates with less window overlap than this against the elapsed
 # plan carry too little shared signal to compare cumulatively at all.
 _MIN_OVERLAP_WEEKS = 3
 
 # How many completed weeks back the session-execution window reaches.
 _SESSION_WINDOW_WEEKS = 3
-
-
-def _builds_bucket(bucket: str) -> Bucket | None:
-    """Case-insensitive match of a plan's distance_bucket against
-    distance_builds.py's Title Case Bucket vocabulary — same casing
-    reconciliation as _canonical_bucket above, pointed at the other
-    convention."""
-    target = bucket.strip().casefold()
-    for key in get_args(Bucket):
-        if key.casefold() == target:
-            return cast(Bucket, key)
-    return None
 
 
 class ReadinessCheckpoint(TypedDict):
@@ -1513,7 +1338,7 @@ class ReadinessCheckpoint(TypedDict):
 class ReadinessGoal(TypedDict):
     """Goal vs current fitness at the plan's race distance. predicted_* /
     basis / confidence are None when estimate_fitness tracks no prediction at
-    that distance (see _CHECKPOINT_PACE_COL) or no estimate is computable;
+    that distance (see derive.CHECKPOINT_PACE_COL) or no estimate is computable;
     goal_* are None when the plan was authored without a goal time."""
     goal_time_s: int | None
     goal_pace_min_per_mile: float | None
@@ -1593,7 +1418,7 @@ def _weekly_offset_miles(
     minus weeks_before weeks, so all julianday differences are positive and
     CAST truncates toward zero correctly — the app-wide offset convention
     (see distance_builds.py). Only weeks with at least one run appear."""
-    tc, tp = _type_clause()
+    tc, tp = run_sport_filter()
     rows = conn.execute(f"""
         SELECT
             CAST((julianday(DATE(start_date)) - julianday(?)) / 7.0 AS INTEGER) - {weeks_before} AS week_offset,
@@ -1608,7 +1433,7 @@ def _weekly_offset_miles(
 def _long_run_count(conn: sqlite3.Connection, start: str, end: str) -> int:
     """Count of effective-type long runs over [start, end] inclusive."""
     effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
+    tc, tp = run_sport_filter()
     row = conn.execute(f"""
         SELECT COUNT(*) AS n FROM activities
         WHERE {tc} AND {effective} = 'long_run'
@@ -1643,7 +1468,7 @@ def _race_efforts(conn: sqlite3.Connection) -> dict[str, str | None]:
     """race_effort keyed by race date, for splitting raced from casual
     candidates — get_distance_builds' rows don't carry the effort column."""
     effective = db.effective_run_type_sql()
-    tc, tp = _type_clause()
+    tc, tp = run_sport_filter()
     rows = conn.execute(
         f"SELECT DATE(start_date) AS date, race_effort FROM activities WHERE {tc} AND {effective} = 'race'",
         tp,
@@ -1654,7 +1479,7 @@ def _race_efforts(conn: sqlite3.Connection) -> dict[str, str | None]:
 def _readiness_goal(
     conn: sqlite3.Connection, active: PlanRow, weeks_in: list[PlanWeekRow], today: date
 ) -> ReadinessGoal:
-    canonical = _canonical_bucket(active["distance_bucket"])
+    canonical = _match_name(active["distance_bucket"], NOMINAL_METERS)
     nominal_mi = NOMINAL_METERS[canonical] / MILE_M if canonical is not None else None
 
     goal_time_s = active["goal_time_s"]
@@ -1678,7 +1503,7 @@ def _readiness_goal(
                 basis = _READINESS_BASIS_BY_TIER.get(est["sources"][0]["tier"])
 
     checkpoints: list[ReadinessCheckpoint] = []
-    col = _CHECKPOINT_PACE_COL.get(canonical) if canonical is not None else None
+    col = CHECKPOINT_PACE_COL.get(canonical) if canonical is not None else None
     if col is not None and weeks_in:
         rows = conn.execute(
             f"SELECT month, {col} AS pace FROM fitness_checkpoints "
@@ -1721,7 +1546,7 @@ def _readiness_builds(
     None when nothing comparable exists: no completed race at the distance,
     or fewer than _MIN_OVERLAP_WEEKS shared weeks so far (the bucket's build
     window is fixed, so overlap is uniform across candidates)."""
-    bucket = _builds_bucket(active["distance_bucket"])
+    bucket = cast("Bucket | None", _match_name(active["distance_bucket"], get_args(Bucket)))
     if bucket is None:
         return None
     rows = get_distance_builds(bucket)
@@ -1748,7 +1573,7 @@ def _readiness_builds(
     candidates: list[ReadinessCandidate] = []
     for r in deduped:
         ref_race_dt = date.fromisoformat(r["date"])
-        ref_monday = ref_race_dt - timedelta(days=ref_race_dt.weekday())
+        ref_monday = monday_of(ref_race_dt)
         ref_end = (ref_monday - timedelta(weeks=k) + timedelta(days=6)).isoformat()
         stats = _block_stats(conn, ref_monday, r["build_weeks"], window_w, k, ref_end)
         by_date[r["date"]] = ReadinessReference(**stats, overlap_weeks=overlap)
@@ -1816,7 +1641,7 @@ def _readiness_sessions(
             ))
     points.sort(key=lambda p: p["date"])
 
-    tc, tp = _type_clause()
+    tc, tp = run_sport_filter()
     longest = conn.execute(
         f"SELECT MAX(distance_m) AS d FROM activities WHERE {tc} AND DATE(start_date) >= ? AND DATE(start_date) <= ?",
         tp + [plan_start.isoformat(), cutoff.isoformat()],
@@ -1838,19 +1663,17 @@ def _readiness_sessions(
 @router.get("/api/plan-readiness")
 def get_plan_readiness() -> PlanReadinessResponse | None:
     """
-    "Am I ready?" evidence for the ACTIVE plan — null for a completed plan
-    (the retrospective owns that slot) or when no plan exists.
+    Readiness evidence for the ACTIVE plan; null for a completed plan or when
+    no plan exists.
 
-    Alignment is by weeks-out, never calendar: with k = weeks to race and
-    W = min(plan length, the bucket's build-window length), both the current
-    block and every reference build report cumulative stats over the same
+    Alignment is by weeks-out, not calendar date: with k = weeks to race and
+    W = min(plan length, the bucket's build-window length), the current block
+    and every reference build report cumulative stats over the same
     Monday-aligned offsets [-W, -k]. k is computed at the sync cutoff
-    (min(today, last_sync_at's date)) rather than the calendar today, so a
-    stale sync narrows the compared range instead of reading absent weeks as
-    zeros — the same clamp _today_blocks applies at week scale.
+    (min(today, last_sync_at's date)), so a stale sync narrows the compared
+    range instead of reading unsynced weeks as zeros.
 
-    All candidates' aligned stats ship in one payload (builds.by_date) so
-    flipping the reference is purely client-side.
+    Every candidate's aligned stats are in builds.by_date.
     """
     conn = _conn()
     active = plan.get_current_or_recent_plan(conn)
@@ -1872,13 +1695,13 @@ def get_plan_readiness() -> PlanReadinessResponse | None:
     cutoff = min(today, sync_date)
 
     race_dt = date.fromisoformat(active["race_date"])
-    race_monday = race_dt - timedelta(days=race_dt.weekday())
-    current_monday = today - timedelta(days=today.weekday())
+    race_monday = monday_of(race_dt)
+    current_monday = monday_of(today)
     weeks_to_race = max(0, (race_monday - current_monday).days // 7)
 
     plan_start = date.fromisoformat(weeks_in[0]["week_start"])
     plan_weeks_before = max(0, (race_monday - plan_start).days // 7)
-    cutoff_monday = cutoff - timedelta(days=cutoff.weekday())
+    cutoff_monday = monday_of(cutoff)
     k = max(0, (race_monday - cutoff_monday).days // 7)
 
     return PlanReadinessResponse(

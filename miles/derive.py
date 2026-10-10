@@ -22,11 +22,13 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from typing import cast, get_args
 
-from .classifier import LAP_MIN_DISTANCE_M, LAP_MIN_MOVING_TIME_S, classify_laps
-from .db import effective_run_type_sql
+from . import db
+from .classifier import classify_laps
+from .db import effective_run_type_sql, get_meta, set_meta
 from .fitness import (
     EFFORT_RACED_MAX,
     MILE_M,
+    PREDICTED_KEYS,
     Confidence,
     classify_race_effort,
     estimate_fitness,
@@ -43,7 +45,10 @@ _CONFIDENCE_VALUES = get_args(Confidence)
 
 # Bump whenever any classifier or threshold feeding a derived value changes, so
 # ensure_derived() knows stale rows need a full recompute.
-DERIVE_VERSION = "11"
+DERIVE_VERSION = "12"
+
+_FINAL_CHECKPOINTS = "fitness_checkpoints"
+_SEED_CHECKPOINTS = "fitness_checkpoints_seed"
 
 # A single intensity must hold at least this share of a session's work-lap moving
 # time to count as the session's dominant_intensity; below it the session is mixed.
@@ -51,9 +56,7 @@ DOMINANT_INTENSITY_MIN_SHARE = 0.60
 
 # Checkpoint pace columns per race category — only these four are tracked; races in
 # other buckets (15K, 10M, 30K, 50K) have no checkpoint prediction and are skipped.
-_CHECKPOINT_PACE_COL: dict[str, str] = {
-    "5K": "pace_5k", "10K": "pace_10k", "half": "pace_half", "marathon": "pace_marathon",
-}
+CHECKPOINT_PACE_COL: dict[str, str] = {k: f"pace_{k.lower()}" for k in PREDICTED_KEYS}
 
 
 def _type_laps(conn: sqlite3.Connection, *, since: str | None = None) -> int:
@@ -117,14 +120,16 @@ _TIER_BY_CONFIDENCE: dict[str, int] = {"high": 1, "medium": 1, "medium-low": 2, 
 def _fitness_checkpoints(
     conn: sqlite3.Connection, *, exclude_casual: bool = False, since_month: tuple[int, int] | None = None
 ) -> int:
-    """Rebuild monthly fitness checkpoints. since_month=None rebuilds every month from
+    """Rebuild monthly fitness checkpoints: the final table when exclude_casual, else
+    the seed table (see db.init_db). since_month=None rebuilds every month from
     the first activity through the current month; a (year, month) scopes the rebuild
     to months >= that one. Safe to scope because a checkpoint's as_of value depends
     only on activities on or before it (fitness.py's tier1/2/3 windows all end at
     as_of — see estimate_fitness), so a month before since_month can never depend on
     anything at or after it and is left untouched. Returns rows inserted."""
+    table = _FINAL_CHECKPOINTS if exclude_casual else _SEED_CHECKPOINTS
     if since_month is None:
-        conn.execute("DELETE FROM fitness_checkpoints")
+        conn.execute(f"DELETE FROM {table}")
         row = conn.execute("SELECT MIN(DATE(start_date)) AS d FROM activities").fetchone()
         first: str | None = row["d"] if row is not None else None
         if first is None:
@@ -132,7 +137,7 @@ def _fitness_checkpoints(
         year, month = int(first[:4]), int(first[5:7])
     else:
         year, month = since_month
-        conn.execute("DELETE FROM fitness_checkpoints WHERE month >= ?", [f"{year:04d}-{month:02d}"])
+        conn.execute(f"DELETE FROM {table} WHERE month >= ?", [f"{year:04d}-{month:02d}"])
 
     today = date.today()
     inserted = 0
@@ -141,8 +146,8 @@ def _fitness_checkpoints(
         as_of = min(next_month - timedelta(days=1), today)
         est = estimate_fitness(conn, as_of, exclude_casual=exclude_casual)
         if est is not None:
-            conn.execute("""
-                INSERT INTO fitness_checkpoints
+            conn.execute(f"""
+                INSERT INTO {table}
                     (month, confidence, source_tier, pace_5k, pace_10k, pace_half, pace_marathon)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
@@ -160,18 +165,18 @@ def _fitness_checkpoints(
     return inserted
 
 
-def _checkpoint_row(conn: sqlite3.Connection, month: str) -> sqlite3.Row | None:
+def _checkpoint_row(conn: sqlite3.Connection, month: str, table: str = _FINAL_CHECKPOINTS) -> sqlite3.Row | None:
     """Checkpoint row for `month`, falling back to the nearest earlier month with
     a row when that exact month has none."""
-    row = conn.execute("""
+    row = conn.execute(f"""
         SELECT confidence, pace_5k, pace_10k, pace_half, pace_marathon
-        FROM fitness_checkpoints WHERE month = ?
+        FROM {table} WHERE month = ?
     """, [month]).fetchone()
     if row is not None:
         return row
-    return conn.execute("""
+    return conn.execute(f"""
         SELECT confidence, pace_5k, pace_10k, pace_half, pace_marathon
-        FROM fitness_checkpoints WHERE month < ? ORDER BY month DESC LIMIT 1
+        FROM {table} WHERE month < ? ORDER BY month DESC LIMIT 1
     """, [month]).fetchone()
 
 
@@ -183,14 +188,15 @@ def _prior_month_str(year: int, month: int) -> str:
 
 
 def _predicted_pace(conn: sqlite3.Connection, race_date: date, category: str) -> tuple[float, Confidence] | None:
-    """(predicted pace min/mi, confidence) for a race's category, from the checkpoint
-    of the month *before* race_date's month — never the activity's own month, which
-    can include activities from later in that same month. Falls back to the nearest
-    earlier month with a row; None when no checkpoint or category has no tracked column."""
-    col = _CHECKPOINT_PACE_COL.get(category)
+    """(predicted pace min/mi, confidence) for a race's category, from the seed
+    checkpoint of the month *before* race_date's month — never the activity's own
+    month, which can include activities from later in that same month. Falls back to
+    the nearest earlier month with a row; None when no checkpoint or category has no
+    tracked column."""
+    col = CHECKPOINT_PACE_COL.get(category)
     if col is None:
         return None
-    checkpoint = _checkpoint_row(conn, _prior_month_str(race_date.year, race_date.month))
+    checkpoint = _checkpoint_row(conn, _prior_month_str(race_date.year, race_date.month), _SEED_CHECKPOINTS)
     if checkpoint is None or checkpoint[col] is None:
         return None
     confidence_val = checkpoint["confidence"]
@@ -198,12 +204,12 @@ def _predicted_pace(conn: sqlite3.Connection, race_date: date, category: str) ->
     return float(checkpoint[col]), cast(Confidence, confidence_val)
 
 
-def _predicted_pace_for_race(conn: sqlite3.Connection, race_date: date, category: str) -> tuple[float, Confidence] | None:
+def predicted_pace_for_race(conn: sqlite3.Connection, race_date: date, category: str) -> tuple[float, Confidence] | None:
     """(predicted pace min/mi, confidence) for a race's category, from a live fitness
     estimate as of the day before the race. Unlike a shared monthly checkpoint, this
     window can never include the race itself. None when the category has no tracked
     prediction or no estimate is computable that far back."""
-    if category not in _CHECKPOINT_PACE_COL:
+    if category not in CHECKPOINT_PACE_COL:
         return None
     est = estimate_fitness(conn, race_date - timedelta(days=1))
     if est is None:
@@ -247,7 +253,7 @@ def _race_effort_pass(conn: sqlite3.Connection, *, since: str | None = None) -> 
         if category is None:
             continue
         race_date = date.fromisoformat(r["date"])
-        predicted = _predicted_pace_for_race(conn, race_date, category)
+        predicted = predicted_pace_for_race(conn, race_date, category)
         if predicted is None:
             continue
         predicted_pace, confidence = predicted
@@ -426,22 +432,25 @@ def _plan_adherence_pass(conn: sqlite3.Connection) -> dict[str, int]:
 
 
 def _dirty_since(conn: sqlite3.Connection) -> str | None:
-    row = conn.execute("SELECT value FROM meta WHERE key = 'derive_dirty_since'").fetchone()
-    return row["value"] if row is not None else None
+    return get_meta(conn, "derive_dirty_since")
 
 
 def _stamp_version(conn: sqlite3.Connection) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('derive_version', ?)", (DERIVE_VERSION,)
-    )
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('derived_at', ?)", (now,)
-    )
+    set_meta(conn, "derive_version", DERIVE_VERSION)
+    set_meta(conn, "derived_at", datetime.now(timezone.utc).isoformat())
+    set_meta(conn, "derived_month", date.today().isoformat()[:7])
 
 
 def _month_of(iso_date: str) -> tuple[int, int]:
     return int(iso_date[:4]), int(iso_date[5:7])
+
+
+def _first_stale_month(conn: sqlite3.Connection, since_month: tuple[int, int]) -> tuple[int, int]:
+    """Earliest checkpoint month an incremental run must rebuild: since_month, or
+    the month of the last derive when that is earlier, because that month's
+    checkpoint was cut off at the day of the last derive and has since grown."""
+    last = get_meta(conn, "derived_month")
+    return min(since_month, _month_of(last)) if last else since_month
 
 
 def _derive_all_full(conn: sqlite3.Connection) -> dict[str, int]:
@@ -508,7 +517,7 @@ def _derive_all_incremental(conn: sqlite3.Connection, since: str) -> dict[str, i
 
     counts["laps_typed"] = _type_laps(conn, since=since)
 
-    since_month = _month_of(since)
+    since_month = _first_stale_month(conn, _month_of(since))
     _fitness_checkpoints(conn, since_month=since_month)  # pass 1
 
     effort_counts = _race_effort_pass(conn, since=since)
@@ -540,8 +549,9 @@ def _derive_all_untouched(conn: sqlite3.Connection) -> dict[str, int]:
     new activities — so both get recomputed; everything else is unchanged from the
     last run."""
     counts: dict[str, int] = {}
-    today_month = (date.today().year, date.today().month)
-    counts["fitness_months"] = _fitness_checkpoints(conn, exclude_casual=True, since_month=today_month)
+    since_month = _first_stale_month(conn, _month_of(date.today().isoformat()))
+    _fitness_checkpoints(conn, since_month=since_month)
+    counts["fitness_months"] = _fitness_checkpoints(conn, exclude_casual=True, since_month=since_month)
     counts.update(_plan_adherence_pass(conn))
     _stamp_version(conn)
     conn.commit()
@@ -558,8 +568,7 @@ def derive_all(conn: sqlite3.Connection, *, full: bool = False) -> dict[str, int
     raw-data writer) says could have changed, which for a sync adding a handful of
     recent activities is the difference between a full rebuild and a sub-second pass.
     """
-    version_row = conn.execute("SELECT value FROM meta WHERE key = 'derive_version'").fetchone()
-    if full or version_row is None or version_row["value"] != DERIVE_VERSION:
+    if full or get_meta(conn, "derive_version") != DERIVE_VERSION:
         return _derive_all_full(conn)
 
     since = _dirty_since(conn)
@@ -570,14 +579,18 @@ def derive_all(conn: sqlite3.Connection, *, full: bool = False) -> dict[str, int
 
 def ensure_derived(conn: sqlite3.Connection) -> None:
     """Run derive_all if the DB's derived values are missing or from a stale version."""
-    row = conn.execute("SELECT value FROM meta WHERE key = 'derive_version'").fetchone()
-    if row is None or row["value"] != DERIVE_VERSION:
+    if get_meta(conn, "derive_version") != DERIVE_VERSION:
         derive_all(conn, full=True)
 
 
-def main() -> None:
-    from . import db
+def connect_derived() -> sqlite3.Connection:
+    """A connection whose derived values are current."""
+    conn = db.connect()
+    ensure_derived(conn)
+    return conn
 
+
+def main() -> None:
     conn = db.connect()
     db.init_db(conn)
     counts = derive_all(conn, full=True)

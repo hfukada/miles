@@ -14,8 +14,7 @@ from typing_extensions import TypedDict
 
 from fastapi import APIRouter, HTTPException
 
-from . import db
-from .derive import ensure_derived
+from .derive import connect_derived as _conn
 from .fitness import HALF_LIFE_DAYS, MILE_M, estimate_fitness
 from .races import NOMINAL_METERS, classify_race_distance, riegel_time
 
@@ -27,13 +26,6 @@ _MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 # here without a circular import.
 _BASIS_BY_TIER: dict[int, str] = {1: "race", 2: "workout anchor", 3: "training floor"}
 _KIND_BY_TIER: dict[int, Literal["race", "workout", "floor"]] = {1: "race", 2: "workout", 3: "floor"}
-
-
-def _conn() -> sqlite3.Connection:
-    conn = db.connect()
-    db.init_db(conn)
-    ensure_derived(conn)
-    return conn
 
 
 class FitnessTrendFullPoint(TypedDict):

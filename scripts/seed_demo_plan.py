@@ -2,21 +2,27 @@
 visually reviewing plan.html's populated states (active plan, versions + diff,
 plan_log markers, adherence bands, progression charts).
 
+Requires a scratch copy of a DB that already holds a synced history; the
+seeded plan is overlaid on those activities.
+
 Usage:
     cp data/activities.db /tmp/plan_demo.db
     MILES_DB=/tmp/plan_demo.db uv run python scripts/seed_demo_plan.py
     MILES_DB=/tmp/plan_demo.db uv run uvicorn miles.api:app --port 8001
 
-The plan window (WEEK1_MONDAY..RACE_DATE) should overlap real synced training
-weeks so actual bars/calendar fills visibly overlay the planned targets —
-adjust the dates below to the athlete's most recent training stretch.
+The plan window (WEEK1_MONDAY..RACE_DATE) starts ten weeks before this week,
+so the first ten weeks overlap synced training and overlay the planned targets,
+and the revision changes only weeks that have not started (a revision never
+rewrites weeks already governed by the earlier version).
 
 SAFETY: refuses to run unless MILES_DB is set and points somewhere other than
 the repo's real data/activities.db.
 """
 
 import os
+import sqlite3
 import sys
+from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,10 +36,11 @@ sys.path.insert(0, str(_REPO))
 
 from miles import db, plan  # noqa: E402
 from miles.derive import derive_all  # noqa: E402
+from miles.periods import monday_of  # noqa: E402
 
-WEEK1_MONDAY = date(2026, 3, 30)
 N_WEEKS = 16
-RACE_DATE = date(2026, 7, 19)  # Sunday of week 16
+WEEK1_MONDAY = monday_of(date.today()) - timedelta(weeks=10)
+RACE_DATE = WEEK1_MONDAY + timedelta(weeks=N_WEEKS) - timedelta(days=1)  # Sunday of week 16
 
 TARGET_MILES = [28, 32, 35, 26, 38, 42, 45, 36, 48, 52, 50, 56, 60, 40, 26, 12]
 TARGET_WORKOUTS = [1, 1, 1, 1, 1, 1, 2, 1, 2, 2, 2, 2, 2, 1, 1, 0]
@@ -55,12 +62,18 @@ def week_starts() -> list[date]:
     return [WEEK1_MONDAY + timedelta(weeks=i) for i in range(N_WEEKS)]
 
 
-def build_weeks(target_miles: list[int], target_long_run: list[int]) -> list[plan.WeekInput]:
+def build_weeks(days: list[plan.DayInput], target_long_run: list[int]) -> list[plan.WeekInput]:
+    """Each week targets the sum of its mileage-slot days, which commit requires."""
     weeks: list[plan.WeekInput] = []
     for i, ws in enumerate(week_starts()):
+        week_end = (ws + timedelta(days=6)).isoformat()
+        week_miles = sum(
+            d.get("target_miles") or 0.0 for d in days
+            if d["slot"] in plan.MILEAGE_SLOTS and ws.isoformat() <= d["date"] <= week_end
+        )
         weeks.append(plan.WeekInput(
             week_start=ws.isoformat(),
-            target_miles=float(target_miles[i]),
+            target_miles=round(week_miles, 1),
             target_workouts=TARGET_WORKOUTS[i],
             phase=PHASES[i],
             target_long_run_miles=float(target_long_run[i]) if target_long_run[i] else None,
@@ -151,50 +164,55 @@ def build_days(target_miles: list[int], target_long_run: list[int]) -> list[plan
     return days
 
 
-def main() -> None:
-    conn = db.connect()
+def seed(conn: sqlite3.Connection) -> None:
     db.init_db(conn)
 
-    plan_id = plan.create_plan(
-        conn, title="Twin Cities Marathon", race_date=RACE_DATE.isoformat(),
+    plan_id, v1_id = plan.start_plan_draft(
+        conn, title="Demo Marathon", race_date=RACE_DATE.isoformat(),
         distance_bucket="marathon", goal_time_s=3 * 3600 + 15 * 60,
     )
-    print(f"created plan_id={plan_id}")
-
-    v1_id = plan.add_version(
-        conn, plan_id,
-        weeks=build_weeks(TARGET_MILES, TARGET_LONG_RUN),
-        days=build_days(TARGET_MILES, TARGET_LONG_RUN),
-        note="Initial 16-week build for Twin Cities Marathon.",
-        author="agent",
-        created_at=datetime(2026, 3, 28, 14, 0, tzinfo=timezone.utc),
-    )
-    print(f"created v1 version_id={v1_id}")
+    days = build_days(TARGET_MILES, TARGET_LONG_RUN)
+    plan.upsert_draft_days(conn, v1_id, days)
+    plan.upsert_draft_weeks(conn, v1_id, build_weeks(days, TARGET_LONG_RUN))
+    plan.commit_plan(conn, plan_id, note="Initial 16-week build for the demo marathon.")
+    # Version 1 governs from week 1 whatever its committed_at, so this date
+    # only makes the history read as authored before the plan began.
+    authored_at = (datetime.combine(WEEK1_MONDAY, datetime.min.time(), tzinfo=timezone.utc) - timedelta(days=2)).isoformat()
+    conn.execute("UPDATE plan_versions SET created_at = ?, committed_at = ? WHERE version_id = ?", [authored_at, authored_at, v1_id])
+    conn.commit()
+    print(f"created plan_id={plan_id} v1 version_id={v1_id}")
 
     # Mid-plan revision so version history, the diff view, and contemporaneous
-    # scoring (version_n_used flipping 1 -> 2) all have something to show.
+    # scoring have something to show. A later version governs the weeks that
+    # begin after its committed_at, so backdating it to week 8 makes
+    # version_n_used flip 1 -> 2 from week 9 on.
     v2_miles = list(TARGET_MILES)
     v2_miles[12], v2_miles[13], v2_miles[14] = 52, 36, 24
     v2_long_run = list(TARGET_LONG_RUN)
     v2_long_run[12] = 18
-    v2_id = plan.add_version(
-        conn, plan_id,
-        weeks=build_weeks(v2_miles, v2_long_run),
-        days=build_days(v2_miles, v2_long_run),
-        note="Cutting the true peak week after two weeks of elevated soreness.",
-        author="agent",
-        created_at=datetime(2026, 6, 18, 9, 30, tzinfo=timezone.utc),
-    )
+    v2_id = plan.start_revision_draft(conn, plan_id)
+    days = build_days(v2_miles, v2_long_run)
+    plan.upsert_draft_days(conn, v2_id, days)
+    plan.upsert_draft_weeks(conn, v2_id, build_weeks(days, v2_long_run))
+    plan.commit_plan(conn, plan_id, note="Cutting the true peak week after two weeks of elevated soreness.")
+    revised_at = (datetime.combine(WEEK1_MONDAY + timedelta(weeks=7), datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1)).isoformat()
+    conn.execute("UPDATE plan_versions SET committed_at = ? WHERE version_id = ?", [revised_at, v2_id])
+    conn.commit()
     print(f"created v2 version_id={v2_id}")
 
     log1 = plan.add_log_entry(
-        conn, plan_id, log_date="2026-06-23", action="skipped",
+        conn, plan_id, log_date=(WEEK1_MONDAY + timedelta(weeks=5, days=1)).isoformat(), action="skipped",
         reason="sore right calf, skipped the Tuesday tempo",
     )
     print(f"created log entry: {log1}")
 
     counts = derive_all(conn)
     print(f"derive_all counts: {counts}")
+
+
+def main() -> None:
+    with closing(db.connect()) as conn:
+        seed(conn)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,7 @@ from typing_extensions import TypedDict
 
 from .db import effective_run_type_sql, get_athlete
 from .format import fmt_pace
-from .races import NOMINAL_METERS, classify_race_distance, riegel_time
+from .races import NOMINAL_METERS, classify_race_distance, riegel_time, run_sport_filter
 
 WINDOW_DAYS = 180
 HALF_LIFE_DAYS = 90  # recency weight = 0.5 ** (age_days / HALF_LIFE_DAYS)
@@ -41,10 +41,9 @@ Effort = Literal["raced", "hard", "casual"]
 _SOFT_CONFIDENCE = ("medium-low", "low")
 
 MILE_M = 1609.34
-_RUN_SPORTS = ("Run", "TrailRun", "VirtualRun")
 
 # Projection targets: the four headline distances plus the two zone anchors.
-_PREDICTED_KEYS = ("5K", "10K", "half", "marathon")
+PREDICTED_KEYS = ("5K", "10K", "half", "marathon")
 _PROJECTION_METERS: dict[str, float] = {
     "5K": NOMINAL_METERS["5K"],
     "10K": NOMINAL_METERS["10K"],
@@ -91,15 +90,10 @@ def _project(time_s: float, from_m: float) -> dict[str, float]:
     return out
 
 
-def _sport_filter(sports: tuple[str, ...]) -> tuple[str, list[str]]:
-    placeholders = ",".join("?" * len(sports))
-    return f"sport_type IN ({placeholders})", list(sports)
-
-
 def _tier1_races(conn: sqlite3.Connection, as_of: date, *, exclude_casual: bool = False) -> _Candidate | None:
     """Races in-window with a known distance category and finish time, combined
     by recency-weighted average in pace space."""
-    sport_clause, params = _sport_filter(_RUN_SPORTS)
+    sport_clause, params = run_sport_filter()
     effective = effective_run_type_sql()
     window_start = (as_of - timedelta(days=WINDOW_DAYS)).isoformat()
     casual_clause = "AND (race_effort IS NULL OR race_effort != 'casual')" if exclude_casual else ""
@@ -162,7 +156,7 @@ def _tier1_races(conn: sqlite3.Connection, as_of: date, *, exclude_casual: bool 
 def _tier2_workout_laps(conn: sqlite3.Connection, as_of: date) -> _Candidate | None:
     """Fastest in-window workout session (by median work-lap pace) with enough
     work volume and long-enough reps, its median treated as 5K race pace."""
-    sport_clause, params = _sport_filter(_RUN_SPORTS)
+    sport_clause, params = run_sport_filter()
     effective = effective_run_type_sql()
     window_start = (as_of - timedelta(days=WINDOW_DAYS)).isoformat()
     rows = conn.execute(f"""
@@ -222,8 +216,7 @@ def _tier2_workout_laps(conn: sqlite3.Connection, as_of: date) -> _Candidate | N
 def _tier3_envelope(conn: sqlite3.Connection, as_of: date) -> _Candidate | None:
     """Fastest sustained (20-45 min) non-trail run in-window; its pace scaled by
     ENVELOPE_RACE_FACTOR is treated as 10K race pace. Explicitly a floor."""
-    sports = tuple(s for s in _RUN_SPORTS if s != "TrailRun")
-    sport_clause, params = _sport_filter(sports)
+    sport_clause, params = run_sport_filter(exclude=("TrailRun",))
     window_start = (as_of - timedelta(days=WINDOW_DAYS)).isoformat()
     row = conn.execute(f"""
         SELECT activity_id, name, DATE(start_date) AS date,
@@ -384,7 +377,7 @@ def estimate_fitness(
     estimate: FitnessEstimate = {
         "as_of": as_of.isoformat(),
         "confidence": chosen["confidence"],
-        "predicted": {k: round(paces[k], 2) for k in _PREDICTED_KEYS},
+        "predicted": {k: round(paces[k], 2) for k in PREDICTED_KEYS},
         "zones": zones,
         "sources": chosen["sources"] + extra_sources,
     }
@@ -414,7 +407,7 @@ def hr_ceiling(conn: sqlite3.Connection, as_of: date) -> float | None:
     if athlete is not None and athlete["max_hr"] is not None:
         return float(athlete["max_hr"])
 
-    sport_clause, params = _sport_filter(_RUN_SPORTS)
+    sport_clause, params = run_sport_filter()
     window_start = (as_of - timedelta(days=365)).isoformat()
     rows = conn.execute(f"""
         SELECT max_heartrate FROM activities

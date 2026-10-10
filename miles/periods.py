@@ -50,6 +50,10 @@ def is_active(week: WeekAgg) -> bool:
     return week["runs"] >= ACTIVE_WEEK_MIN_RUNS or week["miles"] >= ACTIVE_WEEK_MIN_MILES
 
 
+def monday_of(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+
 def sunday_of(monday_iso: str) -> str:
     return (date.fromisoformat(monday_iso) + timedelta(days=6)).isoformat()
 

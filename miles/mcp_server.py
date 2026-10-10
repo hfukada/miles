@@ -1,20 +1,24 @@
 import json
 import os
 import sqlite3
-import statistics
 from datetime import date, datetime, timedelta
 from typing import Literal, Sequence, cast
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import db
+from . import areas_mcp, db, drive_mcp, elevation, events, network_mcp, outbound, outbound_mcp, search_mcp
 from . import routes as routes_service
-from .builds import Build, RaceRef, detect_builds
-from .derive import derive_all, ensure_derived
+from .terrain_mcp import register_terrain_tools
+from .weather import ATTRIBUTION as WEATHER_ATTRIBUTION
+from .builds import Build, detect_builds
+from .derive import connect_derived as _conn, derive_all
+from .build_stats import run_type_stats, window_total_miles
+from .errors import describe_error, reporting
 from .fitness import WINDOW_DAYS, estimate_fitness
 from .format import fmt_pace, fmt_time
-from .periods import GAP_WEEKS_TO_SPLIT, Period, WeekAgg, is_active, sunday_of, detect_periods
+from .offload import threaded
+from .periods import GAP_WEEKS_TO_SPLIT, Period, WeekAgg, is_active, monday_of, sunday_of, detect_periods
 from .plan import (
     DayInput,
     PlanValidationError,
@@ -30,18 +34,23 @@ from .plan import (
     get_active_plan,
     get_draft as _plan_get_draft,
     get_version,
+    plan_start_monday,
     start_plan_draft as _plan_start_plan_draft,
     start_revision_draft as _plan_start_revision_draft,
     upsert_draft_days,
     upsert_draft_weeks,
 )
 from .races import (
-    MARATHON_MAX_M,
-    MARATHON_MIN_M,
     NOMINAL_METERS,
     classify_race_distance,
+    effective_race_activities,
+    full_periods_and_builds,
+    marathon_races,
+    race_refs,
     race_rows,
     riegel_time,
+    run_sport_filter,
+    week_aggs,
 )
 
 # stateless_http applies only to the streamable-HTTP transport that api.py
@@ -68,15 +77,6 @@ _transport_security = (
 )
 mcp = FastMCP("miles", stateless_http=True, transport_security=_transport_security)
 
-RUN_TYPES = ("Run", "TrailRun", "VirtualRun")
-
-
-def _conn() -> sqlite3.Connection:
-    conn = db.connect()
-    db.init_db(conn)
-    ensure_derived(conn)
-    return conn
-
 
 _PACE_KEYS = frozenset({
     "pace_min_per_mile", "avg_pace_min_per_mile", "avg_pace",
@@ -97,9 +97,14 @@ def _fmt_paces(obj: object) -> object:
     return obj
 
 
-def _run_type_filter(sport_types: tuple[str, ...] = RUN_TYPES) -> tuple[str, list[str]]:
-    placeholders = ",".join("?" * len(sport_types))
-    return f"sport_type IN ({placeholders})", list(sport_types)
+_WEATHER_KEYS = ("temp_c_start", "temp_c_max", "apparent_temp_c_max", "humidity_avg", "precip_mm", "wind_kph_avg")
+
+
+def _with_weather_attribution(row: dict[str, object]) -> dict[str, object]:
+    """The row plus a `weather_attribution` credit when it carries weather values."""
+    if any(row.get(k) is not None for k in _WEATHER_KEYS):
+        return {**row, "weather_attribution": WEATHER_ATTRIBUTION}
+    return row
 
 
 @mcp.tool()
@@ -110,7 +115,7 @@ def get_weekly_mileage(start_date: str | None = None, end_date: str | None = Non
     Returns list of {week, miles, runs}.
     """
     conn = _conn()
-    type_clause, params = _run_type_filter()
+    type_clause, params = run_sport_filter()
     where = f"WHERE {type_clause}"
     if start_date:
         where += " AND start_date >= ?"
@@ -146,13 +151,14 @@ def get_activities(
     for untagged (workout_type=0) activities (see run_type_source in each row).
     Dates are YYYY-MM-DD. Returns up to `limit` rows, newest first.
     Weather fields (temp_c_start, temp_c_max, apparent_temp_c_max, humidity_avg,
-    precip_mm, wind_kph_avg) are null if not yet synced for that activity.
+    precip_mm, wind_kph_avg) are null if not yet synced for that activity; rows that
+    have them carry a `weather_attribution` credit (Open-Meteo, CC BY 4.0) to repeat
+    when quoting weather.
     """
     conn = _conn()
     effective_run_type = db.effective_run_type_sql("a")
-    _, sport_params = _run_type_filter()
-    placeholders = ",".join("?" * len(sport_params))
-    conditions = [f"a.sport_type IN ({placeholders})"]
+    sport_clause, sport_params = run_sport_filter("a")
+    conditions = [sport_clause]
     params: list[str | int] = list(sport_params)
     if run_type:
         conditions.append(f"{effective_run_type} = ?")
@@ -175,9 +181,7 @@ def get_activities(
                  THEN 'inferred' ELSE 'strava' END AS run_type_source,
             ROUND(a.distance_m / 1609.34, 2) AS miles,
             a.moving_time_s,
-            CASE WHEN a.average_speed_mps > 0
-                 THEN ROUND(26.8224 / a.average_speed_mps, 2)
-                 ELSE NULL END AS pace_min_per_mile,
+            {db.pace_sql("a.average_speed_mps")} AS pace_min_per_mile,
             a.average_heartrate,
             a.total_elevation_gain_m,
             a.strava_url,
@@ -193,7 +197,7 @@ def get_activities(
         ORDER BY a.start_date DESC
         LIMIT ?
     """, params + [limit]).fetchall()
-    return json.dumps(_fmt_paces([dict(r) for r in rows]))
+    return json.dumps(_fmt_paces([_with_weather_attribution(dict(r)) for r in rows]))
 
 
 @mcp.tool()
@@ -204,7 +208,7 @@ def get_training_block(start_date: str, end_date: str) -> str:
     """
     conn = _conn()
     effective_run_type = db.effective_run_type_sql()
-    type_clause, base_params = _run_type_filter()
+    type_clause, base_params = run_sport_filter()
     date_clause = "AND start_date >= ? AND start_date <= ?"
     date_params = [start_date, end_date]
 
@@ -215,9 +219,7 @@ def get_training_block(start_date: str, end_date: str) -> str:
             ROUND(SUM(distance_m) / 1609.34, 2)  AS total_miles,
             ROUND(AVG(distance_m) / 1609.34, 2)  AS avg_miles,
             ROUND(AVG(average_heartrate), 1)       AS avg_hr,
-            CASE WHEN AVG(average_speed_mps) > 0
-                 THEN ROUND(26.8224 / AVG(average_speed_mps), 2)
-                 ELSE NULL END                     AS avg_pace_min_per_mile,
+            {db.pace_sql("AVG(average_speed_mps)")} AS avg_pace_min_per_mile,
             ROUND(SUM(total_elevation_gain_m) * 3.28084, 0) AS total_elevation_ft
         FROM activities
         WHERE {type_clause} {date_clause}
@@ -241,6 +243,21 @@ def get_training_block(start_date: str, end_date: str) -> str:
     }))
 
 
+def _day_window_build(conn: sqlite3.Connection, race_date: str, build_weeks: int, run_type_expr: str) -> dict[str, object]:
+    """Stats for the build_weeks * 7 days before race_date, counted back in days
+    rather than Monday-aligned so the comparison tools agree with each other."""
+    start = (date.fromisoformat(race_date) - timedelta(weeks=build_weeks)).isoformat()
+    total_miles = window_total_miles(conn, start, race_date)
+    return {
+        "start": start,
+        "end": race_date,
+        "weeks": build_weeks,
+        "total_miles": total_miles,
+        "avg_mpw": round(total_miles / build_weeks, 1),
+        "by_type": run_type_stats(conn, start, race_date, run_type_expr),
+    }
+
+
 @mcp.tool()
 def get_marathon_comparison(build_weeks: int = 12) -> str:
     """
@@ -256,87 +273,18 @@ def get_marathon_comparison(build_weeks: int = 12) -> str:
     For non-marathon races or effective-type awareness, see get_race_comparison.
     """
     conn = _conn()
-    type_clause, type_params = _run_type_filter()
 
-    races = conn.execute("""
-        SELECT
-            name,
-            DATE(start_date) AS race_date,
-            ROUND(distance_m / 1609.34, 2) AS distance_miles,
-            moving_time_s,
-            CASE WHEN average_speed_mps > 0
-                 THEN ROUND(26.8224 / average_speed_mps, 2)
-                 ELSE NULL END AS pace_min_per_mile
-        FROM activities
-        WHERE run_type = 'race'
-          AND distance_m BETWEEN ? AND ?
-        ORDER BY race_date
-    """, [MARATHON_MIN_M, MARATHON_MAX_M]).fetchall()
-
-    out = []
-    for race in races:
-        race_date: str = race["race_date"]
-        build_start: str = conn.execute(
-            "SELECT DATE(?, ?)", (race_date, f"-{build_weeks * 7} days")
-        ).fetchone()[0]
-
-        by_type = conn.execute(f"""
-            SELECT
-                run_type,
-                COUNT(*) AS runs,
-                ROUND(SUM(distance_m) / 1609.34, 2)         AS total_miles,
-                ROUND(AVG(distance_m) / 1609.34, 2)         AS avg_miles,
-                ROUND(AVG(average_heartrate), 1)             AS avg_hr,
-                CASE WHEN AVG(average_speed_mps) > 0
-                     THEN ROUND(26.8224 / AVG(average_speed_mps), 2)
-                     ELSE NULL END                           AS avg_pace_min_per_mile
-            FROM activities
-            WHERE {type_clause}
-              AND DATE(start_date) >= ?
-              AND DATE(start_date) < ?
-            GROUP BY run_type
-            ORDER BY run_type
-        """, type_params + [build_start, race_date]).fetchall()
-
-        totals = conn.execute(f"""
-            SELECT
-                COUNT(*) AS runs,
-                ROUND(SUM(distance_m) / 1609.34, 2) AS total_miles
-            FROM activities
-            WHERE {type_clause}
-              AND DATE(start_date) >= ?
-              AND DATE(start_date) < ?
-        """, type_params + [build_start, race_date]).fetchone()
-
-        total_miles: float = totals["total_miles"] or 0.0
-
-        out.append({
+    return json.dumps(_fmt_paces([
+        {
             "name": race["name"],
-            "date": race_date,
+            "date": race["race_date"],
             "finish_time_s": race["moving_time_s"],
             "distance_miles": race["distance_miles"],
             "pace_min_per_mile": race["pace_min_per_mile"],
-            "build": {
-                "start": build_start,
-                "end": race_date,
-                "weeks": build_weeks,
-                "total_miles": total_miles,
-                "avg_mpw": round(total_miles / build_weeks, 1),
-                "by_type": {
-                    row["run_type"]: {
-                        "runs": row["runs"],
-                        "total_miles": row["total_miles"],
-                        "avg_miles": row["avg_miles"],
-                        "avg_hr": row["avg_hr"],
-                        "avg_pace_min_per_mile": row["avg_pace_min_per_mile"],
-                    }
-                    for row in by_type
-                    if row["run_type"] is not None
-                },
-            },
-        })
-
-    return json.dumps(_fmt_paces(out))
+            "build": _day_window_build(conn, race["race_date"], build_weeks, "run_type"),
+        }
+        for race in marathon_races(conn)
+    ]))
 
 
 @mcp.tool()
@@ -364,7 +312,7 @@ def get_race_comparison(distance_category: str | None = None, build_weeks: int =
     """
     conn = _conn()
     effective_run_type = db.effective_run_type_sql()
-    type_clause, type_params = _run_type_filter()
+    type_clause, type_params = run_sport_filter()
 
     races = conn.execute(f"""
         SELECT
@@ -373,9 +321,7 @@ def get_race_comparison(distance_category: str | None = None, build_weeks: int =
             distance_m,
             ROUND(distance_m / 1609.34, 2) AS distance_miles,
             moving_time_s,
-            CASE WHEN average_speed_mps > 0
-                 THEN ROUND(26.8224 / average_speed_mps, 2)
-                 ELSE NULL END AS pace_min_per_mile,
+            {db.pace_sql("average_speed_mps")} AS pace_min_per_mile,
             CASE WHEN workout_type = 0 AND run_type_inferred IS NOT NULL
                  THEN 'inferred' ELSE 'strava' END AS run_type_source
         FROM activities
@@ -383,7 +329,7 @@ def get_race_comparison(distance_category: str | None = None, build_weeks: int =
         ORDER BY race_date
     """, type_params).fetchall()
 
-    periods, builds = _full_periods_and_builds(conn)
+    periods, builds, _weeks = full_periods_and_builds(conn)
 
     out = []
     for race in races:
@@ -392,45 +338,8 @@ def get_race_comparison(distance_category: str | None = None, build_weeks: int =
             continue
 
         race_date: str = race["race_date"]
-        # Matches get_marathon_comparison's day-based window exactly (not Monday-aligned)
-        # so the two tools' build stats agree; window_coverage below stays Monday-aligned
-        # like the rest of the codebase.
-        build_start: str = conn.execute(
-            "SELECT DATE(?, ?)", (race_date, f"-{build_weeks * 7} days")
-        ).fetchone()[0]
-
-        by_type = conn.execute(f"""
-            SELECT
-                {effective_run_type} AS run_type,
-                COUNT(*) AS runs,
-                ROUND(SUM(distance_m) / 1609.34, 2)         AS total_miles,
-                ROUND(AVG(distance_m) / 1609.34, 2)         AS avg_miles,
-                ROUND(AVG(average_heartrate), 1)             AS avg_hr,
-                CASE WHEN AVG(average_speed_mps) > 0
-                     THEN ROUND(26.8224 / AVG(average_speed_mps), 2)
-                     ELSE NULL END                           AS avg_pace_min_per_mile
-            FROM activities
-            WHERE {type_clause}
-              AND DATE(start_date) >= ?
-              AND DATE(start_date) < ?
-            GROUP BY {effective_run_type}
-            ORDER BY {effective_run_type}
-        """, type_params + [build_start, race_date]).fetchall()
-
-        totals = conn.execute(f"""
-            SELECT
-                COUNT(*) AS runs,
-                ROUND(SUM(distance_m) / 1609.34, 2) AS total_miles
-            FROM activities
-            WHERE {type_clause}
-              AND DATE(start_date) >= ?
-              AND DATE(start_date) < ?
-        """, type_params + [build_start, race_date]).fetchone()
-
-        total_miles: float = totals["total_miles"] or 0.0
-
         race_dt = date.fromisoformat(race_date)
-        race_week_monday = race_dt - timedelta(days=race_dt.weekday())
+        race_week_monday = monday_of(race_dt)
         window_coverage = _window_coverage(conn, race_date, race_week_monday, build_weeks, periods, builds)
 
         out.append({
@@ -441,24 +350,7 @@ def get_race_comparison(distance_category: str | None = None, build_weeks: int =
             "finish_time_s": race["moving_time_s"],
             "distance_miles": race["distance_miles"],
             "pace_min_per_mile": race["pace_min_per_mile"],
-            "build": {
-                "start": build_start,
-                "end": race_date,
-                "weeks": build_weeks,
-                "total_miles": total_miles,
-                "avg_mpw": round(total_miles / build_weeks, 1),
-                "by_type": {
-                    row["run_type"]: {
-                        "runs": row["runs"],
-                        "total_miles": row["total_miles"],
-                        "avg_miles": row["avg_miles"],
-                        "avg_hr": row["avg_hr"],
-                        "avg_pace_min_per_mile": row["avg_pace_min_per_mile"],
-                    }
-                    for row in by_type
-                    if row["run_type"] is not None
-                },
-            },
+            "build": _day_window_build(conn, race_date, build_weeks, effective_run_type),
             "window_coverage": window_coverage,
         })
 
@@ -498,38 +390,11 @@ def get_race_history(distance_category: str | None = None, start_date: str | Non
     conn = _conn()
     rows = race_rows(conn, distance_category=distance_category, start_date=start_date)
 
-    type_clause, type_params = _run_type_filter()
+    type_clause, type_params = run_sport_filter()
     for row in rows:
         race_dt = date.fromisoformat(str(row["date"]))
-        race_week_monday = race_dt - timedelta(days=race_dt.weekday())
+        race_week_monday = monday_of(race_dt)
         window_start = race_week_monday - timedelta(weeks=8)
-
-        week_rows = conn.execute(f"""
-            SELECT
-                DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
-                ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
-                COUNT(*) AS runs
-            FROM activities
-            WHERE {type_clause}
-              AND DATE(start_date) >= ?
-              AND DATE(start_date) < ?
-            GROUP BY monday
-        """, type_params + [window_start.isoformat(), race_week_monday.isoformat()]).fetchall()
-
-        by_monday = {r["monday"]: r for r in week_rows}
-        active_weeks = 0
-        d = window_start
-        while d < race_week_monday:
-            wr = by_monday.get(d.isoformat())
-            week: WeekAgg = {
-                "monday": d.isoformat(),
-                "miles": (wr["miles"] or 0.0) if wr else 0.0,
-                "runs": (wr["runs"] or 0) if wr else 0,
-                "workouts": 0,
-            }
-            if is_active(week):
-                active_weeks += 1
-            d += timedelta(weeks=1)
 
         totals = conn.execute(f"""
             SELECT
@@ -546,7 +411,7 @@ def get_race_history(distance_category: str | None = None, start_date: str | Non
             "runs": totals["runs"] or 0,
             "miles": totals["miles"] or 0.0,
             "longest_run_miles": totals["longest_run_miles"] or 0.0,
-            "active_weeks": active_weeks,
+            "active_weeks": _window_active_weeks(conn, race_week_monday, 8),
         }
 
     return json.dumps(_fmt_paces(rows))
@@ -746,43 +611,12 @@ def get_training_periods(start_date: str | None = None) -> str:
     are the meaningful analysis windows for "what led into this race."
     """
     conn = _conn()
-    effective_run_type = db.effective_run_type_sql()
-    type_clause, type_params = _run_type_filter()
-    where = f"WHERE {type_clause}"
-    params = list(type_params)
-    if start_date:
-        where += " AND start_date >= ?"
-        params.append(start_date)
-
-    week_rows = conn.execute(f"""
-        SELECT
-            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
-            ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
-            COUNT(*) AS runs,
-            SUM(CASE WHEN {effective_run_type} = 'workout' THEN 1 ELSE 0 END) AS workouts
-        FROM activities
-        {where}
-        GROUP BY monday
-        ORDER BY monday
-    """, params).fetchall()
-
-    weeks: list[WeekAgg] = [
-        {"monday": r["monday"], "miles": r["miles"] or 0.0, "runs": r["runs"], "workouts": r["workouts"] or 0}
-        for r in week_rows
-    ]
+    weeks = week_aggs(conn, start_date)
     periods, gaps = detect_periods(weeks)
     if not periods:
         return json.dumps({"periods": [], "gaps": []})
 
-    race_type_clause, race_type_params = _run_type_filter()
-    race_activity_rows = conn.execute(f"""
-        SELECT DATE(start_date) AS date, name, distance_m,
-               ROUND(distance_m / 1609.34, 2) AS distance_miles
-        FROM activities
-        WHERE {race_type_clause} AND {effective_run_type} = 'race'
-        ORDER BY date
-    """, race_type_params).fetchall()
-
+    race_activity_rows = effective_race_activities(conn)
     races = [
         {
             "date": r["date"],
@@ -792,17 +626,7 @@ def get_training_periods(start_date: str | None = None) -> str:
         }
         for r in race_activity_rows
     ]
-    race_refs: list[RaceRef] = [
-        {
-            "date": r["date"],
-            "name": r["name"],
-            "distance_category": classify_race_distance(r["distance_m"]) or "other",
-            "distance_m": r["distance_m"],
-        }
-        for r in race_activity_rows
-        if r["distance_m"] is not None
-    ]
-    builds = detect_builds(weeks, race_refs, periods)
+    builds = detect_builds(weeks, race_refs(race_activity_rows), periods)
 
     out_periods = [
         {
@@ -884,7 +708,7 @@ def get_consistency_report(months: int = 12) -> str:
     """
     conn = _conn()
     effective_run_type = db.effective_run_type_sql()
-    type_clause, type_params = _run_type_filter()
+    type_clause, type_params = run_sport_filter()
 
     today = date.today()
     window_start = today - timedelta(days=months * 30)
@@ -903,7 +727,7 @@ def get_consistency_report(months: int = 12) -> str:
     # trailing gap up to today shows up rather than being silently dropped.
     week_rows = conn.execute(f"""
         SELECT
-            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            {db.monday_sql("start_date")} AS monday,
             ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
             COUNT(*) AS runs,
             SUM(CASE WHEN {effective_run_type} = 'workout' THEN 1 ELSE 0 END) AS workouts
@@ -914,8 +738,8 @@ def get_consistency_report(months: int = 12) -> str:
     """, type_params + [window_start.isoformat()]).fetchall()
     by_monday = {r["monday"]: r for r in week_rows}
 
-    first_monday = window_start - timedelta(days=window_start.weekday())
-    this_week_monday = today - timedelta(days=today.weekday())
+    first_monday = monday_of(window_start)
+    this_week_monday = monday_of(today)
     weeks: list[WeekAgg] = []
     d = first_monday
     while d <= this_week_monday:
@@ -989,7 +813,7 @@ def get_consistency_report(months: int = 12) -> str:
     # not a non-ramp -- treat it as large for the note, same as ramp_pct > 30.
     is_large_ramp = (ramp_pct is not None and ramp_pct > 30) or (prior_miles == 0 and last_miles > 0)
     if is_large_ramp:
-        lookback_end = last_start - timedelta(days=last_start.weekday())
+        lookback_end = monday_of(last_start)
         lookback_start = lookback_end - timedelta(weeks=8)
         lookback_weeks = [
             w for w in weeks
@@ -1061,9 +885,8 @@ def get_workout_laps(
     workout_label on unlabeled sessions — see run_sql for querying by dominant_intensity.
     """
     conn = _conn()
-    _, sport_params = _run_type_filter()
-    placeholders = ",".join("?" * len(sport_params))
-    conditions = [f"a.sport_type IN ({placeholders})", "a.run_type = 'workout'"]
+    sport_clause, sport_params = run_sport_filter("a")
+    conditions = [sport_clause, "a.run_type = 'workout'"]
     params: list[str | int] = list(sport_params)
     if workout_label:
         conditions.append("a.workout_label = ?")
@@ -1092,15 +915,13 @@ def get_workout_laps(
 
     out = []
     for act in activities:
-        laps = conn.execute("""
+        laps = conn.execute(f"""
             SELECT
                 lap_index,
                 lap_type,
                 intensity,
                 ROUND(distance_m / 1609.34, 3) AS distance_miles,
-                CASE WHEN average_speed_mps > 0
-                     THEN ROUND(26.8224 / average_speed_mps, 2)
-                     ELSE NULL END AS pace_min_per_mile,
+                {db.pace_sql("average_speed_mps")} AS pace_min_per_mile,
                 average_heartrate AS avg_hr,
                 max_heartrate AS max_hr
             FROM laps
@@ -1109,7 +930,7 @@ def get_workout_laps(
         """, [act["activity_id"]]).fetchall()
 
         keep = ("lap_index", "distance_miles", "pace_min_per_mile", "avg_hr", "max_hr", "lap_type", "intensity")
-        out.append({
+        out.append(_with_weather_attribution({
             "activity_id": act["activity_id"],
             "name": act["name"],
             "date": act["date"],
@@ -1121,60 +942,9 @@ def get_workout_laps(
             "humidity_avg": act["humidity_avg"],
             "wind_kph_avg": act["wind_kph_avg"],
             "laps": [{k: lap[k] for k in keep} for lap in laps],
-        })
+        }))
 
     return json.dumps(_fmt_paces(out))
-
-
-def _full_periods_and_builds(conn: sqlite3.Connection) -> tuple[list[Period], list[Build]]:
-    """
-    Full-history weekly aggregates, detected periods, and race-anchored builds — the
-    same computation get_training_periods exposes over all effective-race activities,
-    reused here to locate the period/build enclosing an arbitrary race date. No
-    start_date filter: the enclosing period must be found from the whole history.
-    """
-    effective_run_type = db.effective_run_type_sql()
-    type_clause, type_params = _run_type_filter()
-
-    week_rows = conn.execute(f"""
-        SELECT
-            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
-            ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
-            COUNT(*) AS runs,
-            SUM(CASE WHEN {effective_run_type} = 'workout' THEN 1 ELSE 0 END) AS workouts
-        FROM activities
-        WHERE {type_clause}
-        GROUP BY monday
-        ORDER BY monday
-    """, type_params).fetchall()
-
-    weeks: list[WeekAgg] = [
-        {"monday": r["monday"], "miles": r["miles"] or 0.0, "runs": r["runs"], "workouts": r["workouts"] or 0}
-        for r in week_rows
-    ]
-    periods, _gaps = detect_periods(weeks)
-    if not periods:
-        return [], []
-
-    race_activity_rows = conn.execute(f"""
-        SELECT DATE(start_date) AS date, name, distance_m
-        FROM activities
-        WHERE {type_clause} AND {effective_run_type} = 'race'
-        ORDER BY date
-    """, type_params).fetchall()
-
-    race_refs: list[RaceRef] = [
-        {
-            "date": r["date"],
-            "name": r["name"],
-            "distance_category": classify_race_distance(r["distance_m"]) or "other",
-            "distance_m": r["distance_m"],
-        }
-        for r in race_activity_rows
-        if r["distance_m"] is not None
-    ]
-    builds = detect_builds(weeks, race_refs, periods)
-    return periods, builds
 
 
 def _window_active_weeks(conn: sqlite3.Connection, race_week_monday: date, build_weeks: int) -> int:
@@ -1183,11 +953,11 @@ def _window_active_weeks(conn: sqlite3.Connection, race_week_monday: date, build
     meeting the active-week definition (periods.is_active), zero-filling calendar gaps.
     """
     window_start = race_week_monday - timedelta(weeks=build_weeks)
-    type_clause, type_params = _run_type_filter()
+    type_clause, type_params = run_sport_filter()
 
     week_rows = conn.execute(f"""
         SELECT
-            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            {db.monday_sql("start_date")} AS monday,
             ROUND(SUM(distance_m) / 1609.34, 2) AS miles,
             COUNT(*) AS runs
         FROM activities
@@ -1264,7 +1034,7 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
     Use this to orient at the start of any build-specific conversation.
     """
     conn = _conn()
-    type_clause, type_params = _run_type_filter()
+    type_clause, type_params = run_sport_filter()
     effective_run_type = db.effective_run_type_sql()
 
     if race_date:
@@ -1307,11 +1077,11 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
         }
 
     race_dt = date.fromisoformat(race_date_str)
-    race_week_monday = race_dt - timedelta(days=race_dt.weekday())
+    race_week_monday = monday_of(race_dt)
     build_start = (race_week_monday - timedelta(weeks=build_weeks)).isoformat()
     weeks_to_race = (race_dt - date.today()).days // 7
 
-    periods, builds = _full_periods_and_builds(conn)
+    periods, builds, _weeks = full_periods_and_builds(conn)
     window_coverage = _window_coverage(conn, race_date_str, race_week_monday, build_weeks, periods, builds)
 
     weeks = conn.execute(f"""
@@ -1353,13 +1123,12 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
         ORDER BY a.start_date
     """, [build_start, race_date_str]).fetchall()
 
+    aliased_clause, aliased_params = run_sport_filter("a")
     long_runs = conn.execute(f"""
         SELECT
             DATE(a.start_date) AS date,
             ROUND(a.distance_m / 1609.34, 1) AS miles,
-            CASE WHEN a.average_speed_mps > 0
-                 THEN ROUND(26.8224 / a.average_speed_mps, 2)
-                 ELSE NULL END AS avg_pace,
+            {db.pace_sql("a.average_speed_mps")} AS avg_pace,
             ROUND(a.average_heartrate) AS avg_hr,
             a.activity_id,
             w.temp_c_start,
@@ -1370,10 +1139,10 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
             w.wind_kph_avg
         FROM activities a
         LEFT JOIN weather w ON w.activity_id = a.activity_id
-        WHERE {type_clause.replace("sport_type", "a.sport_type")} AND a.run_type = 'long_run'
+        WHERE {aliased_clause} AND a.run_type = 'long_run'
           AND DATE(a.start_date) >= ? AND DATE(a.start_date) < ?
         ORDER BY a.start_date
-    """, type_params + [build_start, race_date_str]).fetchall()
+    """, aliased_params + [build_start, race_date_str]).fetchall()
 
     return json.dumps(_fmt_paces({
         "race": race_name,
@@ -1384,8 +1153,8 @@ def get_build_snapshot(race_date: str | None = None, build_weeks: int = 12) -> s
         "build_start": build_start,
         "weeks_to_race": weeks_to_race,
         "weeks": [dict(w) for w in weeks],
-        "workouts": [dict(w) for w in workouts],
-        "long_runs": [dict(lr) for lr in long_runs],
+        "workouts": [_with_weather_attribution(dict(w)) for w in workouts],
+        "long_runs": [_with_weather_attribution(dict(lr)) for lr in long_runs],
         "window_coverage": window_coverage,
     }))
 
@@ -1420,16 +1189,14 @@ def get_workout_session(activity_id: int) -> str:
     if not activity:
         return json.dumps({"error": f"Activity {activity_id} not found."})
 
-    laps = conn.execute("""
+    laps = conn.execute(f"""
         SELECT
             lap_index,
             lap_type,
             intensity,
             ROUND(distance_m / 1609.34, 3) AS distance_miles,
             moving_time_s AS duration_s,
-            CASE WHEN average_speed_mps > 0
-                 THEN ROUND(26.8224 / average_speed_mps, 2)
-                 ELSE NULL END AS pace_min_mi,
+            {db.pace_sql("average_speed_mps")} AS pace_min_mi,
             ROUND(average_heartrate) AS avg_hr,
             ROUND(max_heartrate) AS max_hr
         FROM laps
@@ -1488,15 +1255,13 @@ def get_race_splits(activity_id: int) -> str:
         return json.dumps({"error": f"Activity {activity_id} is not a race."})
     race_meta = {k: races[0][k] for k in _RACE_SPLITS_META_KEYS}
 
-    laps = conn.execute("""
+    laps = conn.execute(f"""
         SELECT
             lap_index,
             distance_m,
             ROUND(distance_m / 1609.34, 3) AS distance_miles,
             moving_time_s AS duration_s,
-            CASE WHEN average_speed_mps > 0
-                 THEN ROUND(26.8224 / average_speed_mps, 2)
-                 ELSE NULL END AS pace_min_mi,
+            {db.pace_sql("average_speed_mps")} AS pace_min_mi,
             ROUND(average_heartrate) AS avg_hr,
             ROUND(max_heartrate) AS max_hr
         FROM laps
@@ -1588,7 +1353,7 @@ def get_easy_hr_trend(months: int = 36) -> str:
     Filtered to easy-tagged runs only.
     """
     conn = _conn()
-    type_clause, type_params = _run_type_filter()
+    type_clause, type_params = run_sport_filter()
 
     cutoff_dt = date.today() - timedelta(days=months * 30)
     cutoff = cutoff_dt.isoformat()
@@ -1598,9 +1363,7 @@ def get_easy_hr_trend(months: int = 36) -> str:
             strftime('%Y-%m', start_date) AS month,
             COUNT(*) AS runs,
             ROUND(AVG(average_heartrate), 1) AS avg_hr,
-            CASE WHEN AVG(average_speed_mps) > 0
-                 THEN ROUND(26.8224 / AVG(average_speed_mps), 2)
-                 ELSE NULL END AS avg_pace_min_mi
+            {db.pace_sql("AVG(average_speed_mps)")} AS avg_pace_min_mi
         FROM activities
         WHERE {type_clause}
           AND run_type = 'easy'
@@ -1638,12 +1401,7 @@ def compare_workouts_by_build(
     """
     conn = _conn()
 
-    races = conn.execute("""
-        SELECT name, DATE(start_date) AS race_date
-        FROM activities
-        WHERE run_type = 'race' AND distance_m BETWEEN ? AND ?
-        ORDER BY race_date
-    """, [MARATHON_MIN_M, MARATHON_MAX_M]).fetchall()
+    races = marathon_races(conn)
 
     # Fetch session metadata and all non-trivial laps separately, then filter in Python.
     session_rows = conn.execute("""
@@ -1692,14 +1450,14 @@ def compare_workouts_by_build(
     for race in races:
         race_date_str: str = race["race_date"]
         race_dt = date.fromisoformat(race_date_str)
-        race_week_monday = race_dt - timedelta(days=race_dt.weekday())
+        race_week_monday = monday_of(race_dt)
         build_start = (race_week_monday - timedelta(weeks=build_weeks)).isoformat()
 
         build_sessions = []
         for aid in id_list:
             row = sessions_by_id[aid]
             if build_start <= str(row["date"]) < race_date_str and aid in session_stats:
-                build_sessions.append({
+                build_sessions.append(_with_weather_attribution({
                     "activity_id": aid,
                     "name": row["name"],
                     "date": row["date"],
@@ -1709,7 +1467,7 @@ def compare_workouts_by_build(
                     "apparent_temp_c_max": row["apparent_temp_c_max"],
                     "humidity_avg": row["humidity_avg"],
                     "wind_kph_avg": row["wind_kph_avg"],
-                })
+                }))
 
         if build_sessions:
             builds.append({
@@ -1730,6 +1488,7 @@ def get_activity_weather(activity_id: int) -> str:
     during a long run (e.g. started cool but got hot by mile 18).
     Also returns summary stats: temp at start/end/max, avg humidity, total precip.
     Returns null hourly field if weather hasn't been synced for this activity (run miles-sync).
+    `attribution` credits the data source (Open-Meteo, CC BY 4.0); repeat it when quoting.
     activity_id comes from get_activities or get_build_snapshot.
     """
     conn = _conn()
@@ -1751,6 +1510,7 @@ def get_activity_weather(activity_id: int) -> str:
     result = dict(row)
     hourly_raw = result.pop("hourly_json", None)
     result["hourly"] = json.loads(hourly_raw) if hourly_raw else None
+    result["attribution"] = WEATHER_ATTRIBUTION
     return json.dumps(result)
 
 
@@ -1853,22 +1613,18 @@ WARN_RAMP_PCT = 0.10    # week-over-week mileage ramp considered aggressive
 WARN_RAMP_MIN_WEEKS = 3  # consecutive ramp weeks needed before warning
 
 
-def _monday_of(d: date) -> date:
-    return d - timedelta(days=d.weekday())
-
-
 def _recent_avg_weekly_miles(conn: sqlite3.Connection, as_of: date, num_weeks: int = 4) -> float | None:
     """Average mileage over the num_weeks Monday-aligned weeks completed
     strictly before as_of's week, zero-filled. None if the athlete has no
     activities at all (vs. a real 0.0 average during a genuine break)."""
     if conn.execute("SELECT 1 FROM activities LIMIT 1").fetchone() is None:
         return None
-    this_monday = _monday_of(as_of)
+    this_monday = monday_of(as_of)
     window_start = this_monday - timedelta(weeks=num_weeks)
-    type_clause, type_params = _run_type_filter()
+    type_clause, type_params = run_sport_filter()
     rows = conn.execute(f"""
         SELECT
-            DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+            {db.monday_sql("start_date")} AS monday,
             ROUND(SUM(distance_m) / 1609.34, 2) AS miles
         FROM activities
         WHERE {type_clause} AND DATE(start_date) >= ? AND DATE(start_date) < ?
@@ -1882,11 +1638,11 @@ def _recent_avg_weekly_miles(conn: sqlite3.Connection, as_of: date, num_weeks: i
 def _all_time_peak_week_miles(conn: sqlite3.Connection) -> float | None:
     """Max Monday-aligned weekly mileage across the athlete's full history, or
     None if there are no activities."""
-    type_clause, type_params = _run_type_filter()
+    type_clause, type_params = run_sport_filter()
     row = conn.execute(f"""
         SELECT MAX(weekly_miles) AS peak FROM (
             SELECT
-                DATE(start_date, '-' || ((CAST(strftime('%w', start_date) AS INTEGER) + 6) % 7) || ' days') AS monday,
+                {db.monday_sql("start_date")} AS monday,
                 SUM(distance_m) / 1609.34 AS weekly_miles
             FROM activities
             WHERE {type_clause}
@@ -1968,18 +1724,6 @@ def _day_with_target(d: db.PlanDayRow) -> dict[str, object]:
     target_json = out.pop("target_json", None)
     out["target"] = json.loads(cast(str, target_json)) if target_json else None
     return out
-
-
-def _plan_start_monday(conn: sqlite3.Connection, plan_id: int) -> date | None:
-    """The plan's first week (from version 1, which always governs from the
-    plan's start regardless of its own created_at), or None if v1 has no weeks
-    (shouldn't happen for an active plan)."""
-    row = conn.execute("""
-        SELECT MIN(pw.week_start) AS d
-        FROM plan_weeks pw JOIN plan_versions pv ON pv.version_id = pw.version_id
-        WHERE pv.plan_id = ? AND pv.version_n = 1
-    """, [plan_id]).fetchone()
-    return date.fromisoformat(row["d"]) if row is not None and row["d"] is not None else None
 
 
 def _days_stale(last_sync_at: str | None) -> int | None:
@@ -2076,7 +1820,7 @@ def start_plan_draft(
             return json.dumps({"error": str(e)})
         return json.dumps(_fmt_paces(_draft_state(conn, plan_id)))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2107,7 +1851,7 @@ def start_revision_draft() -> str:
             return json.dumps({"error": str(e)})
         return json.dumps(_fmt_paces(_draft_state(conn, p["plan_id"])))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2149,7 +1893,7 @@ def get_draft() -> str:
         plan_id, _version_id = resolved
         return json.dumps(_fmt_paces(_draft_state(conn, plan_id)))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2193,7 +1937,7 @@ def set_draft_weeks(weeks: list[WeekInput]) -> str:
         result["written"] = {"weeks": sorted({w["week_start"] for w in weeks})}
         return json.dumps(_fmt_paces(result))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2242,7 +1986,7 @@ def set_draft_days(days: list[DayInput]) -> str:
         result["written"] = {"days": [[d["date"], d.get("seq", 1)] for d in days]}
         return json.dumps(_fmt_paces(result))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2272,7 +2016,7 @@ def delete_draft_weeks(week_starts: list[str]) -> str:
         result["deleted_weeks"] = deleted
         return json.dumps(_fmt_paces(result))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2302,7 +2046,7 @@ def delete_draft_days(dates: list[str]) -> str:
         result["deleted_days"] = deleted
         return json.dumps(_fmt_paces(result))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2374,8 +2118,8 @@ def commit_plan(note: str) -> str:
         ).fetchone() is not None
         past_weeks_preserved: list[str] = []
         if has_prior_committed:
-            this_monday = _monday_of(date.today())
-            plan_start = _plan_start_monday(conn, plan_id)
+            this_monday = monday_of(date.today())
+            plan_start = plan_start_monday(conn, plan_id)
             if plan_start is not None:
                 m = plan_start
                 while m <= this_monday:
@@ -2403,7 +2147,7 @@ def commit_plan(note: str) -> str:
         }
         return json.dumps(_fmt_paces(result))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2434,7 +2178,7 @@ def discard_draft() -> str:
         derive_all(conn)
         return json.dumps({"discarded_plan_id": plan_id})
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2488,11 +2232,11 @@ def get_training_plan(version_n: int | None = None, compare_to: int | None = Non
         bundle = get_version(conn, version_index[target_n])
         assert bundle is not None
 
-        governing = current_version_for_week(conn, plan_id, _monday_of(date.today()))
+        governing = current_version_for_week(conn, plan_id, monday_of(date.today()))
         last_sync_at = db.get_last_sync_at(conn)
 
         this_week: dict[str, object] | None = None
-        monday = _monday_of(date.today())
+        monday = monday_of(date.today())
         week_row = next(
             (w for w in governing["weeks"] if w["week_start"] == monday.isoformat()),
             None,
@@ -2502,7 +2246,7 @@ def get_training_plan(version_n: int | None = None, compare_to: int | None = Non
             if last_sync_at is not None:
                 cutoff = min(cutoff, date.fromisoformat(last_sync_at[:10]))
             if cutoff >= monday:
-                tc, tp = _run_type_filter()
+                tc, tp = run_sport_filter()
                 effective = db.effective_run_type_sql()
                 actual = conn.execute(f"""
                     SELECT ROUND(COALESCE(SUM(distance_m), 0) / 1609.34, 2) AS miles,
@@ -2551,7 +2295,7 @@ def get_training_plan(version_n: int | None = None, compare_to: int | None = Non
 
         return json.dumps(_fmt_paces(result))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2589,7 +2333,7 @@ def log_plan_adjustment(
             return json.dumps({"error": str(e)})
         return json.dumps({"log_id": log_id})
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2634,7 +2378,7 @@ def abandon_plan(reason: str, plan_id: int | None = None) -> str:
         ).fetchone()
         return json.dumps({"plan": dict(updated)})
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2722,7 +2466,7 @@ def get_plan_adherence() -> str:
         }
         return json.dumps(_fmt_paces(result))
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return json.dumps({"error": describe_error(e, None)})
 
 
 @mcp.tool()
@@ -2762,6 +2506,8 @@ def run_sql(query: str) -> str:
     Table: weather  (one row per activity; populated by miles-sync)
       activity_id, fetched_at, temp_c_start, temp_c_end, temp_c_avg, temp_c_max,
       apparent_temp_c_max, humidity_avg, precip_mm, wind_kph_avg, hourly_json
+      (weather rows are Open-Meteo data, CC BY 4.0: credit "Weather data by
+      Open-Meteo.com" when quoting them)
 
     Table: fitness_checkpoints  (derived, rebuilt each sync — not athlete-entered)
       month (YYYY-MM), confidence, source_tier (1=races, 2=workout laps, 3=envelope
@@ -2851,12 +2597,18 @@ def run_sql(query: str) -> str:
     stripped = query.strip().upper().lstrip("(")
     if not (stripped.startswith("SELECT") or stripped.startswith("WITH")):
         return json.dumps({"error": "Only SELECT / WITH queries are permitted."})
-    conn = _conn()
+    _conn().close()  # schema and derived values are brought current before reading
+    # The prefix test above cannot see a write nested in a WITH statement, so
+    # the query runs on a connection that refuses every write.
+    conn = db.connect()
     try:
+        conn.execute("PRAGMA query_only = ON")
         rows = conn.execute(query).fetchall()
         return json.dumps([dict(r) for r in rows])
     except Exception as e:
         return json.dumps({"error": str(e)})
+    finally:
+        conn.close()
 
 
 def _routes_conn() -> sqlite3.Connection:
@@ -2879,8 +2631,11 @@ def list_routes(
     optionally filtered by distance (meters), climb rate (ft_per_mi), a
     single tag, or proximity to a lat/lng (near_radius_m defaults to
     5000m). Returns route_id, name, gpx_name, kind, source, tags,
-    has_elevation, distance_m, gain_m, loss_m, ft_per_mi, shape,
-    start_lat/start_lng for each match.
+    has_elevation, elevation_source (the athlete's auto/file/dem
+    preference), ele_source (which one is actually populating this route's
+    elevation: file/dem/null), elevation_pending (a dem drape is still
+    waiting on tile coverage), distance_m, gain_m, loss_m, ft_per_mi,
+    shape, start_lat/start_lng for each match.
     """
     conn = _routes_conn()
     rows = routes_service.list_routes(
@@ -2898,6 +2653,7 @@ def list_routes(
 
 
 @mcp.tool()
+@reporting(routes_service.RouteNotFoundError)
 def get_route(route_id: int) -> str:
     """
     Full detail for one route: metadata (name, source, notes, tags),
@@ -2906,13 +2662,11 @@ def get_route(route_id: int) -> str:
     waypoints, and (for a composed route) its leg definition.
     """
     conn = _routes_conn()
-    try:
-        return json.dumps(routes_service.get_route(conn, route_id))
-    except routes_service.RouteNotFoundError as e:
-        return json.dumps({"error": str(e)})
+    return json.dumps(routes_service.get_route(conn, route_id))
 
 
 @mcp.tool()
+@reporting(routes_service.RouteNotFoundError)
 def find_route_junctions(route_a: int, route_b: int, tolerance_m: float = 30.0) -> str:
     """
     Where two routes meet: clustered contact points ("junctions") plus any
@@ -2921,13 +2675,11 @@ def find_route_junctions(route_a: int, route_b: int, tolerance_m: float = 30.0) 
     two points must be to count as touching.
     """
     conn = _routes_conn()
-    try:
-        return json.dumps(routes_service.find_route_junctions(conn, route_a, route_b, tolerance_m=tolerance_m))
-    except routes_service.RouteNotFoundError as e:
-        return json.dumps({"error": str(e)})
+    return json.dumps(routes_service.find_route_junctions(conn, route_a, route_b, tolerance_m=tolerance_m))
 
 
 @mcp.tool()
+@reporting(routes_service.RouteNotFoundError)
 def find_routes_near(
     lat: float | None = None,
     lng: float | None = None,
@@ -2941,16 +2693,14 @@ def find_routes_near(
     """
     conn = _routes_conn()
     if route_id is not None:
-        try:
-            return json.dumps(routes_service.routes_near_route(conn, route_id, radius_m))
-        except routes_service.RouteNotFoundError as e:
-            return json.dumps({"error": str(e)})
+        return json.dumps(routes_service.routes_near_route(conn, route_id, radius_m))
     if lat is None or lng is None:
         return json.dumps({"error": "Pass lat and lng, or route_id."})
     return json.dumps(routes_service.routes_near(conn, lat, lng, radius_m))
 
 
 @mcp.tool()
+@reporting(routes_service.RouteNotFoundError)
 def compose_route(
     legs: str,
     tolerance_m: float = 30.0,
@@ -2980,17 +2730,15 @@ def compose_route(
     except json.JSONDecodeError as e:
         return json.dumps({"error": f"legs must be a JSON list: {e}"})
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else None
-    try:
-        return json.dumps(
-            routes_service.compose_route(
-                conn, parsed_legs, tolerance_m=tolerance_m, save=save, name=name, notes=notes, tags=tag_list
-            )
+    return json.dumps(
+        routes_service.compose_route(
+            conn, parsed_legs, tolerance_m=tolerance_m, save=save, name=name, notes=notes, tags=tag_list
         )
-    except routes_service.RouteNotFoundError as e:
-        return json.dumps({"error": str(e)})
+    )
 
 
 @mcp.tool()
+@reporting(routes_service.RouteNotFoundError)
 def compare_route_to_course(route_id: int, course_route_id: int) -> str:
     """
     Transparent side-by-side comparison of two routes: ft/mi, grade-band
@@ -3000,30 +2748,76 @@ def compare_route_to_course(route_id: int, course_route_id: int) -> str:
     single score.
     """
     conn = _routes_conn()
-    try:
-        return json.dumps(routes_service.compare_route_to_course(conn, route_id, course_route_id))
-    except routes_service.RouteNotFoundError as e:
-        return json.dumps({"error": str(e)})
+    return json.dumps(routes_service.compare_route_to_course(conn, route_id, course_route_id))
 
 
 @mcp.tool()
-def update_route(route_id: int, name: str | None = None, notes: str | None = None, tags: str | None = None) -> str:
+@reporting(routes_service.RouteNotFoundError, ValueError)
+def update_route(
+    route_id: int,
+    name: str | None = None,
+    notes: str | None = None,
+    tags: str | None = None,
+    elevation_source: str | None = None,
+) -> str:
     """
-    Update a route's athlete-facing name, notes, and/or tags
-    (comma-separated; pass an empty string to clear all tags). Only
-    fields passed are changed; omitted ones are left as they were.
-    Everything else about a route (stats, points, climbs) is derived from
-    its raw GPX and isn't editable here.
+    Update a route's athlete-facing name, notes, tags (comma-separated;
+    pass an empty string to clear all tags), and/or elevation_source
+    (one of "auto", "file", "dem"). Only fields passed are changed;
+    omitted ones are left as they were. Everything else about a route
+    (stats, points, climbs) is derived from its raw GPX and the terrain
+    model, and isn't editable here.
+
+    elevation_source controls where a route's elevation comes from: "auto"
+    (default) uses the GPX file's own elevation when it has one, else
+    drapes from the terrain model; "file" never drapes even when the file
+    has no elevation; "dem" always drapes, ignoring any file elevation.
+    Changing it re-derives the route immediately from the cached tile set
+    only -- if the terrain model doesn't cover this route yet, it comes
+    back pending; use redrape_route to fetch the tiles now.
     """
     conn = _routes_conn()
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags is not None else None
+    return json.dumps(
+        routes_service.update_route(
+            conn, route_id, name=name, notes=notes, tags=tag_list, elevation_source=elevation_source
+        )
+    )
+
+
+@mcp.tool()
+@threaded
+@reporting(routes_service.RouteNotFoundError, elevation.ElevationFetchError)
+def redrape_route(route_id: int) -> str:
+    """
+    Re-derive one route's elevation with network fetches allowed, unlike
+    every other derive path (upload, a full rebuild, a preference change),
+    which only reads whatever's already cached. Use after importing an
+    area that covers this route, or to retry a pending drape (see
+    get_route's elevation_pending) right now instead of waiting for the
+    next derive.
+    """
+    conn = _routes_conn()
     try:
-        return json.dumps(routes_service.update_route(conn, route_id, name=name, notes=notes, tags=tag_list))
-    except routes_service.RouteNotFoundError as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps(routes_service.redrape_route(conn, route_id))
+    finally:
+        conn.close()
+
+
+register_terrain_tools(mcp)
+areas_mcp.register_area_tools(mcp)
+network_mcp.register_network_tools(mcp)
+drive_mcp.register_drive_tools(mcp)
+outbound_mcp.register_outbound_tools(mcp)
+search_mcp.register_search_tools(mcp)
 
 
 def main() -> None:
+    try:
+        outbound.claim()
+    except outbound.OutboundBusyError as e:
+        raise SystemExit(e.message) from None
+    events.install()
     mcp.run()
 
 
