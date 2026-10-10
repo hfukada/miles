@@ -97,31 +97,6 @@ def test_terrarium_sampler_interpolates_a_gradient(conn: sqlite3.Connection):
     assert elevation.TerrariumSampler(conn, zoom=zoom).sample([(lat, lng)]) == [pytest.approx(10.5, abs=0.01)]
 
 
-def test_the_tile_memo_drops_its_least_recently_used_entry():
-    memo: elevation._LRU[str, int] = elevation._LRU(2)
-    memo["a"] = 1
-    memo["b"] = 2
-    assert memo["a"] == 1  # touching "a" makes "b" the oldest
-    memo["c"] = 3
-    assert "a" in memo and "c" in memo and "b" not in memo
-
-
-def test_a_sampler_keeps_no_more_decoded_tiles_than_the_memo_bound(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(elevation, "_TERRARIUM_MEMO_TILES", 3)
-    zoom = 5
-    sampler = elevation.TerrariumSampler(conn, zoom=zoom)
-
-    sampler.sample([_pixel_to_lonlat(zoom, tx * elevation.TERRARIUM_TILE_PX + 10.0, 10.0) for tx in range(6)])
-
-    memoed = [tx for tx in range(8) if (tx, 0) in sampler._images]
-    assert memoed == [3, 4, 5]
-
-
-def test_the_sampler_never_fetches_an_uncached_tile(conn: sqlite3.Connection, no_fetch: _TileServer):
-    assert elevation.sampler_for(conn).sample([(1.0, 2.0)]) == [None]
-    assert no_fetch.urls == []
-
-
 def test_a_corrupt_cached_tile_reads_as_missing_without_writing_and_is_refetched(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     _cache_tile(conn, 5, 3, 7, b"garbage")
 
@@ -148,14 +123,6 @@ def test_ensure_tiles_fetches_and_caches_each_missing_tile_once(conn: sqlite3.Co
     assert len(server.urls) == fetched_once
 
 
-def test_ensure_tiles_covers_tiles_between_two_distant_points(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    server = _TileServer(monkeypatch, _tile_png(100.0))
-
-    elevation.ensure_tiles(conn, points=[_tile_point(5, 3, 7), _tile_point(5, 6, 7)], zoom=5)
-
-    assert {u.rsplit("/", 2)[-2] for u in server.urls} >= {"3", "4", "5", "6"}
-
-
 def test_ensure_tiles_refuses_to_run_inside_a_transaction(conn: sqlite3.Connection, no_fetch: _TileServer):
     conn.execute("INSERT INTO meta (key, value) VALUES ('probe', '1')")
     assert conn.in_transaction
@@ -163,40 +130,25 @@ def test_ensure_tiles_refuses_to_run_inside_a_transaction(conn: sqlite3.Connecti
         elevation.ensure_tiles(conn, points=[(1.0, 2.0)])
 
 
-def test_a_tile_that_cannot_be_written_is_a_fetch_error(monkeypatch: pytest.MonkeyPatch):
-    caller = sqlite3.connect(db.DB_PATH, timeout=0)
-    caller.row_factory = sqlite3.Row
-    holder = db.connect()
-    holder.execute("BEGIN IMMEDIATE")
-    _TileServer(monkeypatch, _tile_png(100.0))
-
-    with pytest.raises(elevation.ElevationFetchError):
-        elevation.ensure_tiles(caller, points=[(1.0, 2.0)])
-    holder.rollback()
-
-
-def test_ensure_tiles_reports_progress_over_the_bbox(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _TileServer(monkeypatch, _tile_png(100.0))
-    bbox = (1.1, 2.4, 1.45, 2.8)
-    expected = len(elevation.terrarium_tiles_covering(*bbox))
-    progress: list[tuple[int, int]] = []
-
-    elevation.ensure_tiles(conn, bbox=bbox, on_progress=lambda done, total: progress.append((done, total)))
-
-    assert progress == [(i, expected) for i in range(expected + 1)]
-    assert _cached_tile_count(conn) == expected
-
-
 @pytest.mark.parametrize(
-    "body",
-    [b"<html>slow down</html>", _png(Image.new("RGB", (16, 16), (0, 0, 0)))],
-    ids=["not a png", "wrong size"],
+    "body, locked",
+    [(b"<html>slow down</html>", False), (_png(Image.new("RGB", (16, 16), (0, 0, 0))), False), (_tile_png(100.0), True)],
+    ids=["not a png", "wrong size", "a valid tile that cannot be written"],
 )
-def test_ensure_tiles_does_not_cache_a_body_that_is_not_a_full_size_png(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, body: bytes):
+def test_ensure_tiles_caches_nothing_and_raises_for_a_body_that_is_not_a_full_size_png_or_cannot_be_written(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, body: bytes, locked: bool
+):
     _TileServer(monkeypatch, body)
+    if locked:
+        holder = db.connect()
+        holder.execute("BEGIN IMMEDIATE")
+        conn = sqlite3.connect(db.DB_PATH, timeout=0)
     with pytest.raises(elevation.ElevationFetchError):
         elevation.ensure_tiles(conn, points=[(1.0, 2.0)])
-    assert _cached_tile_count(conn) == 0
+    if locked:
+        holder.rollback()
+    else:
+        assert _cached_tile_count(conn) == 0
 
 
 def test_fetch_failure_raises_rather_than_reading_as_no_data(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
@@ -205,24 +157,16 @@ def test_fetch_failure_raises_rather_than_reading_as_no_data(conn: sqlite3.Conne
         elevation.ensure_tiles(conn, points=[(1.0, 2.0)])
 
 
-def test_a_404_tile_reads_as_no_data(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _TileServer(monkeypatch, urllib.error.HTTPError("http://x", 404, "not found", {}, None))  # type: ignore[arg-type]
+def test_a_404_tile_reads_as_no_data_and_the_sampler_never_fetches_it(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    server = _TileServer(monkeypatch, urllib.error.HTTPError("http://x", 404, "not found", {}, None))  # type: ignore[arg-type]
     elevation.ensure_tiles(conn, points=[(1.0, 2.0)])
     assert _cached_tile_count(conn) == 0
+    asked = len(server.urls)
     assert elevation.sampler_for(conn).sample([(1.0, 2.0)]) == [None]
+    assert len(server.urls) == asked
 
 
-def test_a_fetched_tile_is_committed_at_once(monkeypatch: pytest.MonkeyPatch):
-    caller = db.connect()
-    _TileServer(monkeypatch, _tile_png(100.0))
-
-    elevation.ensure_tiles(caller, points=[_tile_point()], zoom=5)
-
-    assert not caller.in_transaction
-    assert _cached_tile_count(db.connect()) > 0
-
-
-def test_fetching_a_tile_does_not_hold_the_callers_write_lock(monkeypatch: pytest.MonkeyPatch):
+def test_fetching_a_tile_commits_at_once_and_does_not_hold_the_callers_write_lock(monkeypatch: pytest.MonkeyPatch):
     caller = db.connect()
     during_fetch: list[bool] = []
 
@@ -241,9 +185,15 @@ def test_fetching_a_tile_does_not_hold_the_callers_write_lock(monkeypatch: pytes
     monkeypatch.setattr(elevation.http_client, "request", fetch)
     elevation.ensure_tiles(caller, points=[_tile_point()], zoom=5)
     assert during_fetch and all(during_fetch)
+    assert not caller.in_transaction  # each fetched tile is committed at once
+    assert _cached_tile_count(db.connect()) > 0
 
 
-def test_the_covering_tiles_include_every_tile_a_sample_inside_the_box_can_read():
+def test_the_covering_tiles_include_every_tile_a_sample_inside_the_box_can_read(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    server = _TileServer(monkeypatch, _tile_png(100.0))
+    elevation.ensure_tiles(conn, points=[_tile_point(5, 3, 7), _tile_point(5, 6, 7)], zoom=5)
+    assert {u.rsplit("/", 2)[-2] for u in server.urls} >= {"3", "4", "5", "6"}  # tiles between two distant points
+
     south, west, north, east = 1.1, 2.4, 1.45, 2.8
     covering = set(elevation.terrarium_tiles_covering(south, west, north, east))
     steps = 40

@@ -4,14 +4,12 @@ existing routers. No auth, matching every other endpoint in this app: the
 API has none, so this doesn't invent any (see /api/workbooks/upload).
 """
 
-from contextlib import closing
-
 import anyio.to_thread
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from . import elevation, gpx_parse, routes as routes_service
+from . import db, elevation, gpx_parse, routes as routes_service
 
 router = APIRouter()
 
@@ -34,7 +32,7 @@ async def upload_route(
     parsed_tags = _parse_tags(tags)
 
     def store() -> list[routes_service.RouteSummary]:
-        with closing(routes_service.connect()) as conn:
+        with db.connection(routes_service.connect) as conn:
             route_ids = routes_service.upload_gpx(
                 conn, data, file.filename or "upload.gpx", name=name, source=source, notes=notes, tags=parsed_tags,
             )
@@ -57,30 +55,30 @@ def list_routes(
     near_lng: float | None = None,
     near_radius_m: float = 5000.0,
 ) -> list[routes_service.RouteSummary]:
-    conn = routes_service.connect()
-    return routes_service.list_routes(
-        conn,
-        min_distance_m=min_distance_m,
-        max_distance_m=max_distance_m,
-        min_ft_per_mi=min_ft_per_mi,
-        max_ft_per_mi=max_ft_per_mi,
-        tag=tag,
-        near_lat=near_lat,
-        near_lng=near_lng,
-        near_radius_m=near_radius_m,
-    )
+    with db.connection(routes_service.connect) as conn:
+        return routes_service.list_routes(
+            conn,
+            min_distance_m=min_distance_m,
+            max_distance_m=max_distance_m,
+            min_ft_per_mi=min_ft_per_mi,
+            max_ft_per_mi=max_ft_per_mi,
+            tag=tag,
+            near_lat=near_lat,
+            near_lng=near_lng,
+            near_radius_m=near_radius_m,
+        )
 
 
 @router.get("/api/routes/junctions")
 def get_junctions(route_a: int, route_b: int, tolerance_m: float = 30.0) -> routes_service.FindJunctionsResult:
-    conn = routes_service.connect()
-    return routes_service.find_route_junctions(conn, route_a, route_b, tolerance_m=tolerance_m)
+    with db.connection(routes_service.connect) as conn:
+        return routes_service.find_route_junctions(conn, route_a, route_b, tolerance_m=tolerance_m)
 
 
 @router.get("/api/routes/near")
 def get_routes_near(lat: float, lng: float, radius_m: float = 1000.0) -> list[routes_service.RouteNearby]:
-    conn = routes_service.connect()
-    return routes_service.routes_near(conn, lat, lng, radius_m)
+    with db.connection(routes_service.connect) as conn:
+        return routes_service.routes_near(conn, lat, lng, radius_m)
 
 
 class ComposeLegBody(BaseModel):
@@ -104,47 +102,47 @@ class ComposeRequestBody(BaseModel):
 
 @router.post("/api/routes/compose")
 def post_compose_route(body: ComposeRequestBody) -> routes_service.ComposeResult:
-    conn = routes_service.connect()
-    legs: list[routes_service.RouteLegInput] = [leg.model_dump() for leg in body.legs]  # type: ignore[misc]
-    return routes_service.compose_route(
-        conn, legs, tolerance_m=body.tolerance_m, save=body.save,
-        name=body.name, notes=body.notes, tags=body.tags,
-    )
+    with db.connection(routes_service.connect) as conn:
+        legs: list[routes_service.RouteLegInput] = [leg.model_dump() for leg in body.legs]  # type: ignore[misc]
+        return routes_service.compose_route(
+            conn, legs, tolerance_m=body.tolerance_m, save=body.save,
+            name=body.name, notes=body.notes, tags=body.tags,
+        )
 
 
 @router.get("/api/routes/compare")
 def get_compare(route_id: int, course_route_id: int) -> routes_service.CompareResult:
-    conn = routes_service.connect()
-    return routes_service.compare_route_to_course(conn, route_id, course_route_id)
+    with db.connection(routes_service.connect) as conn:
+        return routes_service.compare_route_to_course(conn, route_id, course_route_id)
 
 
 @router.get("/api/routes/{route_id}")
 def get_route(route_id: int) -> routes_service.RouteDetail:
-    conn = routes_service.connect()
-    return routes_service.get_route(conn, route_id)
+    with db.connection(routes_service.connect) as conn:
+        return routes_service.get_route(conn, route_id)
 
 
 @router.get("/api/routes/{route_id}/gpx")
 def get_route_gpx(route_id: int) -> Response:
-    conn = routes_service.connect()
-    filename, data = routes_service.get_route_gpx(conn, route_id)
-    return Response(
-        content=data,
-        media_type="application/gpx+xml",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    with db.connection(routes_service.connect) as conn:
+        filename, data = routes_service.get_route_gpx(conn, route_id)
+        return Response(
+            content=data,
+            media_type="application/gpx+xml",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
 
 @router.get("/api/routes/{route_id}/profile")
 def get_route_profile(route_id: int) -> list[routes_service.RouteProfilePoint]:
-    conn = routes_service.connect()
-    return routes_service.get_route_profile(conn, route_id)
+    with db.connection(routes_service.connect) as conn:
+        return routes_service.get_route_profile(conn, route_id)
 
 
 @router.get("/api/routes/{route_id}/near")
 def get_route_near_routes(route_id: int, radius_m: float = 1000.0) -> list[routes_service.RouteNearby]:
-    conn = routes_service.connect()
-    return routes_service.routes_near_route(conn, route_id, radius_m)
+    with db.connection(routes_service.connect) as conn:
+        return routes_service.routes_near_route(conn, route_id, radius_m)
 
 
 class RouteUpdateBody(BaseModel):
@@ -156,14 +154,14 @@ class RouteUpdateBody(BaseModel):
 
 @router.patch("/api/routes/{route_id}")
 def patch_route(route_id: int, body: RouteUpdateBody) -> routes_service.RouteDetail:
-    conn = routes_service.connect()
-    try:
-        return routes_service.update_route(
-            conn, route_id, name=body.name, notes=body.notes, tags=body.tags,
-            elevation_source=body.elevation_source,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    with db.connection(routes_service.connect) as conn:
+        try:
+            return routes_service.update_route(
+                conn, route_id, name=body.name, notes=body.notes, tags=body.tags,
+                elevation_source=body.elevation_source,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/api/routes/{route_id}/redrape")
@@ -172,14 +170,14 @@ def post_redrape_route(route_id: int) -> routes_service.RouteDetail:
     unlike every other derive path, which only reads the elevation tile
     cache. Use after an area import has cached tiles the route needed, or
     to retry a pending drape immediately."""
-    conn = routes_service.connect()
-    try:
-        return routes_service.redrape_route(conn, route_id)
-    except elevation.ElevationFetchError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    with db.connection(routes_service.connect) as conn:
+        try:
+            return routes_service.redrape_route(conn, route_id)
+        except elevation.ElevationFetchError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.delete("/api/routes/{route_id}", status_code=204)
 def delete_route(route_id: int) -> None:
-    conn = routes_service.connect()
-    routes_service.delete_route(conn, route_id)
+    with db.connection(routes_service.connect) as conn:
+        routes_service.delete_route(conn, route_id)

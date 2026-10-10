@@ -1,10 +1,8 @@
 """The "needs attention" check behind /api/health.
 
-Everything is read from the database, so the answer is the same whichever
-process asks and whichever process did the work: the last sync's outcome, the
-persisted log of throttling and credential failures (events.py), and the
-status rows of the background jobs. A handful of indexed queries; cheap
-enough to poll every minute from an uptime monitor.
+Read entirely from the database, so the answer is the same whichever process
+asks: the last sync's outcome, the throttling and credential log (events.py),
+and the background jobs' status rows. Cheap enough to poll every minute.
 """
 
 import os
@@ -80,8 +78,8 @@ def _credential_reasons(conn: sqlite3.Connection, now: datetime, details: dict[s
 
 
 def _history_work_remains(conn: sqlite3.Connection) -> bool:
-    """Whether any history (streams or laps) is still waiting. A backfill error
-    with nothing left to fetch is stale: the next sync has no work to retry."""
+    """Whether any history (streams or laps) is waiting; a backfill error with
+    nothing left to fetch is stale."""
     if conn.execute("SELECT 1 FROM terrain_backfill_queue LIMIT 1").fetchone() is not None:
         return True
     return bool(sync.remaining_lap_ids(conn))

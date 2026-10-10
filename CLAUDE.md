@@ -15,7 +15,6 @@ uv run miles-derive # rebuild derived values (run_type_inferred, laps.lap_type);
 uv run miles-route-import FILE... # upload GPX files to a running miles-api (--name --source --notes --tags, --url defaults to localhost:8000)
 uv run miles-terrain-backfill # fetch run streams and segment them for the terrain model (resumable, Strava rate-limit aware)
 uv run miles-area-refresh LABEL  # re-fetch an area's map data (--geocode PLACE re-geocodes, --force-extract replaces a bad extract); nothing refreshes by age
-uv run miles-terrain-rebuild  # run the full terrain-model rebuild a version bump needs (the API also starts it itself at startup)
 uv run pyright      # type check
 uv run pytest       # unit tests (tests/) — pure-function coverage: streams.py math, format.py, api.py pace helpers
 ```

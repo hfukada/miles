@@ -135,7 +135,7 @@ Without `history=true` the sync skips the history trickle (the Sync button in th
 Poll `GET /api/sync/status` for progress; `GET /api/health` tells a monitor whether the last
 sync worked.
 
-The CLIs (`miles-auth`, `miles-sync`, `miles-terrain-backfill`, `miles-terrain-rebuild`,
+The CLIs (`miles-auth`, `miles-sync`, `miles-terrain-backfill`,
 `miles-area-refresh`) and the stdio server (`miles-mcp`) stay for development and self-hosting. Each is a
 single-process tool with its own throttle state, so the process that makes outbound calls
 takes an exclusive lock file beside the database (`activities.db.outbound.lock`) when it

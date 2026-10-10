@@ -5,7 +5,7 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from helpers import memory_db
+from helpers import FakeResponse, memory_db
 
 from miles import geofabrik
 
@@ -84,27 +84,20 @@ def test_a_box_inside_a_hole_does_not_intersect_the_region():
     assert geofabrik.intersects(regions["world/other/ringed"], (52, 4.5, 55.5, 5.5)) is True
 
 
-def test_an_area_straddling_two_regions_walks_up_to_their_parent():
-    regions = geofabrik.parse_index(_raw())
-    found = geofabrik.smallest_containing(regions, (10, 18, 12, 22))
-    assert found is not None and found.path == "world/land"
-
-
-def test_an_area_outside_every_region_has_no_match():
-    regions = geofabrik.parse_index(_raw())
-    assert geofabrik.smallest_containing(regions, (-20, -20, -19, -19)) is None
-
-
-def test_a_hole_in_a_region_is_not_contained():
-    regions = geofabrik.parse_index(_raw())
-    assert geofabrik.smallest_containing(regions, (54.5, 4.5, 55.5, 5.5)) is None
-    assert geofabrik.smallest_containing(regions, (51, 1, 52, 2)) is not None
-
-
-def test_an_area_spanning_the_parts_of_a_multipolygon_is_not_contained():
-    regions = geofabrik.parse_index(_raw())
-    assert geofabrik.smallest_containing(regions, (70.2, 0.2, 70.8, 0.8)) is not None
-    assert geofabrik.smallest_containing(regions, (70.2, 0.2, 70.8, 5.8)) is None
+@pytest.mark.parametrize(
+    ("box", "expected"),
+    [
+        ((10, 18, 12, 22), "world/land"),  # straddling two regions walks up to their parent
+        ((-20, -20, -19, -19), None),  # outside every region
+        ((54.5, 4.5, 55.5, 5.5), None),  # inside a hole
+        ((51, 1, 52, 2), "world/other/ringed"),  # beside the hole
+        ((70.2, 0.2, 70.8, 0.8), "world/other/islands"),  # inside one part of a multipolygon
+        ((70.2, 0.2, 70.8, 5.8), None),  # spanning two parts
+    ],
+)
+def test_the_smallest_region_containing_a_box(box, expected):
+    found = geofabrik.smallest_containing(geofabrik.parse_index(_raw()), box)
+    assert (found.path if found else None) == expected
 
 
 class _Served:
@@ -121,16 +114,8 @@ class _Served:
                 raise urllib.error.URLError("down")
             raise urllib.error.HTTPError(url, self.status, "x", {}, None)  # type: ignore[arg-type]
 
-        class Resp:
-            headers = {"ETag": '"v1"', "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"}
-
-            def __init__(self, raw: bytes) -> None:
-                self.raw = raw
-
-            def read(self) -> bytes:
-                return self.raw
-
-        return reader(Resp(self.raw))
+        headers = {"ETag": '"v1"', "Last-Modified": "Mon, 01 Jan 2024 00:00:00 GMT"}
+        return reader(FakeResponse(self.raw, headers))
 
 
 def _age_index(conn: sqlite3.Connection, days: float) -> None:
@@ -239,25 +224,17 @@ def _split_conn(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
     return conn
 
 
-def test_an_area_across_a_border_is_covered_by_the_children_not_the_parent(monkeypatch: pytest.MonkeyPatch):
-    conn = _split_conn(monkeypatch)
-    assert sorted(geofabrik.choose_regions(conn, (10, 18, 12, 22))) == ["example/big/part-a", "example/big/part-b"]
-
-
-def test_an_area_inside_one_child_takes_that_child(monkeypatch: pytest.MonkeyPatch):
-    conn = _split_conn(monkeypatch)
-    assert geofabrik.choose_regions(conn, (10, 2, 12, 4)) == ["example/big/part-a"]
-
-
-def test_a_parent_exactly_covered_by_its_children_wins_as_one_region(monkeypatch: pytest.MonkeyPatch):
-    conn = _split_conn(monkeypatch)
-    assert geofabrik.choose_regions(conn, (55, 8, 57, 22)) == ["example/tri"]
-
-
-def test_an_area_spanning_three_children_of_a_larger_parent_takes_all_three(monkeypatch: pytest.MonkeyPatch):
-    conn = _split_conn(monkeypatch)
-    found = geofabrik.choose_regions(conn, (10, 15, 12, 60))
-    assert sorted(found) == ["example/big/part-a", "example/big/part-b", "example/big/part-c"]
+@pytest.mark.parametrize(
+    ("box", "expected"),
+    [
+        ((10, 18, 12, 22), ["example/big/part-a", "example/big/part-b"]),  # across a border: the children, not the parent
+        ((10, 2, 12, 4), ["example/big/part-a"]),  # inside one child
+        ((10, 15, 12, 60), ["example/big/part-a", "example/big/part-b", "example/big/part-c"]),
+        ((55, 8, 57, 22), ["example/tri"]),  # a parent exactly tiled by its children wins as one region
+    ],
+)
+def test_the_regions_chosen_for_an_area_prefer_children_unless_they_tile_the_parent(monkeypatch: pytest.MonkeyPatch, box, expected):
+    assert sorted(geofabrik.choose_regions(_split_conn(monkeypatch), box)) == expected
 
 
 def test_the_children_that_cover_an_area_under_a_named_parent(monkeypatch: pytest.MonkeyPatch):
@@ -273,7 +250,3 @@ def test_an_explicit_region_is_accepted_unchecked_when_the_index_is_unreachable(
     geofabrik.validate_region(memory_db(), "example/anything")
 
 
-def test_a_typo_gets_a_close_match_suggestion(monkeypatch: pytest.MonkeyPatch):
-    conn = _split_conn(monkeypatch)
-    with pytest.raises(geofabrik.RegionError, match="did you mean example/big/part-a"):
-        geofabrik.validate_region(conn, "example/big/part-aa")

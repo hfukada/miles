@@ -311,24 +311,5 @@ def main(limit: int | None, short_reserve: int, daily_reserve: int | None) -> No
         raise
 
 
-@click.command()
-def rebuild_main() -> None:
-    """Run, in the foreground, the full terrain-model rebuild that a model
-    version bump calls for. The API server starts the same rebuild on its own
-    at startup; running this at deploy time just does it before traffic
-    arrives."""
-    outbound.claim()
-    conn = db.connect()
-    if terrain.model_is_current(conn):
-        print("Terrain model is current.")
-        return
-    started = time.monotonic()
-    try:
-        terrain.ensure_terrain_derived(conn)
-    except terrain.TerrainRebuildingError as e:
-        raise click.ClickException(str(e)) from e
-    print(f"Rebuilt the terrain model in {time.monotonic() - started:.1f} s.")
-
-
 if __name__ == "__main__":
     main()

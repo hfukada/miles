@@ -1,9 +1,6 @@
 """MCP tools for route search (docs/design-terrain-and-route-search.md,
-section 5). find_routes converts the athlete-facing miles/feet request into
-route_search's meters-only RouteSearchRequest, runs it, and reports a
-compact per-candidate breakdown back in miles/feet -- the unit conversion
-happens only at this boundary, never inside route_search itself.
-"""
+section 5). Miles/feet are converted to and from route_search's meters only
+here."""
 
 import json
 from typing import cast
@@ -115,78 +112,61 @@ def register_search_tools(mcp: FastMCP) -> None:
     ) -> str:
         """
         Find candidate running routes over an imported area's network graph
-        (import_area first if the area isn't ready). Exactly one of these
-        gives the start(s):
-        - start_lat/start_lng alone: a single out-the-door start.
-        - start_lat/start_lng plus max_drive_minutes: drive mode -- fans out
-          over trailheads and trail-adjacent parking within that drive time
-          of (start_lat, start_lng) (best drive_k, default 8, first), the
-          same set find_trailheads returns, plus the point itself as a
-          zero-drive-time start.
-        - starts: a list of {"lat", "lng", "label"?, "drive_s"?} objects,
-          for a caller that already has its own start set.
+        (import_area first if the area isn't ready). Give the start(s) one way:
+        - start_lat/start_lng alone: a single start.
+        - start_lat/start_lng plus max_drive_minutes (at most 90): fans out over
+          the trailheads and parking find_trailheads returns (best drive_k,
+          default 8) plus the point itself. Drive times are straight-line
+          estimates, flagged drive_time_estimated=true, when OSRM is down; tell
+          the athlete and re-run later.
+        - starts: a list of {"lat", "lng", "label"?, "drive_s"?} objects.
 
-        distance_mi_min/distance_mi_max bound the route length. shape is
-        "loop", "out_and_back", "lollipop", or "any" (default). min_trail_mi
-        and min_runnable_pct (percent of the route that's comfortably
-        runnable or grind -- runnable but slow, not steep enough to count as
-        hiking) are soft floors; gain_ft_min/gain_ft_max bounds total
-        climbing. avoid_way_ids/include_way_ids take lists of OSM way
-        ids -- a route touching an avoided way is never returned, even as a
-        near miss.
+        distance_mi_min/distance_mi_max bound the length. shape is "loop",
+        "out_and_back", "lollipop", or "any". min_trail_mi and min_runnable_pct
+        (run plus grind, i.e. not hiking) are soft floors; gain_ft_min/
+        gain_ft_max bound climbing. avoid_way_ids/include_way_ids are lists of
+        OSM way ids; a route touching an avoided way is never returned.
 
-        In drive mode max_drive_minutes is at most 90. The drive times come
-        from one OSRM request; if that service is down they are straight-line
-        estimates and each start says so with drive_time_estimated=true
-        (say that to the athlete, and re-run later for real times).
-
-        Returns up to n candidates (default 5), each with its start (label
-        and drive_minutes included) and a compact breakdown -- distance,
-        trail/road mix, runnability, road-exposure summary -- plus a
-        candidate_id for get_route_candidate/save_route_candidate. When
-        nothing meets every constraint, returns the closest few instead
-        (near_miss=true), each listing what it misses so the constraints
-        can be relaxed deliberately.
-
-        seed makes the search reproducible: the same seed, request, and
-        network give the same candidates. The seed used is always returned,
-        so a good result can be regenerated.
+        Returns up to n candidates (default 5): start, distance, trail/road
+        mix, runnability, road exposure, and a candidate_id for
+        get_route_candidate/save_route_candidate. When nothing meets every
+        constraint, the closest few come back with near_miss=true, each listing
+        what it misses. The same seed, request, and network reproduce the same
+        candidates; the seed used is always returned.
         """
-        conn = db.connect()
         try:
-            start_list = route_search.resolve_starts(
-                conn,
-                area_id,
-                starts=_parse_starts(starts) if starts else None,
-                origin=(start_lat, start_lng) if start_lat is not None and start_lng is not None else None,
-                max_drive_minutes=max_drive_minutes,
-                drive_k=drive_k,
-            )
-            if distance_mi_min is None or distance_mi_max is None:
-                return json.dumps({"error": "find_routes needs distance_mi_min and distance_mi_max"})
-            if shape not in ("loop", "out_and_back", "lollipop", "any"):
-                return json.dumps({"error": f"invalid shape: {shape!r}"})
+            with db.connection() as conn:
+                start_list = route_search.resolve_starts(
+                    conn,
+                    area_id,
+                    starts=_parse_starts(starts) if starts else None,
+                    origin=(start_lat, start_lng) if start_lat is not None and start_lng is not None else None,
+                    max_drive_minutes=max_drive_minutes,
+                    drive_k=drive_k,
+                )
+                if distance_mi_min is None or distance_mi_max is None:
+                    return json.dumps({"error": "find_routes needs distance_mi_min and distance_mi_max"})
+                if shape not in ("loop", "out_and_back", "lollipop", "any"):
+                    return json.dumps({"error": f"invalid shape: {shape!r}"})
 
-            request: route_search.RouteSearchRequest = {
-                "area_id": area_id,
-                "starts": start_list,
-                "distance_m_min": distance_mi_min * MILE_M,
-                "distance_m_max": distance_mi_max * MILE_M,
-                "shape": cast(route_search.Shape, shape),
-                "n": n,
-                "min_trail_m": None if min_trail_mi is None else min_trail_mi * MILE_M,
-                "min_runnable_pct": min_runnable_pct,
-                "gain_m_min": None if gain_ft_min is None else gain_ft_min / FT_PER_M,
-                "gain_m_max": None if gain_ft_max is None else gain_ft_max / FT_PER_M,
-                "avoid_way_ids": _parse_way_ids("avoid_way_ids", avoid_way_ids) if avoid_way_ids else None,
-                "include_way_ids": _parse_way_ids("include_way_ids", include_way_ids) if include_way_ids else None,
-                "seed": seed,
-            }
-            result = route_search.find_routes(conn, request)
+                request: route_search.RouteSearchRequest = {
+                    "area_id": area_id,
+                    "starts": start_list,
+                    "distance_m_min": distance_mi_min * MILE_M,
+                    "distance_m_max": distance_mi_max * MILE_M,
+                    "shape": cast(route_search.Shape, shape),
+                    "n": n,
+                    "min_trail_m": None if min_trail_mi is None else min_trail_mi * MILE_M,
+                    "min_runnable_pct": min_runnable_pct,
+                    "gain_m_min": None if gain_ft_min is None else gain_ft_min / FT_PER_M,
+                    "gain_m_max": None if gain_ft_max is None else gain_ft_max / FT_PER_M,
+                    "avoid_way_ids": _parse_way_ids("avoid_way_ids", avoid_way_ids) if avoid_way_ids else None,
+                    "include_way_ids": _parse_way_ids("include_way_ids", include_way_ids) if include_way_ids else None,
+                    "seed": seed,
+                }
+                result = route_search.find_routes(conn, request)
         except (ValueError, json.JSONDecodeError) as e:
             return json.dumps({"error": str(e)})
-        finally:
-            conn.close()
 
         return json.dumps(
             {
@@ -201,27 +181,18 @@ def register_search_tools(mcp: FastMCP) -> None:
     @reporting(route_search.CandidateNotFoundError)
     def get_route_candidate(candidate_id: str) -> str:
         """
-        Full breakdown and geometry for one search candidate, by the
-        candidate_id find_routes returned. Candidates are ephemeral and
-        expire a day after the search that produced them.
+        Full breakdown and geometry for a find_routes candidate. Candidates
+        expire a day after their search.
         """
-        conn = db.connect()
-        try:
+        with db.connection() as conn:
             return json.dumps(route_search.get_route_candidate(conn, candidate_id))
-        finally:
-            conn.close()
 
     @mcp.tool()
     @reporting(route_search.CandidateNotFoundError)
     def save_route_candidate(candidate_id: str, name: str) -> str:
         """
-        Save a search candidate as a normal route (source "generated"),
-        generating its GPX from the candidate's stored geometry. After this,
-        compare_route_to_course, find_route_junctions, compose_route, and
-        GPX export all apply to it exactly like an uploaded route.
+        Save a candidate as a route (source "generated") with a GPX built from
+        its geometry; it then works like an uploaded route.
         """
-        conn = db.connect()
-        try:
+        with db.connection() as conn:
             return json.dumps(route_search.save_route_candidate(conn, candidate_id, name))
-        finally:
-            conn.close()

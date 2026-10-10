@@ -1,34 +1,32 @@
 """Durable outbound-request accounting.
 
-A short-lived CLI run (a `miles-sync` that exits before anything could scrape
-it) and the API server write to the same database, so what they call is
+CLI runs and the API server write to the same database, so requests are
 recorded there rather than in process memory:
 
 - `outbound_requests`: per-day totals by service, host, endpoint kind, and
-  status (an HTTP code, or "error" for a connection failure). One upsert per
-  request. Rows older than RETENTION_DAYS are dropped.
+  status (HTTP code, or "error" for a connection failure); pruned after
+  RETENTION_DAYS.
 - `outbound_events`: a timestamped row for each request that ended on a status
-  the health check needs to place in time (a service answering 429 to the
-  last attempt, Strava refusing credentials), dropped after
-  EVENT_RETENTION_DAYS.
-- a `meta` key holding the Strava allowance last seen in a response.
+  the health check must place in time (429 on the last attempt, Strava 401);
+  pruned after EVENT_RETENTION_DAYS.
+- a `meta` key holding the Strava allowance last seen.
 
-Recording is opt-in per process: an entry point calls install(), which hooks
-http_client and strava_client. Library code and tests never write to a
-database on their own.
+Recording is opt-in: an entry point calls install(), which hooks http_client
+and strava_client.
 """
 
 import json
 import logging
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from . import db, http_client, strava_client
 
 _logger = logging.getLogger(__name__)
 
-# Statuses worth a timestamped row: a service telling us to slow down, and
-# Strava refusing our credentials.
+# Statuses worth a timestamped row: slow down, and refused credentials.
 EVENT_STATUSES = ("429", "401")
 EVENT_RETENTION_DAYS = 7
 LEDGER_BUSY_TIMEOUT_MS = 1500
@@ -74,13 +72,14 @@ def _prune(conn: sqlite3.Connection, today: str, now: datetime) -> None:
     conn.execute("DELETE FROM outbound_events WHERE at < ?", ((now - timedelta(days=EVENT_RETENTION_DAYS)).isoformat(),))
 
 
-def _ledger_connection() -> sqlite3.Connection:
+@contextmanager
+def _ledger_connection() -> Iterator[sqlite3.Connection]:
     """A connection for one ledger write. The write waits only briefly for a
     lock: recording a request must not hold up, or fail, the request itself,
     and a missed count costs less than a stalled caller."""
-    conn = db.connect()
-    conn.execute(f"PRAGMA busy_timeout = {LEDGER_BUSY_TIMEOUT_MS}")
-    return conn
+    with db.connection() as conn:
+        conn.execute(f"PRAGMA busy_timeout = {LEDGER_BUSY_TIMEOUT_MS}")
+        yield conn
 
 
 def record_request(service: str, host: str, status: str, kind: str = "") -> None:
@@ -89,8 +88,7 @@ def record_request(service: str, host: str, status: str, kind: str = "") -> None
     now = datetime.now(timezone.utc)
     today = now.date().isoformat()
     try:
-        conn = _ledger_connection()
-        try:
+        with _ledger_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO outbound_requests (day, service, host, kind, status, count) VALUES (?, ?, ?, ?, ?, 1)
@@ -100,8 +98,6 @@ def record_request(service: str, host: str, status: str, kind: str = "") -> None
             )
             _prune(conn, today, now)
             conn.commit()
-        finally:
-            conn.close()
     except Exception:
         _logger.warning("could not record outbound request %s %s %s", service, host, status, exc_info=True)
 
@@ -114,15 +110,12 @@ def record_outcome(service: str, status: int) -> None:
         return
     now = datetime.now(timezone.utc)
     try:
-        conn = _ledger_connection()
-        try:
+        with _ledger_connection() as conn:
             conn.execute(
                 "INSERT INTO outbound_events (at, service, status) VALUES (?, ?, ?)",
                 (now.isoformat(), service, status),
             )
             conn.commit()
-        finally:
-            conn.close()
     except Exception:
         _logger.warning("could not record outbound outcome %s %s", service, status, exc_info=True)
 
@@ -135,12 +128,9 @@ def record_strava_rate(daily_remaining: int, short_remaining: int) -> None:
         "at": datetime.now(timezone.utc).isoformat(),
     })
     try:
-        conn = _ledger_connection()
-        try:
+        with _ledger_connection() as conn:
             db.set_meta(conn, STRAVA_RATE_META, value)
             conn.commit()
-        finally:
-            conn.close()
     except Exception:
         _logger.warning("could not record the Strava allowance", exc_info=True)
 

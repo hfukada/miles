@@ -20,17 +20,14 @@ _TEXT_FORMAT = "text/plain; version=0.0.4; charset=utf-8"
 
 @router.get("/api/health")
 def get_health(verbose: bool = False) -> JSONResponse:
-    """200 {"status": "ok"} when nothing needs a person's attention, else 503
-    {"status": "attention", "reasons": [...]}. verbose=1 adds the underlying
-    values. Suited to an uptime monitor's HTTP-status or keyword check."""
-    conn = db.connect()
+    """200 {"status": "ok"}, or 503 {"status": "attention", "reasons": [...]};
+    verbose=1 adds the underlying values."""
     result: health.Health
     try:
-        result = health.check(conn, verbose=verbose)
+        with db.connection() as conn:
+            result = health.check(conn, verbose=verbose)
     except sqlite3.Error as e:
         result = {"status": "attention", "reasons": [f"database unreadable: {describe_error(e)}"]}
-    finally:
-        conn.close()
     return JSONResponse(result, status_code=200 if result["status"] == "ok" else 503)
 
 
@@ -104,24 +101,16 @@ def database_samples(conn: sqlite3.Connection) -> list[Sample]:
 def get_outbound(days: int = 30) -> list[dict[str, object]]:
     """Per-day counts of outbound requests by service, host, endpoint kind,
     and status over the last `days` days."""
-    conn = db.connect()
-    try:
+    with db.connection() as conn:
         return events.daily_counts(conn, days)
-    finally:
-        conn.close()
 
 
 @router.get("/metrics")
 def get_metrics() -> PlainTextResponse:
-    """Prometheus text format. 404 unless MILES_METRICS is set. Retry, wait,
-    and cache series are this process's own; outbound request totals, the
-    Strava allowance, and sync and backfill series come from the database and
-    cover every process."""
+    """Prometheus text format; 404 unless MILES_METRICS is set. Retry, wait, and
+    cache series are this process's; the rest come from the database."""
     if not metrics.enabled():
         raise HTTPException(status_code=404)
-    conn = db.connect()
-    try:
+    with db.connection() as conn:
         body = metrics.render(database_samples(conn))
-    finally:
-        conn.close()
     return PlainTextResponse(body, media_type=_TEXT_FORMAT)

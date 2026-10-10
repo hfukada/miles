@@ -1,23 +1,19 @@
 """Geofabrik's region index and the choice of which regional extract covers an
 area.
 
-Geofabrik publishes `index-v1.json`, a GeoJSON FeatureCollection with one
-feature per downloadable region: its id, parent, `urls.pbf`, and its boundary
-polygon. The file is large and changes rarely, so it is fetched once, stored
-gzipped in the database, and refreshed at most every INDEX_MAX_AGE_DAYS with a
-conditional GET (a stale copy keeps serving if the refresh fails).
+Geofabrik's `index-v1.json` is a GeoJSON FeatureCollection with one feature
+per downloadable region (id, parent, `urls.pbf`, boundary polygon). It is
+fetched once, stored gzipped in the database, and refreshed at most every
+INDEX_MAX_AGE_DAYS with a conditional GET (a stale copy keeps serving if the
+refresh fails).
 
-Region choice is the cheapest way to cover the area's box: the smallest region
-whose boundary contains it, or, when several smaller regions together cover
-it for less ground than that region, the smallest such set. Regions nest (a
-state sits inside a country inside a continent), so an area straddling two
-states is contained only by their parent, which can be a multi-gigabyte
-extract; the two states are the better choice whenever their polygons cover
-the area. Areas are compared by polygon area in degrees squared, a stand-in
-for extract size (the index carries no sizes). Containment and coverage are
-tested on sample points of the box against the region's polygons with a plain
-ray-casting test: it can miss a boundary notch that falls between sample
-points, and costs no geometry dependency.
+Region choice is the cheapest cover of the area's box: the smallest region
+whose boundary contains it, or a smaller set of regions that together cover
+it for less ground. Regions nest, so an area straddling two states is
+contained only by their parent, possibly a multi-gigabyte extract. Size is
+compared by polygon area in degrees squared, since the index carries no file
+sizes. Containment and coverage use sample points of the box and a plain
+ray-casting test, which can miss a boundary notch between sample points.
 """
 
 import difflib
@@ -33,7 +29,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
-from . import http_client
+from . import http_client, tiles
 
 GEOFABRIK_BASE_URL = os.environ.get("MILES_GEOFABRIK_URL", "https://download.geofabrik.de")
 
@@ -134,8 +130,7 @@ def _area(region: Region) -> float:
 
 
 def _memoized_area() -> Callable[[Region], float]:
-    """_area with results kept by region path, for one search over a fixed
-    list of regions (a region's polygons make it unhashable)."""
+    """_area memoized by region path (a Region is unhashable)."""
     cache: dict[str, float] = {}
 
     def area(region: Region) -> float:
@@ -146,21 +141,28 @@ def _memoized_area() -> Callable[[Region], float]:
     return area
 
 
-def _sample_points(bbox: tuple[float, float, float, float]) -> list[tuple[float, float]]:
+def _grid_points(bbox: tuple[float, float, float, float], n: int) -> list[tuple[float, float]]:
+    """An n-by-n lattice over bbox, corners and edges included."""
     south, west, north, east = bbox
-    mid_lat, mid_lng = (south + north) / 2.0, (west + east) / 2.0
+    steps = n - 1
     return [
-        (south, west), (south, east), (north, west), (north, east),
-        (south, mid_lng), (north, mid_lng), (mid_lat, west), (mid_lat, east),
-        (mid_lat, mid_lng),
+        (south + (north - south) * i / steps, west + (east - west) * j / steps)
+        for i in range(n)
+        for j in range(n)
     ]
 
 
-def _contains(region: Region, points: list[tuple[float, float]]) -> bool:
+def _covered(region: Region, points: list[tuple[float, float]]) -> frozenset[int]:
     south, west, north, east = region.bbox
-    if not all(south <= lat <= north and west <= lng <= east for lat, lng in points):
-        return False
-    return all(any(_in_polygon(lat, lng, polygon) for polygon in region.polygons) for lat, lng in points)
+    return frozenset(
+        i
+        for i, (lat, lng) in enumerate(points)
+        if south <= lat <= north and west <= lng <= east and any(_in_polygon(lat, lng, p) for p in region.polygons)
+    )
+
+
+def _contains(region: Region, points: list[tuple[float, float]]) -> bool:
+    return len(_covered(region, points)) == len(points)
 
 
 def _segment_meets_box(a: tuple[float, float], b: tuple[float, float], box: tuple[float, float, float, float]) -> bool:
@@ -187,14 +189,12 @@ def _segment_meets_box(a: tuple[float, float], b: tuple[float, float], box: tupl
 
 
 def intersects(region: Region, bbox: tuple[float, float, float, float]) -> bool:
-    """Whether region's polygon and bbox share any point, a shared border
-    included: a way crossing a border can be fuller in the neighbouring
-    region's file, so a tile on the border needs both. True when a
-    polygon edge meets the box or the box's center is inside the polygon (the
-    box lies wholly inside it)."""
+    """Whether region's polygon and bbox share any point, border included: a
+    way crossing a border can be fuller in the neighbour's file, so a border
+    tile needs both. True when a polygon edge meets the box or its center is
+    inside the polygon."""
     south, west, north, east = bbox
-    r_south, r_west, r_north, r_east = region.bbox
-    if not (r_south <= north and r_north >= south and r_west <= east and r_east >= west):
+    if not tiles.bbox_overlaps(region.bbox, bbox):
         return False
     center = ((south + north) / 2.0, (west + east) / 2.0)
     for polygon in region.polygons:
@@ -207,41 +207,22 @@ def intersects(region: Region, bbox: tuple[float, float, float, float]) -> bool:
 
 
 def contains_bbox(region: Region, bbox: tuple[float, float, float, float]) -> bool:
-    """Whether region's polygon contains bbox, judged at its corners, edge
-    midpoints, and centre."""
-    return _contains(region, _sample_points(bbox))
+    """Whether region's polygon contains bbox's corners, edge midpoints, and centre."""
+    return _contains(region, _grid_points(bbox, _CONTAIN_GRID))
 
 
 def smallest_containing(regions: list[Region], bbox: tuple[float, float, float, float]) -> Region | None:
-    points = _sample_points(bbox)
+    points = _grid_points(bbox, _CONTAIN_GRID)
     containing = [r for r in regions if _contains(r, points)]
     return min(containing, key=_area) if containing else None
 
 
-# A covering set is searched exactly over the sample points of a finer grid
-# than containment uses, among at most this many regions at a time.
+# Containment samples a coarse lattice of the box; a covering set is searched
+# exactly over a finer one.
+_CONTAIN_GRID = 3
 _COVER_GRID = 5
 MAX_COVER_REGIONS = 4
 _MAX_COVER_CANDIDATES = 24
-
-
-def _grid_points(bbox: tuple[float, float, float, float]) -> list[tuple[float, float]]:
-    south, west, north, east = bbox
-    steps = _COVER_GRID - 1
-    return [
-        (south + (north - south) * i / steps, west + (east - west) * j / steps)
-        for i in range(_COVER_GRID)
-        for j in range(_COVER_GRID)
-    ]
-
-
-def _covered(region: Region, points: list[tuple[float, float]]) -> frozenset[int]:
-    south, west, north, east = region.bbox
-    return frozenset(
-        i
-        for i, (lat, lng) in enumerate(points)
-        if south <= lat <= north and west <= lng <= east and any(_in_polygon(lat, lng, p) for p in region.polygons)
-    )
 
 
 def covering_set(
@@ -251,16 +232,13 @@ def covering_set(
     smaller_than: float | None = None,
     area: Callable[[Region], float] | None = None,
 ) -> list[Region] | None:
-    """The set of at most MAX_COVER_REGIONS regions whose polygons together
-    cover every sample point of bbox with the least total area (fewest regions
-    on a tie), or None when no such set exists. Regions covering nothing the
-    others do not, or covering a subset of a region that is no larger, are
-    never worth choosing and are dropped before the search. With smaller_than,
-    regions of that area or more are dropped too: a set containing one cannot
-    total less than a single region of that area. area is a memoized _area to
-    share with the caller."""
+    """At most MAX_COVER_REGIONS regions whose polygons together cover every
+    sample point of bbox with the least total area (fewest regions on a tie),
+    or None. Regions that cover a subset of a no-larger region are dropped
+    before the search; with smaller_than, so are regions of that area or more,
+    since a set containing one can't total less. area is a shared memoized _area."""
     area = area or _memoized_area()
-    points = _grid_points(bbox)
+    points = _grid_points(bbox, _COVER_GRID)
     everything = frozenset(range(len(points)))
     best_by_cover: dict[frozenset[int], Region] = {}
     for region in regions:
@@ -288,8 +266,7 @@ def covering_set(
 
 def cheapest_cover(regions: list[Region], bbox: tuple[float, float, float, float]) -> list[Region] | None:
     """The regions to download for bbox: the smallest containing region, unless
-    a covering set of smaller regions totals less ground, in which case that
-    set. None when nothing covers bbox."""
+    a set of smaller ones totals less ground. None when nothing covers bbox."""
     area = _memoized_area()
     single = smallest_containing(regions, bbox)
     cover = covering_set(regions, bbox, smaller_than=area(single) if single is not None else None, area=area)
@@ -301,8 +278,7 @@ def cheapest_cover(regions: list[Region], bbox: tuple[float, float, float, float
 
 
 def covering_children(regions: list[Region], parent: str, bbox: tuple[float, float, float, float]) -> list[Region] | None:
-    """The regions nested under parent's path that cover bbox, or None when
-    they do not."""
+    """The regions nested under parent's path that cover bbox, or None."""
     prefix = parent.rstrip("/") + "/"
     return covering_set([r for r in regions if r.path.startswith(prefix)], bbox)
 
@@ -372,9 +348,8 @@ def _refresh(conn: sqlite3.Connection, row: sqlite3.Row | None) -> sqlite3.Row:
 
 
 def regions(conn: sqlite3.Connection) -> list[Region]:
-    """Every region in the index, fetching or refreshing it when the stored
-    copy is missing or older than INDEX_MAX_AGE_DAYS. A refresh that fails
-    leaves the stale copy in use."""
+    """Every region in the index, fetched or refreshed when missing or older
+    than INDEX_MAX_AGE_DAYS; a failed refresh keeps the stale copy."""
     row = _load(conn)
     if row is None or not _is_fresh(row):
         try:
@@ -386,8 +361,7 @@ def regions(conn: sqlite3.Connection) -> list[Region]:
 
 
 def cached_regions(conn: sqlite3.Connection) -> list[Region] | None:
-    """The stored index of any age, or None when it has never been fetched.
-    Never touches the network."""
+    """The stored index of any age, or None if never fetched. No network."""
     row = _load(conn)
     return _regions_of(row) if row is not None else None
 
@@ -409,9 +383,8 @@ def check_region(known: list[Region], region: str) -> None:
 
 
 def validate_region(conn: sqlite3.Connection, region: str) -> None:
-    """Refuse a region path the index does not list. With no index stored and
-    none fetchable, the path is accepted unchecked and a bad one surfaces as
-    the download's 404."""
+    """Refuse a region path the index does not list. With no index available the
+    path is accepted and a bad one surfaces as the download's 404."""
     try:
         known = regions(conn)
     except RegionError:
@@ -435,7 +408,6 @@ def choose_regions(conn: sqlite3.Connection, bbox: tuple[float, float, float, fl
 
 
 def choose_cached_regions(conn: sqlite3.Connection, bbox: tuple[float, float, float, float]) -> list[str] | None:
-    """choose_regions from the stored index alone, None when there is no stored
-    index or nothing covers bbox."""
+    """choose_regions from the stored index alone; None without one or a cover."""
     known = cached_regions(conn)
     return _cover_paths(known, bbox) if known is not None else None

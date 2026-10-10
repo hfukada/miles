@@ -15,9 +15,9 @@ from pathlib import Path
 import pytest
 import requests
 from fastapi.testclient import TestClient
-from helpers import insert_activity
+from helpers import FakeStravaSession, insert_activity
 
-from miles import api, db, errors, mcp_server, strava_client, terrain_api, terrain_backfill
+from miles import api, db, mcp_server, strava_client, terrain_api, terrain_backfill
 from miles.sync import SyncProgress
 
 SECRET = "FAKE-SECRET-123"
@@ -26,39 +26,20 @@ ACCESS = "FAKE-ACCESS-789"
 SECRETS = (SECRET, REFRESH, ACCESS)
 
 
-class _TokenResponse:
-    ok = True
-    status_code = 200
-
-    def json(self) -> dict[str, object]:
-        return {"access_token": ACCESS, "refresh_token": REFRESH, "expires_at": 4_000_000_000}
-
-
-class _FailingSession:
+def _failing_session(fail_on: str) -> FakeStravaSession:
     """Fails the token request or the API call, naming the credentials in the
     message the way requests does."""
-
-    def __init__(self, fail_on: str) -> None:
-        self.fail_on = fail_on
-
-    def mount(self, *args: object) -> None:
-        pass
-
-    def post(self, url: str, **kwargs: object) -> _TokenResponse:
-        if self.fail_on == "token":
-            raise requests.exceptions.ProxyError(
-                f"HTTPSConnectionPool(host='www.strava.com'): Max retries exceeded with url: "
-                f"/oauth/token?client_id=1&client_secret={SECRET}&refresh_token={REFRESH}&grant_type=refresh_token"
-            )
-        return _TokenResponse()
-
-    def get(self, url: str, **kwargs: object) -> None:
-        raise requests.exceptions.ConnectionError(
+    return FakeStravaSession(
+        {"access_token": ACCESS, "refresh_token": REFRESH, "expires_at": 4_000_000_000},
+        token_error=requests.exceptions.ProxyError(
+            f"HTTPSConnectionPool(host='www.strava.com'): Max retries exceeded with url: "
+            f"/oauth/token?client_id=1&client_secret={SECRET}&refresh_token={REFRESH}&grant_type=refresh_token"
+        ) if fail_on == "token" else None,
+        api_error=requests.exceptions.ConnectionError(
             f"HTTPSConnectionPool(host='www.strava.com'): Max retries exceeded with url: "
             f"/api/v3/athlete/activities?access_token={ACCESS}&per_page=200"
-        )
-
-    put = delete = get
+        ),
+    )
 
 
 @pytest.fixture
@@ -74,8 +55,8 @@ def failing_strava(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("STRAVA_CLIENT_ID", "1")
     monkeypatch.setenv("STRAVA_CLIENT_SECRET", SECRET)
     monkeypatch.setenv("STRAVA_REFRESH_TOKEN", REFRESH)
-    monkeypatch.setattr(strava_client, "_http_session", lambda: _FailingSession(request.param))
-    monkeypatch.setattr(strava_client, "_api_session", lambda token: _FailingSession(request.param))
+    monkeypatch.setattr(strava_client, "_http_session", lambda: _failing_session(request.param))
+    monkeypatch.setattr(strava_client, "_api_session", lambda token: _failing_session(request.param))
     return request.param
 
 
@@ -124,18 +105,3 @@ def test_a_failing_strava_request_leaks_no_credential(
     for surface in surfaces:
         for secret in SECRETS:
             assert secret not in surface
-
-
-def test_describe_error_redacts_credential_pairs() -> None:
-    error = RuntimeError("GET /x?access_token=abc123&per_page=2 and client_secret=s3cret refresh_token='r1' code=zz")
-    text = errors.describe_error(error)
-    for leaked in ("abc123", "s3cret", "r1'", "zz"):
-        assert leaked not in text
-    assert "per_page=2" in text
-
-
-def test_describe_error_cuts_after_redacting() -> None:
-    error = RuntimeError("x" * 190 + " access_token=abcdefghijklmnop")
-    text = errors.describe_error(error)
-    assert len(text) <= errors.MAX_LENGTH
-    assert "abcdefghi" not in text

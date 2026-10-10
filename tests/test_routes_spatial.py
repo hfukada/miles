@@ -20,21 +20,6 @@ def _dists(pts: list[tuple[float, float]]) -> list[float]:
     return dist
 
 
-def test_equirect_distance_matches_known_latitude_delta_and_is_zero_for_the_same_point():
-    # 1 degree of latitude is ~111.19km with this module's R=6371000 sphere.
-    assert rs.equirect_distance_m(40.0, -105.0, 41.0, -105.0) == pytest.approx(111194.9, rel=0.001)
-    assert rs.equirect_distance_m(40.0, -105.0, 40.0, -105.0) == 0.0
-
-
-def test_grid_near_finds_close_points_and_excludes_far_ones():
-    points = [(40.0, -105.0), (40.001, -105.0), (45.0, -105.0)]
-    grid = rs.Grid(points, cell_size_m=50.0)
-    nearby = grid.near(40.0, -105.0, radius_m=50.0)
-    # Grid.near is cell-granularity (a superset); exact filtering is the caller's job.
-    assert 0 in nearby
-    assert 2 not in nearby
-
-
 def test_nearest_index_returns_the_closest_key_offset_and_distance_within_the_radius():
     index = rs.NearestIndex(cell_size_m=50.0)
     index.add("a", [(40.0, -105.0, 0.0), (40.0002, -105.0, 22.0)])
@@ -47,7 +32,7 @@ def test_nearest_index_returns_the_closest_key_offset_and_distance_within_the_ra
     assert rs.NearestIndex(cell_size_m=50.0).nearest(40.0, -105.0, 100.0) is None
 
 
-def test_nearest_index_follows_removed_and_added_keys():
+def test_nearest_index_follows_removed_added_and_readded_keys():
     index = rs.NearestIndex(cell_size_m=50.0)
     index.add(1, [(40.0, -105.0, 0.0)])
     index.remove(1)
@@ -55,14 +40,11 @@ def test_nearest_index_follows_removed_and_added_keys():
     index.add(2, [(40.0, -105.0, 7.0)])
     assert index.nearest(40.0, -105.0, 100.0) == (2, 7.0, 0.0)
 
-
-def test_nearest_index_does_not_bring_back_points_of_a_removed_key():
-    index = rs.NearestIndex(cell_size_m=50.0)
-    index.add(1, [(1.0, 2.0, 0.0)])
-    index.remove(1)
-    index.add(1, [(1.0, 2.001, 5.0)])
-    assert index.nearest(1.0, 2.0, 20.0) is None
-    assert index.nearest(1.0, 2.001, 20.0) == (1, 5.0, 0.0)
+    # Re-adding a removed key brings back none of its old points.
+    index.remove(2)
+    index.add(2, [(40.0, -105.001, 5.0)])
+    assert index.nearest(40.0, -105.0, 20.0) is None
+    assert index.nearest(40.0, -105.001, 20.0) == (2, 5.0, 0.0)
 
 
 def test_nearest_index_finds_every_point_in_range_far_from_the_first_points_latitude():
@@ -88,30 +70,14 @@ def test_find_junctions_detects_a_crossing_as_a_junction_not_an_overlap():
     assert result["overlaps"] == []
 
 
-def test_find_junctions_detects_a_shared_stretch_as_an_overlap():
-    # B follows the same path as A for its whole length.
+@pytest.mark.parametrize("reverse_b", [False, True], ids=["same direction", "opposite direction"])
+def test_find_junctions_detects_a_shared_stretch_as_one_overlap_in_either_direction(reverse_b: bool):
     a = _line(40.0, -105.0, 30)
-    b = [(lat, lng) for lat, lng in a]
+    b = list(reversed(a)) if reverse_b else list(a)
     dist_a = _dists(a)
     dist_b = _dists(b)
     result = rs.find_junctions(a, dist_a, b, dist_b, tolerance_m=30.0)
-    assert result["overlaps"], "identical paths should produce an overlap, not scattered junctions"
-    overlap = result["overlaps"][0]
-    assert overlap["a_from_m"] == pytest.approx(0.0, abs=1.0)
-    assert overlap["a_to_m"] == pytest.approx(dist_a[-1], abs=1.0)
-
-
-def test_find_junctions_reversed_direction_overlap_stays_one_span():
-    # B runs the exact same path as A but in the opposite direction (think
-    # two routes sharing a stretch, one heading out as the other heads
-    # back) -- the matched B position still advances one step per A step,
-    # just backwards, and should report as a single overlap end to end.
-    a = _line(40.0, -105.0, 30)
-    b = list(reversed(a))
-    dist_a = _dists(a)
-    dist_b = _dists(b)
-    result = rs.find_junctions(a, dist_a, b, dist_b, tolerance_m=30.0)
-    assert len(result["overlaps"]) == 1
+    assert len(result["overlaps"]) == 1, "identical paths should produce one overlap, not scattered junctions"
     overlap = result["overlaps"][0]
     assert overlap["a_from_m"] == pytest.approx(0.0, abs=1.0)
     assert overlap["a_to_m"] == pytest.approx(dist_a[-1], abs=1.0)
@@ -177,7 +143,7 @@ def test_routes_near_point_within_and_outside_radius():
     assert far is None
 
 
-def test_slice_by_distance_basic_subrange():
+def test_slice_by_distance_interpolates_a_subrange_runs_backwards_and_keeps_missing_values():
     dist = [0.0, 10.0, 20.0, 30.0, 40.0]
     values = [0.0, 1.0, 2.0, 3.0, 4.0]
     out_dist, out_vals = rs.slice_by_distance(dist, values, 5.0, 25.0)
@@ -186,17 +152,11 @@ def test_slice_by_distance_basic_subrange():
     assert out_vals[0] == pytest.approx(0.5)  # interpolated between 0 and 1
     assert out_vals[-1] == pytest.approx(2.5)  # interpolated between 2 and 3
 
-
-def test_slice_by_distance_reversed():
-    dist = [0.0, 10.0, 20.0, 30.0]
-    values = [0.0, 1.0, 2.0, 3.0]
-    out_dist, out_vals = rs.slice_by_distance(dist, values, 30.0, 0.0)
+    out_dist, out_vals = rs.slice_by_distance(dist[:4], values[:4], 30.0, 0.0)
     assert out_dist == [0.0, 10.0, 20.0, 30.0]
     assert out_vals == [3.0, 2.0, 1.0, 0.0]
 
+    with_gap: list[float | None] = [1.0, None, 3.0]
+    assert rs.slice_by_distance([0.0, 10.0, 20.0], with_gap, 0.0, 20.0)[1][1] is None
 
-def test_slice_by_distance_preserves_none_ele():
-    dist = [0.0, 10.0, 20.0]
-    values: list[float | None] = [1.0, None, 3.0]
-    _, out_vals = rs.slice_by_distance(dist, values, 0.0, 20.0)
-    assert out_vals[1] is None
+

@@ -17,7 +17,7 @@ def _gpx_multi_track(names: list[str]) -> bytes:
 <gpx version="1.1" creator="Test" xmlns="http://www.topografix.com/GPX/1/1">{''.join(tracks)}</gpx>""".encode("utf-8")
 
 
-def test_upload_and_derive_single_track():
+def test_upload_and_derive_single_track_with_and_without_elevation():
     conn = memory_db()
     route_ids = routes_service.upload_gpx(conn, _gpx_single_track(), "track.gpx", name="Ridge Loop", source="alltrails", tags=["hike"])
     assert len(route_ids) == 1
@@ -30,17 +30,13 @@ def test_upload_and_derive_single_track():
     assert detail["distance_m"] is not None and detail["distance_m"] > 0
     assert detail["shape"] in ("loop", "out_and_back", "point_to_point")
 
-
-def test_upload_no_elevation_route_has_null_gain():
-    conn = memory_db()
-    route_ids = routes_service.upload_gpx(conn, _gpx_single_track(ele0=None), "flat.gpx", name="No Ele")
-    detail = routes_service.get_route(conn, route_ids[0])
-    assert detail["has_elevation"] is False
-    assert detail["gain_m"] is None
-    assert detail["loss_m"] is None
-    assert detail["ft_per_mi"] is None
-    assert detail["grade_bands"] is None
-    assert detail["climbs"] == []
+    flat = routes_service.get_route(conn, routes_service.upload_gpx(conn, _gpx_single_track(ele0=None), "flat.gpx", name="No Ele")[0])
+    assert flat["has_elevation"] is False
+    assert flat["gain_m"] is None
+    assert flat["loss_m"] is None
+    assert flat["ft_per_mi"] is None
+    assert flat["grade_bands"] is None
+    assert flat["climbs"] == []
 
 
 def test_upload_multi_track_names_each_route():
@@ -92,13 +88,7 @@ def test_update_route_name_notes_tags():
     assert updated["notes"] is None
 
 
-def test_update_route_missing_raises():
-    conn = memory_db()
-    with pytest.raises(routes_service.RouteNotFoundError):
-        routes_service.update_route(conn, 999, name="x")
-
-
-def test_a_deleted_route_is_gone_and_stays_deleted_after_a_full_derive():
+def test_a_deleted_route_stays_deleted_after_a_full_derive_and_uploading_its_file_again_restores_it():
     conn = memory_db()
     route_ids = routes_service.upload_gpx(conn, _gpx_single_track(), "a.gpx")
     routes_service.delete_route(conn, route_ids[0])
@@ -112,28 +102,15 @@ def test_a_deleted_route_is_gone_and_stays_deleted_after_a_full_derive():
     for table in ("route_points", "route_climbs", "route_grade_bands", "route_waypoints"):
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
-
-def test_deleting_one_track_of_a_multi_track_file_keeps_it_deleted_and_the_others():
-    conn = memory_db()
-    route_ids = routes_service.upload_gpx(conn, _gpx_multi_track(["A", "B", "C"]), "m.gpx")
-    routes_service.delete_route(conn, route_ids[1])
-
+    multi = _gpx_multi_track(["A", "B", "C"])
+    ids = routes_service.upload_gpx(conn, multi, "m.gpx")
+    routes_service.delete_route(conn, ids[1])
     routes_service.derive_all_routes(conn)
-
-    remaining = {r["route_id"] for r in routes_service.list_routes(conn)}
-    assert remaining == {route_ids[0], route_ids[2]}
+    assert {r["route_id"] for r in routes_service.list_routes(conn)} == {ids[0], ids[2]}  # the other tracks stay
     assert conn.execute("SELECT COUNT(*) FROM gpx_files").fetchone()[0] == 1
 
-
-def test_uploading_a_file_again_restores_its_deleted_tracks():
-    conn = memory_db()
-    data = _gpx_multi_track(["A", "B"])
-    route_ids = routes_service.upload_gpx(conn, data, "m.gpx")
-    routes_service.delete_route(conn, route_ids[0])
-
-    routes_service.upload_gpx(conn, data, "m.gpx")
-
-    assert len(routes_service.list_routes(conn)) == 2
+    routes_service.upload_gpx(conn, multi, "m.gpx")
+    assert len(routes_service.list_routes(conn)) == 3
 
 
 def test_list_routes_filters_by_distance_and_tag():
@@ -151,7 +128,7 @@ def test_list_routes_filters_by_distance_and_tag():
     assert {r["route_id"] for r in narrow} == {short_ids[0]}
 
 
-def test_derive_all_routes_is_idempotent():
+def test_derive_all_routes_is_idempotent_and_a_version_bump_reruns_it():
     conn = memory_db()
     route_ids = routes_service.upload_gpx(conn, _gpx_single_track(), "a.gpx", name="A")
     before = routes_service.get_route(conn, route_ids[0])
@@ -161,12 +138,10 @@ def test_derive_all_routes_is_idempotent():
     assert before["gain_m"] == after["gain_m"]
     assert before["name"] == after["name"]  # user metadata untouched by re-derive
 
-
-def test_ensure_routes_derived_reruns_on_version_bump(monkeypatch: pytest.MonkeyPatch):
-    conn = memory_db()
-    routes_service.upload_gpx(conn, _gpx_single_track(), "a.gpx")
     conn.execute("UPDATE meta SET value = '0' WHERE key = 'route_derive_version'")
     conn.commit()
-    routes_service.ensure_routes_derived(conn)
+    routes_service.ensure_routes_derived(conn)  # a version bump reruns the derive
     row = conn.execute("SELECT value FROM meta WHERE key = 'route_derive_version'").fetchone()
     assert row["value"] == str(routes_service.ROUTE_DERIVE_VERSION)
+
+

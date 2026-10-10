@@ -10,44 +10,8 @@
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
   <style>
-    .route-view h1 {
-      font-size: 1.25rem;
-      font-weight: 650;
-      letter-spacing: -0.02em;
-      margin-bottom: 0.25rem;
-    }
-    .route-view .subtitle { font-size: 0.8125rem; color: var(--muted); margin-bottom: 0.75rem; }
-    .route-view .loading, .route-view .error { font-size: 0.8125rem; color: var(--muted); padding: 1rem 0; }
+    .route-view .subtitle { margin-bottom: 0.75rem; }
     .route-view .note { font-size: 0.75rem; color: var(--muted); font-style: italic; margin-bottom: 1rem; }
-
-    .route-view .stat-strip {
-      display: flex;
-      flex-wrap: wrap;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      margin-bottom: 1.5rem;
-    }
-    .route-view .stat { padding: 0.625rem 1.25rem; }
-    .route-view .stat + .stat { border-left: 1px solid var(--border); }
-    .route-view .stat-label {
-      font-size: 0.625rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--muted);
-      margin-bottom: 0.1875rem;
-    }
-    .route-view .stat-value {
-      display: flex;
-      align-items: baseline;
-      gap: 0.375rem;
-      font-size: 1.0625rem;
-      font-weight: 700;
-      font-variant-numeric: tabular-nums;
-      color: var(--text);
-    }
-    .route-view .stat-sub { font-size: 0.6875rem; font-weight: 400; color: var(--muted); }
 
     .route-view .chart-panel {
       background: var(--surface);
@@ -77,7 +41,7 @@
 <script src="/charts.js"></script>
 <script src="/map.js"></script>
 
-<main class="route-view">
+<main class="route-view page-view">
   <div id="root">Loading…</div>
 </main>
 
@@ -127,9 +91,9 @@
   }
 
   function render(route, profilePoints, terrainPoints, score) {
-    const distMi = route.distance_m != null ? (route.distance_m / 1609.344).toFixed(2) : '—';
-    const gainFt = route.gain_m != null ? Math.round(route.gain_m * 3.28084) : null;
-    const lossFt = route.loss_m != null ? Math.round(route.loss_m * 3.28084) : null;
+    const distMi = route.distance_m != null ? (route.distance_m / MILE_METERS).toFixed(2) : '—';
+    const gainFt = route.gain_m != null ? Math.round(route.gain_m * FT_PER_METER) : null;
+    const lossFt = route.loss_m != null ? Math.round(route.loss_m * FT_PER_METER) : null;
     const hasElevation = !!route.has_elevation;
 
     root.innerHTML = `
@@ -169,29 +133,20 @@
   function renderStats(route, gainFt, lossFt, score) {
     const strip = document.getElementById('stat-strip');
     const tiles = [
-      stat('Gain', gainFt != null ? gainFt : '—', 'ft'),
-      stat('Loss', lossFt != null ? lossFt : '—', 'ft'),
+      statTile('Gain', gainFt != null ? gainFt : '—', 'ft'),
+      statTile('Loss', lossFt != null ? lossFt : '—', 'ft'),
     ];
     if (score?.runnability) {
       const r = score.runnability;
       tiles.push(
-        stat('Run', r.run_pct.toFixed(0), '%'),
-        stat('Grind', r.grind_pct.toFixed(0), '%'),
-        stat('Hike', r.hike_pct.toFixed(0), '%'),
-        stat('Longest Hike', (r.longest_hike_m / 1609.344).toFixed(2), 'mi'),
-        stat('Steep Descent', (r.steep_descent_m / 1609.344).toFixed(2), 'mi'),
+        statTile('Run', r.run_pct.toFixed(0), '%'),
+        statTile('Grind', r.grind_pct.toFixed(0), '%'),
+        statTile('Hike', r.hike_pct.toFixed(0), '%'),
+        statTile('Longest Hike', (r.longest_hike_m / MILE_METERS).toFixed(2), 'mi'),
+        statTile('Steep Descent', (r.steep_descent_m / MILE_METERS).toFixed(2), 'mi'),
       );
     }
     strip.innerHTML = tiles.join('');
-  }
-
-  function stat(label, value, sub) {
-    return `
-      <div class="stat">
-        <div class="stat-label">${label}</div>
-        <div class="stat-value">${value}${sub ? `<span class="stat-sub">${sub}</span>` : ''}</div>
-      </div>
-    `;
   }
 
   // Groups consecutive points sharing a class into one polyline segment,
@@ -253,7 +208,7 @@
     }
     const theme = chartTheme();
     const clsByIdx = new Map(terrainPoints.map(p => [p.idx, p.cls]));
-    const data = profilePoints.map(p => [p.dist_m / 1609.344, p.ele_m != null ? p.ele_m * 3.28084 : null]);
+    const data = profilePoints.map(p => [p.dist_m / MILE_METERS, p.ele_m != null ? p.ele_m * FT_PER_METER : null]);
 
     // markArea bands colored by class, spanning each contiguous run's
     // distance range, drawn under a single neutral elevation line.
@@ -262,11 +217,11 @@
     for (const p of profilePoints) {
       const cls = clsByIdx.get(p.idx) ?? null;
       if (!current || current.cls !== cls) {
-        if (current) current.end = p.dist_m / 1609.344;
-        current = { cls, start: p.dist_m / 1609.344, end: p.dist_m / 1609.344 };
+        if (current) current.end = p.dist_m / MILE_METERS;
+        current = { cls, start: p.dist_m / MILE_METERS, end: p.dist_m / MILE_METERS };
         distBands.push(current);
       } else {
-        current.end = p.dist_m / 1609.344;
+        current.end = p.dist_m / MILE_METERS;
       }
     }
 
@@ -281,33 +236,18 @@
     elevChart.setOption({
       animation: false,
       grid: { top: 12, right: 24, bottom: 32, left: 56 },
-      tooltip: {
-        trigger: 'axis',
-        backgroundColor: theme.surface,
-        borderColor: theme.gridline,
-        textStyle: { fontSize: 12, color: theme.text },
-        formatter(items) {
-          if (!items.length) return '';
-          const v = items[0].data[1];
-          return `${items[0].axisValue.toFixed(2)} mi<br>${v != null ? Math.round(v) : '—'} ft`;
-        },
-      },
-      xAxis: {
-        type: 'value',
+      tooltip: chartAxisTooltip(theme, (items) => {
+        if (!items.length) return '';
+        const v = items[0].data[1];
+        return `${items[0].axisValue.toFixed(2)} mi<br>${v != null ? Math.round(v) : '—'} ft`;
+      }),
+      xAxis: chartValueAxis(theme, {
         name: 'mi',
         min: 0,
-        nameTextStyle: { color: theme.muted, fontSize: 10 },
-        axisLabel: { color: theme.muted, fontSize: 10 },
         axisLine: { lineStyle: { color: theme.gridline } },
         splitLine: { show: false },
-      },
-      yAxis: {
-        type: 'value',
-        name: 'ft',
-        nameTextStyle: { color: theme.muted, fontSize: 10 },
-        axisLabel: { color: theme.muted, fontSize: 10 },
-        splitLine: { lineStyle: { color: theme.gridline, opacity: 0.4 } },
-      },
+      }),
+      yAxis: chartValueAxis(theme, { name: 'ft' }),
       series: [{
         name: 'Elevation',
         type: 'line',
@@ -324,7 +264,7 @@
     const bins = [...gap.bins].sort((a, b) => a.lo_pct - b.lo_pct);
     const rows = bins.map(b => `
       <tr>
-        <td>${b.lo_pct <= -999 ? `< ${b.hi_pct.toFixed(0)}%` : b.hi_pct >= 999 ? `≥ ${b.lo_pct.toFixed(0)}%` : `${b.lo_pct.toFixed(0)}–${b.hi_pct.toFixed(0)}%`}</td>
+        <td>${gradeBinLabel(b)}</td>
         <td class="r">${(b.course_share * 100).toFixed(1)}%</td>
         <td class="r">${b.deficit != null ? `${(b.deficit * 100).toFixed(0)}%` : '—'}</td>
         <td class="r">${b.weighted_deficit != null ? `${(b.weighted_deficit * 100).toFixed(1)}%` : '—'}</td>

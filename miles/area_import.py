@@ -1,11 +1,8 @@
-"""`miles-area-import`: cut an area's tiles locally out of a regional
-OpenStreetMap extract (a .osm.pbf the operator has on disk) and upload just
-the result to a running miles-api, which finishes the import (elevation
-prefetch + network build) without ever needing the extract itself.
-
-A plain HTTP client, not a direct DB writer, mirroring route_import.py's
-shape: the extract and the miles-api host are often different machines, and
-cutting happens against a throwaway in-memory database, never the host's own.
+"""`miles-area-import`: cut an area's tiles locally out of a .osm.pbf extract
+and upload just the result to a running miles-api, which finishes the import
+without needing the extract. A plain HTTP client (like route_import.py): the
+extract and the API host may be different machines, and cutting uses a
+throwaway in-memory database.
 """
 
 import sqlite3
@@ -33,10 +30,8 @@ def _parse_bbox(value: str) -> tuple[float, float, float, float]:
 def _resolve_bbox_and_center(
     center: str | None, radius_km: float | None, bbox: str | None
 ) -> tuple[tuple[float, float, float, float], float, float, float]:
-    """(bbox, center_lat, center_lng, radius_km) -- radius_km is exact for
-    the --center/--radius-km form, and the bbox's own half-diagonal
-    (an approximation used only for the area row's metadata, never for
-    which tiles get cut) for the --bbox form."""
+    """(bbox, center_lat, center_lng, radius_km). For --bbox the radius is the
+    half-diagonal, used only as area metadata, never to pick tiles."""
     if bbox is not None:
         if center is not None or radius_km is not None:
             raise click.UsageError("--bbox is exclusive of --center/--radius-km")

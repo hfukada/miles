@@ -1,24 +1,20 @@
 """The gate every Strava request passes through.
 
-Strava limits an app to a daily and a 15-minute number of calls and reports
-the remaining allowance on every response. Anything beyond the essential
-"fetch new activities" work (detail for new activities, history backfills)
-stops at a reserve of daily calls, so a later sync the same day can still
-fetch what was recorded in between, and never takes the last few calls of the
-15-minute window.
+Strava reports the remaining daily and 15-minute allowance on every response.
+Anything beyond fetching new activities (detail, history backfills) stops at
+a reserve of daily calls, so a later sync the same day can still fetch new
+activities, and never takes the last calls of the 15-minute window.
 
-The numbers come from the most recent response (strava_client records them),
-aged by the clock: a 15-minute window that has ended reads as whole again, and
-the daily figure is unknown once the UTC date changes. An unknown figure
-never blocks a request.
+The numbers come from the latest response (strava_client), aged by the clock:
+an ended window reads as whole, and the daily figure is unknown once the UTC
+date changes. An unknown figure never blocks a request.
 
-A Gate belongs to one run (a sync, a backfill) or to one page request. It
-refuses a request that would cross a reserve with StravaAllowanceLowError,
-which a background pass catches to stop and an interactive caller reports as
-"not fetched yet". A background gate waits out the 15-minute window instead
-when only that is low. A 429 is waited out once; a second one with nothing
-having succeeded since, or one that the headers say is the daily limit, is
-final and is recorded as the request's outcome.
+A Gate belongs to one run or one page request. It raises
+StravaAllowanceLowError for a request that would cross a reserve (a
+background pass stops; an interactive caller reports "not fetched yet"); a
+background gate waits out the 15-minute window instead when only that is low.
+A 429 is waited out once; a second one with no success since, or one the
+headers say is the daily limit, is final and recorded as the request's outcome.
 """
 
 import os
@@ -79,11 +75,9 @@ class Gate:
         self._waited_for_429 = False
 
     def acquire(self, kind: str, interactive: bool = False) -> None:
-        """Clear one request of `kind` to be made. Raises
-        StravaAllowanceLowError when the daily allowance is at its reserve, or
-        when the 15-minute window is nearly spent and the request is
-        interactive (a page request is never held for a window). Otherwise
-        waits for the next window when it is nearly spent."""
+        """Clear one request of `kind`. Raises StravaAllowanceLowError when the
+        daily allowance is at its reserve, or the 15-minute window is nearly
+        spent and the request is interactive; otherwise waits for the next window."""
         if kind == LISTING_KIND:
             return
         daily = strava_client.daily_calls_remaining()
@@ -97,13 +91,11 @@ class Gate:
             wait_for_next_window(self._on_wait)
 
     def on_429(self, kind: str, interactive: bool = False) -> None:
-        """Handle a 429: wait for the next window and return so the request is
-        repeated, or raise StravaAllowanceLowError when waiting cannot help
-        (the headers say the daily limit is spent, or a wait already bought
-        nothing) or the caller is interactive. The activity listing keeps
-        waiting unless the headers say the daily limit is spent: it restarts
-        from its first page after each wait. The final answer is recorded in
-        the health events."""
+        """Handle a 429: wait and return so the request repeats, or raise
+        StravaAllowanceLowError when waiting cannot help (daily limit spent, or
+        a wait already bought nothing) or the caller is interactive. The
+        activity listing keeps waiting unless the daily limit is spent, since
+        it restarts from its first page. The final answer is recorded as an event."""
         daily = strava_client.daily_calls_remaining()
         if interactive:
             message = "Strava rate limit reached; try again in a few minutes"
@@ -117,9 +109,7 @@ class Gate:
         raise StravaAllowanceLowError(message)
 
     def call(self, kind: str, request: Callable[[], T], *, interactive: bool = False) -> T:
-        """Make one Strava request: acquire, run it, and on a 429 let on_429
-        decide between repeating it and giving up. Other failures pass
-        through."""
+        """Acquire, run the request, and on a 429 let on_429 decide whether to repeat."""
         while True:
             self.acquire(kind, interactive)
             try:

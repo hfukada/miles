@@ -1,6 +1,5 @@
-"""Fixed lat/lng grid for map tiles, so overlapping areas and repeated
-imports share downloads instead of fetching per request. Pure math, no I/O --
-extracts.py cuts and tilecache.py stores the data keyed by these indices.
+"""Fixed lat/lng grid for map tiles, so overlapping areas share cached data.
+Pure math, no I/O.
 """
 
 import math
@@ -12,9 +11,8 @@ EARTH_RADIUS_M = 6371000.0
 
 
 def tile_index(lat: float, lng: float) -> tuple[int, int]:
-    """The (gx, gy) grid cell containing a point. Both floor toward negative
-    infinity so cells tile the plane with no gaps or overlaps at the axes'
-    zero lines."""
+    """The (gx, gy) grid cell containing a point; flooring keeps cells gap-free
+    across zero."""
     return (math.floor(lng / TILE_DEG), math.floor(lat / TILE_DEG))
 
 
@@ -32,11 +30,17 @@ def bbox_overlaps(a: tuple[float, float, float, float], b: tuple[float, float, f
     return a_south <= b_north and a_north >= b_south and a_west <= b_east and a_east >= b_west
 
 
+def bbox_within(inner: tuple[float, float, float, float], outer: tuple[float, float, float, float]) -> bool:
+    """Whether the `inner` (south, west, north, east) box lies inside `outer`."""
+    i_south, i_west, i_north, i_east = inner
+    o_south, o_west, o_north, o_east = outer
+    return o_south <= i_south and o_west <= i_west and o_north >= i_north and o_east >= i_east
+
+
 def bbox_for_center_radius(lat: float, lng: float, radius_km: float) -> tuple[float, float, float, float]:
-    """(south, west, north, east) bounding box of a circle, padded to a square
-    by using the same degrees-latitude delta on both axes scaled by
-    longitude's convergence at this latitude. Callers that need the exact
-    circle (not its bounding square) filter further themselves."""
+    """(south, west, north, east) bounding square of a circle, longitude scaled
+    for convergence at this latitude. Callers needing the exact circle filter
+    further."""
     lat_delta = math.degrees(radius_km * 1000.0 / EARTH_RADIUS_M)
     lng_scale = max(math.cos(math.radians(lat)), 0.01)  # avoid blowup near the poles
     lng_delta = lat_delta / lng_scale
@@ -44,19 +48,15 @@ def bbox_for_center_radius(lat: float, lng: float, radius_km: float) -> tuple[fl
 
 
 def tiles_in_bbox(south: float, west: float, north: float, east: float) -> list[tuple[int, int]]:
-    """Every grid cell whose bounds intersect a bbox, in row-major (gy then
-    gx) order so a fetch loop reads like a scan across the area rather than
-    a random walk."""
+    """Every grid cell intersecting a bbox, in row-major (gy then gx) order."""
     gx0, gy0 = tile_index(south, west)
     gx1, gy1 = tile_index(north, east)
     return [(gx, gy) for gy in range(gy0, gy1 + 1) for gx in range(gx0, gx1 + 1)]
 
 
 def assign_elements(elements: Sequence[dict], tile_ids: Iterable[tuple[int, int]]) -> dict[tuple[int, int], list[dict]]:
-    """Bucket tile-payload elements (ways with inline geometry, point nodes)
-    into the tiles from tile_ids they intersect: a way lands in every tile
-    its geometry's bbox overlaps, a node in the single tile containing its
-    point."""
+    """Bucket elements into the tile_ids they intersect: a way into every tile
+    its geometry's bbox overlaps, a node into the one containing it."""
     tile_id_list = list(tile_ids)
     bounds_by_tile = {t: tile_bounds(*t) for t in tile_id_list}
     buckets: dict[tuple[int, int], list[dict]] = {t: [] for t in tile_id_list}

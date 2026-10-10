@@ -1,6 +1,8 @@
 import logging
 import os
 import sqlite3
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing_extensions import NotRequired, TypedDict
@@ -60,94 +62,6 @@ class ActivityRow(TypedDict):
     start_lat: float | None
     start_lng: float | None
     raw_json: str
-
-
-class GpxFileRow(TypedDict):
-    file_id: int
-    sha256: str
-    filename: str
-    creator: str | None
-    data: bytes
-    uploaded_at: str
-
-
-class RouteRow(TypedDict):
-    route_id: int
-    file_id: int
-    track_index: int
-    kind: str  # 'trk' | 'rte'
-    gpx_name: str | None  # name embedded in the GPX track/route itself
-    name: str | None  # athlete-facing name; defaults from gpx_name at creation
-    source: str | None
-    notes: str | None
-    tags_json: str  # JSON list[str]
-    created_at: str
-    # Derived from gpx_files.data; NULL/None until the first derive pass.
-    derive_version: int | None
-    has_elevation: int | None  # 0/1
-    distance_m: float | None
-    gain_m: float | None
-    loss_m: float | None
-    min_ele_m: float | None
-    max_ele_m: float | None
-    ft_per_mi: float | None
-    bbox_south: float | None
-    bbox_west: float | None
-    bbox_north: float | None
-    bbox_east: float | None
-    start_lat: float | None
-    start_lng: float | None
-    end_lat: float | None
-    end_lng: float | None
-    shape: str | None  # 'loop' | 'out_and_back' | 'point_to_point'
-
-
-class RoutePointRow(TypedDict):
-    route_id: int
-    idx: int
-    lat: float
-    lng: float
-    dist_m: float  # cumulative distance from route start
-    ele_m: float | None  # smoothed; NULL when the route has no elevation
-
-
-class RouteWaypointRow(TypedDict):
-    waypoint_id: int
-    route_id: int
-    name: str | None
-    desc: str | None
-    lat: float
-    lng: float
-    dist_m: float  # snapped distance along the route
-    offset_m: float  # distance from the named point to the route itself
-
-
-class RouteClimbRow(TypedDict):
-    route_id: int
-    idx: int
-    kind: str  # 'climb' | 'descent'
-    start_m: float
-    end_m: float
-    gain_m: float  # magnitude of the elevation change over the segment
-    avg_grade: float
-
-
-class RouteGradeBandRow(TypedDict):
-    route_id: int
-    band: str
-    share: float  # fraction of distance in this band, 0..1
-
-
-class RouteLegRow(TypedDict):
-    route_id: int  # the composed route this leg belongs to
-    idx: int  # order within the composition
-    kind: str  # 'route' | 'connector'
-    leg_route_id: int | None  # the source route, for kind='route'
-    from_m: float | None  # leg's start distance on leg_route_id (kind='route')
-    to_m: float | None  # leg's end distance; from_m > to_m means reversed
-    distance_m: float | None  # leg distance; authored for connectors, derived for routes
-    gain_m: float | None  # authored estimate, for connectors only
-    note: str | None
 
 
 class AthleteRow(TypedDict):
@@ -280,6 +194,17 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     # the first connection. It needs a local filesystem (shared-memory index).
     conn.execute("PRAGMA journal_mode = WAL")
     return conn
+
+
+@contextmanager
+def connection(opener: Callable[[], sqlite3.Connection] | None = None) -> Iterator[sqlite3.Connection]:
+    """A connection from `opener` (default `connect`) that is closed on exit,
+    including when the body raises."""
+    conn = (opener or connect)()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 SCHEMA_VERSION = 3

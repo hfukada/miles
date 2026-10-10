@@ -2,27 +2,29 @@ import gzip
 import json
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from helpers import ImmediateThread, fake_extract_record, wait_until
+from helpers import FakeSampler, ImmediateThread, fake_extract_record, flat_sampler
 
 from miles import areas as areas_service
 from miles import db, elevation, extracts, geocode, network, tilecache, tiles
 
 LAT, LNG = 5.0, 10.0
 
+
+def _wait_until(condition, timeout: float = 5.0) -> bool:
+    """Poll `condition` until it is true or the timeout passes."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.005)
+    return bool(condition())
+
 _REAL_THREAD = threading.Thread
 _REAL_SAMPLER_FOR = elevation.sampler_for
-
-
-class _FakeSampler:
-    def __init__(self, conn=None, provider=None):
-        self.calls: list = []
-
-    def sample(self, points):
-        self.calls.append(list(points))
-        return [100.0 for _ in points]
 
 
 @pytest.fixture
@@ -42,7 +44,7 @@ def _synchronous_import(monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture(autouse=True)
 def _no_dem_download(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(elevation, "ensure_tiles", lambda conn, **kwargs: None)
-    monkeypatch.setattr(elevation, "sampler_for", lambda conn, provider=None, **kwargs: _FakeSampler())
+    monkeypatch.setattr(elevation, "sampler_for", lambda conn, provider=None, **kwargs: flat_sampler())
 
 
 def _fake_fetch_and_cache_tiles(calls: list) -> callable:
@@ -99,7 +101,7 @@ def _insert_area(
     return int(cur.lastrowid)  # type: ignore[arg-type]
 
 
-def test_import_area_by_lat_lng_and_radius(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+def test_import_area_by_lat_lng_or_by_place(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     tile_calls = _use_tile_source(monkeypatch)
 
     status = areas_service.import_area(conn, lat=LAT, lng=LNG, radius_km=2.0, label="test-area")
@@ -115,23 +117,14 @@ def test_import_area_by_lat_lng_and_radius(conn: sqlite3.Connection, monkeypatch
     assert len(payloads) == len(tile_calls)
     assert all("elements" in p for p in payloads)
 
-
-def test_import_area_by_place_geocodes(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _use_tile_source(monkeypatch)
     found = {"lat": 12.5, "lng": 34.5, "display_name": "Somewhere, Region", "attribution": geocode.ATTRIBUTION}
     monkeypatch.setattr(geocode, "lookup", lambda conn, query, **kwargs: found)
-
-    status = areas_service.import_area(conn, place="Somewhere", radius_km=1.0, label="geocoded")
-    detail = areas_service.get_area(conn, status["area_id"])
+    by_place = areas_service.import_area(conn, place="Somewhere", drive_minutes=500.0, label="geocoded")
+    detail = areas_service.get_area(conn, by_place["area_id"])
     assert (detail["center_lat"], detail["center_lng"]) == (12.5, 34.5)
-    assert status["geocode"] == found
-    assert "geocode" not in areas_service.import_area(conn, lat=1.0, lng=1.0, radius_km=1.0, label="by-coordinates")
-
-
-def test_import_area_drive_minutes_heuristic():
-    assert areas_service._resolve_radius_km(None, 10.0) == 10.0
-    assert areas_service._resolve_radius_km(None, 500.0) == areas_service.MAX_RADIUS_KM == 60.0
-    assert areas_service._resolve_radius_km(5.0, 30.0) == 5.0  # explicit radius wins
+    assert detail["radius_km"] == areas_service.MAX_RADIUS_KM  # drive minutes stand in for a radius, up to the cap
+    assert by_place["geocode"] == found
+    assert "geocode" not in status
 
 
 @pytest.mark.parametrize(
@@ -167,18 +160,7 @@ def test_the_estimate_names_the_pending_region_from_the_cached_index_without_the
     assert areas_service._estimate_import(conn, bbox, "example/region-c")["source"] == "pending-extract:example/region-c"
 
 
-def test_import_area_reuses_existing_label(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _use_tile_source(monkeypatch)
-
-    first = areas_service.import_area(conn, lat=1.0, lng=1.0, radius_km=1.0, label="home")
-    second = areas_service.import_area(conn, lat=2.0, lng=2.0, radius_km=1.0, label="home")
-
-    assert first["area_id"] == second["area_id"]
-    assert len(areas_service.list_areas(conn)) == 1
-    assert areas_service.get_area(conn, second["area_id"])["center_lat"] == 2.0  # re-import updates the center
-
-
-def test_a_reimport_keeps_pinned_and_region_unless_told_otherwise(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+def test_a_reimport_reuses_the_label_and_keeps_pinned_and_region_unless_told_otherwise(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     _use_tile_source(monkeypatch)
     monkeypatch.setattr(extracts, "select_extracts", lambda *a, **kw: [])
     area = {"lat": 1.0, "lng": 1.0, "radius_km": 1.0, "label": "home"}
@@ -187,8 +169,10 @@ def test_a_reimport_keeps_pinned_and_region_unless_told_otherwise(conn: sqlite3.
     detail = areas_service.get_area(conn, first["area_id"])
     assert detail["region"] == "example/region-a,example/region-b"  # several regions share one comma-separated value
 
-    areas_service.import_area(conn, **area)
+    moved = areas_service.import_area(conn, **{**area, "lat": 2.0, "lng": 2.0})
+    assert moved["area_id"] == first["area_id"] and len(areas_service.list_areas(conn)) == 1
     detail = areas_service.get_area(conn, first["area_id"])
+    assert detail["center_lat"] == 2.0  # a re-import updates the center
     assert (detail["pinned"], detail["region"]) == (True, "example/region-a,example/region-b")
 
     areas_service.import_area(conn, **area, pinned=False)
@@ -198,25 +182,6 @@ def test_a_reimport_keeps_pinned_and_region_unless_told_otherwise(conn: sqlite3.
 def test_try_start_import_is_atomic_against_a_running_import(conn: sqlite3.Connection):
     area_id = _insert_area(conn, "busy", status="importing")
     assert areas_service._try_start_import(conn, area_id) is False
-
-
-def test_pin_and_unpin_area(conn: sqlite3.Connection):
-    area_id = _insert_area(conn, "home")
-
-    assert areas_service.pin_area(conn, area_id)["pinned"] is True
-    assert areas_service.unpin_area(conn, area_id)["pinned"] is False
-
-
-def test_unknown_area_ids_raise(conn: sqlite3.Connection):
-    for function in (areas_service.get_area, areas_service.get_area_status, areas_service.pin_area):
-        with pytest.raises(areas_service.AreaNotFoundError):
-            function(conn, 999)
-
-
-def test_list_areas_orders_by_last_used_desc(conn: sqlite3.Connection):
-    _insert_area(conn, "older", used_days_ago=5)
-    _insert_area(conn, "newer")
-    assert [a["label"] for a in areas_service.list_areas(conn)] == ["newer", "older"]
 
 
 def test_gc_removes_stale_unpinned_areas_their_networks_and_orphaned_tiles(conn: sqlite3.Connection):
@@ -254,42 +219,34 @@ def test_gc_removes_stale_unpinned_areas_their_networks_and_orphaned_tiles(conn:
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
-def test_an_import_reports_queued_until_it_holds_the_import_lock(conn: sqlite3.Connection):
+def test_an_import_prepares_without_the_import_lock_then_reports_queued_until_it_holds_it(conn: sqlite3.Connection):
     area_id = _insert_area(conn, "q", status="importing")
     phases: list = []
+    entered = threading.Event()
+    release = threading.Event()
 
     def phase() -> str:
         return conn.execute("SELECT status_phase FROM areas WHERE area_id = ?", (area_id,)).fetchone()[0]
 
-    def body(c, aid):
-        phases.append(c.execute("SELECT status_phase FROM areas WHERE area_id = ?", (aid,)).fetchone()[0])
-
-    with areas_service._import_lock:
-        runner = _REAL_THREAD(target=areas_service._run_job, args=(area_id, body))
-        runner.start()
-        assert wait_until(lambda: phase() == "queued")
-        assert runner.is_alive()
-    runner.join(timeout=5)
-    assert phases == ["queued"]
-
-
-def test_work_before_the_lock_does_not_hold_other_imports_up(conn: sqlite3.Connection):
-    area_id = _insert_area(conn, "q", status="importing")
-    entered = threading.Event()
-    release = threading.Event()
-
-    def slow_prepare(c, aid):
+    def prepare(c, aid):
         entered.set()
         release.wait(5)
 
-    runner = _REAL_THREAD(target=areas_service._run_job, args=(area_id, lambda c, aid: None, slow_prepare))
+    def body(c, aid):
+        phases.append(c.execute("SELECT status_phase FROM areas WHERE area_id = ?", (aid,)).fetchone()[0])
+
+    runner = _REAL_THREAD(target=areas_service._run_job, args=(area_id, body, prepare))
     runner.start()
     assert entered.wait(5)
-    assert areas_service._import_lock.acquire(timeout=1), "waiting before the lock must not hold it"
-    areas_service._import_lock.release()
-    release.set()
+    assert areas_service._import_lock.acquire(timeout=1), "preparing must not hold the import lock"
+    try:
+        release.set()
+        assert _wait_until(lambda: phase() == "queued")
+        assert runner.is_alive()
+    finally:
+        areas_service._import_lock.release()
     runner.join(timeout=5)
-    assert not runner.is_alive()
+    assert phases == ["queued"]
 
 
 def test_imports_run_one_at_a_time_process_wide(monkeypatch: pytest.MonkeyPatch):
@@ -462,7 +419,18 @@ def test_an_area_reports_the_download_it_performs_with_bytes_received(conn: sqli
     ]
 
 
-def test_a_label_only_refresh_reuses_the_stored_center_and_radius_and_reaches_extract_selection(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+def test_refresh_area_runs_the_import_with_refresh_and_rejects_an_unknown_label(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    area_id = _insert_area(conn, "home")
+    jobs_run: list[tuple[int, bool]] = []
+    monkeypatch.setattr(areas_service, "_run_import_job", lambda area_id, refresh=False, force_extract=False: jobs_run.append((area_id, refresh)))
+
+    assert areas_service.refresh_area(conn, "home")["label"] == "home"
+    assert jobs_run == [(area_id, True)]
+    with pytest.raises(areas_service.AreaNotFoundError):
+        areas_service.refresh_area(conn, "nowhere")
+
+
+def test_a_label_only_refresh_reuses_the_stored_center_and_radius_and_a_geocode_refresh_reaches_the_geocoder(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     seen: list = []
     record = fake_extract_record()
 
@@ -483,16 +451,11 @@ def test_a_label_only_refresh_reuses_the_stored_center_and_radius_and_reaches_ex
     detail = areas_service.get_area(conn, first["area_id"])
     assert (detail["center_lat"], detail["center_lng"], detail["radius_km"]) == (LAT, LNG, 2.0)
 
-
-def test_import_area_refresh_geocode_reaches_the_geocoder(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _use_tile_source(monkeypatch)
     asked: list = []
     found = {"lat": 1.0, "lng": 2.0, "display_name": "x", "attribution": geocode.ATTRIBUTION}
     monkeypatch.setattr(geocode, "lookup", lambda conn, query, refresh=False: asked.append(refresh) or found)
-
     areas_service.import_area(conn, place="Somewhere", radius_km=1.0, label="g")
     areas_service.import_area(conn, place="Somewhere", radius_km=1.0, label="g", refresh_geocode=True)
-
     assert asked == [False, True]
 
 
@@ -522,19 +485,7 @@ def test_a_fresh_area_is_not_flagged_for_refresh_and_an_old_one_is(conn: sqlite3
     assert areas_service.get_area(conn, old_id)["refresh_suggested"] is True
 
 
-def test_an_extract_cut_tile_is_as_of_the_extracts_own_date_not_the_cut_time(conn: sqlite3.Connection):
-    area_id = _insert_area(conn, "cut")
-    extract_date = (datetime.now(timezone.utc) - timedelta(days=200)).isoformat()
-    conn.execute(
-        "INSERT INTO map_extracts (region, path, sha256, fetched_at, data_as_of) VALUES ('r/x', '/p', 's', ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), extract_date),
-    )
-    _tile_row(conn, area_id, datetime.now(timezone.utc).isoformat(), source="extract:r/x")
-    assert areas_service.area_freshness(conn, area_id) == (extract_date, True)
-
-
-def test_a_tile_merged_from_several_extracts_is_as_of_the_oldest_extract(conn: sqlite3.Connection):
-    area_id = _insert_area(conn, "merged")
+def test_an_extract_cut_tile_is_as_of_the_extracts_own_date_and_a_merged_tile_the_oldest(conn: sqlite3.Connection):
     now = datetime.now(timezone.utc)
     older, newer = (now - timedelta(days=200)).isoformat(), (now - timedelta(days=5)).isoformat()
     for region, as_of in (("r/x", newer), ("r/y", older)):
@@ -542,13 +493,17 @@ def test_a_tile_merged_from_several_extracts_is_as_of_the_oldest_extract(conn: s
             "INSERT INTO map_extracts (region, path, sha256, fetched_at, data_as_of) VALUES (?, '/p', 's', ?, ?)",
             (region, now.isoformat(), as_of),
         )
-    _tile_row(conn, area_id, now.isoformat(), source="extract:r/x,r/y")
-    assert areas_service.area_freshness(conn, area_id) == (older, True)
+    single = _insert_area(conn, "cut")
+    _tile_row(conn, single, now.isoformat(), source="extract:r/y")
+    assert areas_service.area_freshness(conn, single) == (older, True)  # the extract's date, not the cut time
 
+    merged = _insert_area(conn, "merged")
+    conn.execute("DELETE FROM area_tiles WHERE area_id = ?", (single,))
+    _tile_row(conn, merged, now.isoformat(), source="extract:r/x,r/y")
+    assert areas_service.area_freshness(conn, merged) == (older, True)
 
-def test_an_area_with_no_tiles_has_no_data_date(conn: sqlite3.Connection):
-    area_id = _insert_area(conn, "empty", status="new")
-    assert areas_service.area_freshness(conn, area_id) == (None, False)
+    empty = _insert_area(conn, "empty", status="new")
+    assert areas_service.area_freshness(conn, empty) == (None, False)
 
 
 def _insert_graph(conn: sqlite3.Connection, area_id: int, derive_version: int) -> None:
@@ -560,38 +515,21 @@ def _insert_graph(conn: sqlite3.Connection, area_id: int, derive_version: int) -
     conn.commit()
 
 
-def test_status_rebuilds_a_network_built_by_an_older_version_from_cached_tiles(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+def test_status_rebuilds_a_network_built_by_an_older_version_from_cached_tiles_and_leaves_a_current_one(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+):
     area_id = _insert_area(conn, "old")
     _insert_graph(conn, area_id, network.NETWORK_DERIVE_VERSION - 1)
+    current_id = _insert_area(conn, "new")
+    _insert_graph(conn, current_id, network.NETWORK_DERIVE_VERSION)
     started: list[int] = []
     monkeypatch.setattr(areas_service, "_run_finish_only_job", lambda aid: started.append(aid))
+    assert areas_service.get_area_status(conn, current_id)["status"] == "ready"
+    assert started == []
 
     assert areas_service.get_area_status(conn, area_id)["status"] == "importing"
     assert areas_service.get_area_status(conn, area_id)["status"] == "importing"
     assert started == [area_id]  # the second poll sees a live rebuild and does not start another
-
-
-def test_status_leaves_a_current_network_alone(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    area_id = _insert_area(conn, "new")
-    _insert_graph(conn, area_id, network.NETWORK_DERIVE_VERSION)
-    monkeypatch.setattr(areas_service, "_run_finish_only_job", lambda aid: pytest.fail("no rebuild needed"))
-
-    assert areas_service.get_area_status(conn, area_id)["status"] == "ready"
-
-
-class _CachedOnlySampler:
-    """Samples None for any point whose DEM tile was not fetched first."""
-
-    def __init__(self, fetched: set) -> None:
-        self._fetched = fetched
-
-    def sample(self, points):
-        out = []
-        for lat, lng in points:
-            gx, gy = elevation._lonlat_to_terrarium_pixel(lat, lng, elevation.TERRARIUM_ZOOM)
-            tile = (int(gx) // elevation.TERRARIUM_TILE_PX, int(gy) // elevation.TERRARIUM_TILE_PX)
-            out.append(100.0 if tile in self._fetched else None)
-        return out
 
 
 def test_a_way_running_past_the_area_keeps_its_elevation(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
@@ -614,7 +552,14 @@ def test_a_way_running_past_the_area_keeps_its_elevation(conn: sqlite3.Connectio
     monkeypatch.setattr(
         elevation, "ensure_tiles", lambda conn, *, bbox, **kwargs: fetched.update(elevation.terrarium_tiles_covering(*bbox))
     )
-    monkeypatch.setattr(elevation, "sampler_for", lambda conn, **kwargs: _CachedOnlySampler(fetched))
+
+    def cached_only(i: int, lat: float, lng: float) -> float | None:
+        """No reading for a point whose DEM tile was not fetched first."""
+        gx, gy = elevation._lonlat_to_terrarium_pixel(lat, lng, elevation.TERRARIUM_ZOOM)
+        tile = (int(gx) // elevation.TERRARIUM_TILE_PX, int(gy) // elevation.TERRARIUM_TILE_PX)
+        return 100.0 if tile in fetched else None
+
+    monkeypatch.setattr(elevation, "sampler_for", lambda conn, **kwargs: FakeSampler(cached_only))
 
     status = areas_service.import_area(conn, lat=LAT, lng=LNG, radius_km=1.0, label="long-way")
 

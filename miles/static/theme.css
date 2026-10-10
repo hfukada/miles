@@ -431,3 +431,36 @@ tr.sub3:hover td { background: var(--sub3-bg-hover); }
   color: var(--muted);
   margin-top: 0.125rem;
 }
+
+/* Shared by the terrain and route pages (main.page-view). */
+.page-view h1 { font-size: 1.25rem; font-weight: 650; letter-spacing: -0.02em; margin-bottom: 0.25rem; }
+.page-view .subtitle { font-size: 0.8125rem; color: var(--muted); }
+.page-view .loading, .page-view .error { font-size: 0.8125rem; color: var(--muted); padding: 1rem 0; }
+.page-view .stat-strip {
+  display: flex;
+  flex-wrap: wrap;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 1.5rem;
+}
+.page-view .stat { padding: 0.625rem 1.25rem; }
+.page-view .stat + .stat { border-left: 1px solid var(--border); }
+.page-view .stat-label {
+  font-size: 0.625rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.1875rem;
+}
+.page-view .stat-value {
+  display: flex;
+  align-items: baseline;
+  gap: 0.375rem;
+  font-size: 1.0625rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.page-view .stat-sub { font-size: 0.6875rem; font-weight: 400; color: var(--muted); }

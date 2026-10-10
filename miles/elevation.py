@@ -1,18 +1,15 @@
-"""Elevation sampling behind one sampler interface, so callers (route
-draping, area import prefetch) never know which DEM backed a value.
+"""Elevation sampling behind one sampler interface.
 
-The DEM is AWS's global Terrarium-encoded PNG tiles (standard slippy-map
-x/y/z), cached as raw fetched bytes in elevation_tiles keyed by
-(provider, zoom, x, y). Tiles never expire, since terrain doesn't move at the
-resolution they capture. The provider column is always "terrarium"; it stays
-in the key so existing databases need no migration.
+The DEM is AWS's global Terrarium-encoded PNG tiles (slippy-map x/y/z),
+cached as fetched bytes in elevation_tiles keyed by (provider, zoom, x, y)
+and never expired. The provider column is always "terrarium" and stays in the
+key to avoid a migration.
 
 The sampler reads the cache alone, interpolates bilinearly, and returns None
-for a point outside its cached coverage (ocean tiles that 404) rather than
-fabricating a value. ensure_tiles fetches what a caller will sample, outside
-any transaction. A fetch that fails for any reason but a 404 (network,
-server error, a response that isn't a valid tile) raises ElevationFetchError
-and caches nothing, so "no data here" is never confused with "couldn't ask".
+outside cached coverage (ocean tiles 404) rather than fabricating a value.
+ensure_tiles fetches what a caller will sample, outside any transaction. Any
+fetch failure but a 404 raises ElevationFetchError and caches nothing, so "no
+data here" is never confused with "couldn't ask".
 """
 
 import io
@@ -20,17 +17,14 @@ import math
 import os
 import sqlite3
 import urllib.error
-from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Callable, Generic, Iterable, Protocol, Sequence, TypeVar, cast
+from functools import lru_cache
+from typing import Callable, Iterable, Protocol, Sequence, cast
 
 from PIL import Image
 
 from . import http_client, metrics
 from .errors import describe_error, redact
-
-K = TypeVar("K")
-V = TypeVar("V")
 
 TERRARIUM_URL = os.environ.get(
     "MILES_TERRARIUM_URL", "https://elevation-tiles-prod.s3.amazonaws.com/terrarium/{z}/{x}/{y}.png"
@@ -50,35 +44,13 @@ class ElevationFetchError(RuntimeError):
     the provider having no data there."""
 
 
-class _LRU(Generic[K, V]):
-    """Bounded memo for decoded tiles: a long activity or a large area would
-    otherwise keep every tile it touched decoded in memory."""
-
-    def __init__(self, capacity: int) -> None:
-        self._capacity = capacity
-        self._items: OrderedDict[K, V] = OrderedDict()
-
-    def __contains__(self, key: K) -> bool:
-        return key in self._items
-
-    def __getitem__(self, key: K) -> V:
-        self._items.move_to_end(key)
-        return self._items[key]
-
-    def __setitem__(self, key: K, value: V) -> None:
-        self._items[key] = value
-        self._items.move_to_end(key)
-        while len(self._items) > self._capacity:
-            self._items.popitem(last=False)
-
-
 # A decoded Terrarium tile is ~200 KB of pixels.
 _TERRARIUM_MEMO_TILES = 64
 
 
 def _fetch(policy: http_client.ServicePolicy, url: str) -> bytes | None:
-    """The response body, None for a 404 (the provider has no tile there), or
-    ElevationFetchError once retries are exhausted."""
+    """The response body, None for a 404, or ElevationFetchError once retries
+    are exhausted."""
     try:
         return http_client.request(policy, url)
     except urllib.error.HTTPError as e:
@@ -94,8 +66,8 @@ def _fetch_terrarium_tile(url: str) -> bytes | None:
 
 
 def _decode_terrarium(data: bytes) -> Image.Image | None:
-    """The tile as an RGB image, or None when the bytes are not a full-size
-    PNG (an error page served with a 200 status, a truncated body)."""
+    """The tile as an RGB image, or None when the bytes are not a full-size PNG
+    (an error page served as 200, a truncated body)."""
     try:
         with Image.open(io.BytesIO(data)) as img:
             if img.format != "PNG" or img.size != (TERRARIUM_TILE_PX, TERRARIUM_TILE_PX):
@@ -106,9 +78,8 @@ def _decode_terrarium(data: bytes) -> Image.Image | None:
 
 
 def _lonlat_to_terrarium_pixel(lat: float, lng: float, zoom: int) -> tuple[float, float]:
-    """Continuous (global) pixel coordinates at a slippy-map zoom level --
-    fractional, so callers can bilinear-interpolate rather than snap to the
-    nearest sample."""
+    """Fractional global pixel coordinates at a slippy-map zoom level, for
+    bilinear interpolation."""
     n = 2 ** zoom
     x = (lng + 180.0) / 360.0 * n * TERRARIUM_TILE_PX
     lat_rad = math.radians(max(min(lat, 85.05), -85.05))
@@ -124,9 +95,8 @@ def _lonlat_to_terrarium_pixel(lat: float, lng: float, zoom: int) -> tuple[float
 def terrarium_tiles_covering(
     south: float, west: float, north: float, east: float, zoom: int = TERRARIUM_ZOOM, margin_px: int = 1
 ) -> list[tuple[int, int]]:
-    """Every DEM tile (x, y) a bilinear sample anywhere in the bounding box
-    can read. The margin covers the neighbouring pixel an interpolation at
-    the box's edge reaches into."""
+    """Every DEM tile (x, y) a bilinear sample in the box can read; margin_px
+    covers the neighbouring pixel at the box's edge."""
     x_min, y_max = _lonlat_to_terrarium_pixel(south, west, zoom)
     x_max, y_min = _lonlat_to_terrarium_pixel(north, east, zoom)
     last = 2 ** zoom - 1
@@ -145,14 +115,11 @@ def ensure_tiles(
     zoom: int = TERRARIUM_ZOOM,
     on_progress: Callable[[int, int], None] | None = None,
 ) -> None:
-    """Fetch every DEM tile a sample over bbox (south, west, north, east) or
-    along the path through the given (lat, lng) points can read and does not
-    have cached yet; a sampler may read anywhere between consecutive points,
-    so each pair's bounding box is covered, not just the points themselves.
-    Each tile is committed as it arrives, so the caller must not be inside a
-    transaction (RuntimeError): it would be published half-finished, and the
-    write lock would be held across the next network fetch. Samplers are
-    cache-only and are built after this runs."""
+    """Fetch every uncached DEM tile a sample over bbox (south, west, north,
+    east) or along the path through points can read; each consecutive pair's
+    bounding box is covered. Each tile is committed as it arrives, so the
+    caller must not be in a transaction (RuntimeError): its writes would be
+    published half-finished and the lock held across network fetches."""
     if conn.in_transaction:
         raise RuntimeError("ensure_tiles commits each tile and must run outside a transaction")
     if bbox is not None:
@@ -201,18 +168,15 @@ def _ensure_tile(conn: sqlite3.Connection, zoom: int, tx: int, ty: int) -> None:
 
 
 class TerrariumSampler:
-    """Cache-only: a tile that is not in elevation_tiles reads as missing
-    coverage. ensure_tiles fetches what a sampler will need beforehand."""
+    """Cache-only: a tile not in elevation_tiles reads as missing coverage."""
 
     def __init__(self, conn: sqlite3.Connection, zoom: int = TERRARIUM_ZOOM) -> None:
         self._conn = conn
         self._zoom = zoom
-        self._images: _LRU[tuple[int, int], Image.Image | None] = _LRU(_TERRARIUM_MEMO_TILES)
+        # Bounded, so a large area doesn't keep every decoded tile.
+        self._tile_image = lru_cache(maxsize=_TERRARIUM_MEMO_TILES)(self._read_tile_image)
 
-    def _tile_image(self, tx: int, ty: int) -> Image.Image | None:
-        key = (tx, ty)
-        if key in self._images:
-            return self._images[key]
+    def _read_tile_image(self, tx: int, ty: int) -> Image.Image | None:
         row = self._conn.execute(
             "SELECT data FROM elevation_tiles WHERE provider = 'terrarium' AND zoom = ? AND x = ? AND y = ?",
             (self._zoom, tx, ty),
@@ -220,7 +184,6 @@ class TerrariumSampler:
         # A corrupt cached tile counts as missing.
         image = _decode_terrarium(row["data"]) if row is not None else None
         metrics.cache("elevation_tiles", "miss" if image is None else "hit")
-        self._images[key] = image
         return image
 
     def _pixel_elevation(self, global_x: int, global_y: int) -> float | None:
@@ -253,7 +216,7 @@ class TerrariumSampler:
 
 
 def sampler_for(conn: sqlite3.Connection) -> ElevationSampler:
-    """A sampler over whatever is cached in elevation_tiles: no network
-    calls, so a request or startup path can never fail or hang on a DEM
-    fetch. Callers allowed to wait on the network run ensure_tiles first."""
+    """A sampler over what is cached in elevation_tiles; no network, so request
+    and startup paths can't hang on a fetch. Callers that may wait run
+    ensure_tiles first."""
     return TerrariumSampler(conn)

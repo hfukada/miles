@@ -113,14 +113,12 @@ def test_a_refresh_that_fails_or_finds_nothing_keeps_the_earlier_answer_and_uses
     assert geocode.geocode(conn, "Renamed") == (1.0, 2.0)
 
 
-def test_geocode_raises_with_no_cache_and_failed_fetch(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+def test_a_failed_fetch_is_not_a_no_match_and_a_no_match_is_cached_until_someone_asks_again(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     _nominatim(monkeypatch, geocode.GeocodeError("network down"))
     with pytest.raises(geocode.GeocodeError):
         geocode.geocode(conn, "Nowhere")
-    assert conn.execute("SELECT COUNT(*) FROM geocode_misses").fetchone()[0] == 0  # a failure is not a "no match"
+    assert conn.execute("SELECT COUNT(*) FROM geocode_misses").fetchone()[0] == 0
 
-
-def test_no_match_is_cached_until_someone_asks_again(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     calls = _nominatim(monkeypatch, geocode.NoMatchError("no match"))
     for _ in range(3):
         with pytest.raises(geocode.NoMatchError):
@@ -163,69 +161,67 @@ def test_concurrent_identical_misses_ask_nominatim_once(monkeypatch: pytest.Monk
     assert results == [(1.0, 2.0)] * 3
 
 
-def test_the_public_instance_is_refused_without_a_contact(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(geocode, "NOMINATIM_URL", "https://nominatim.openstreetmap.org/search")
-    monkeypatch.delenv("MILES_CONTACT", raising=False)
-    monkeypatch.setattr(http_client, "request", lambda *a, **k: pytest.fail("nothing may be sent"))
-    with pytest.raises(geocode.GeocodeError, match="MILES_CONTACT"):
-        geocode.geocode(conn, "Anywhere")
+def _answer_with(monkeypatch: pytest.MonkeyPatch, url: str, outcome: bytes | Exception) -> list[str]:
+    """Point geocode at `url` and answer every request with `outcome` (a body, or an exception to raise)."""
+    monkeypatch.setattr(geocode, "NOMINATIM_URL", url)
+    sent: list[str] = []
+
+    def request(policy, url, **k):
+        sent.append(url)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(http_client, "request", request)
+    return sent
 
 
 @pytest.mark.parametrize(
-    "url, contact",
-    [("https://nominatim.openstreetmap.org/search", "ops@example.com"), ("http://nominatim.internal:8080/search", None)],
+    "url, contact, refused",
+    [
+        ("https://nominatim.openstreetmap.org/search", None, True),
+        ("https://nominatim.openstreetmap.org/search", "ops@example.com", False),
+        ("http://nominatim.internal:8080/search", None, False),
+    ],
+    ids=["the public instance without a contact", "the public instance with one", "another instance without one"],
 )
 def test_the_public_instance_needs_a_contact_and_another_instance_does_not(
-    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, url: str, contact: str | None
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, url: str, contact: str | None, refused: bool
 ):
-    monkeypatch.setattr(geocode, "NOMINATIM_URL", url)
     if contact is None:
         monkeypatch.delenv("MILES_CONTACT", raising=False)
     else:
         monkeypatch.setenv("MILES_CONTACT", contact)
-    sent: list[str] = []
-    monkeypatch.setattr(
-        http_client, "request",
-        lambda policy, url, **k: sent.append(url) or json.dumps([{"lat": "1.5", "lon": "2.5", "display_name": "A"}]).encode(),
-    )
-    assert geocode.geocode(conn, "Anywhere") == (1.5, 2.5)
-    assert len(sent) == 1
+    sent = _answer_with(monkeypatch, url, json.dumps([{"lat": "1.5", "lon": "2.5", "display_name": "A"}]).encode())
+    if refused:
+        with pytest.raises(geocode.GeocodeError, match="MILES_CONTACT"):
+            geocode.geocode(conn, "Anywhere")
+        assert sent == []
+    else:
+        assert geocode.geocode(conn, "Anywhere") == (1.5, 2.5)
+        assert len(sent) == 1
 
 
 @pytest.mark.parametrize(
-    "body",
-    [b"<html>rate limited</html>", b"{}", b'[{"lat": "x", "lon": "1"}]', b'[{"lon": "1"}]', b'["string"]', b"null"],
-)
-def test_an_unusable_response_is_a_geocode_error_and_is_not_cached(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, body: bytes):
-    monkeypatch.setattr(geocode, "NOMINATIM_URL", "http://nominatim.internal/search")
-    monkeypatch.setattr(http_client, "request", lambda policy, url, **k: body)
-    with pytest.raises(geocode.GeocodeError) as raised:
-        geocode.geocode(conn, "Anywhere")
-    if body not in (b"{}", b"null"):
-        assert not isinstance(raised.value, geocode.NoMatchError)
-    assert conn.execute("SELECT COUNT(*) FROM geocode_cache").fetchone()[0] == 0
-
-
-def test_an_empty_result_list_is_a_no_match(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(geocode, "NOMINATIM_URL", "http://nominatim.internal/search")
-    monkeypatch.setattr(http_client, "request", lambda policy, url, **k: b"[]")
-    with pytest.raises(geocode.NoMatchError):
-        geocode.geocode(conn, "Atlantis")
-
-
-@pytest.mark.parametrize(
-    "failure, message",
+    "outcome, error, message",
     [
-        (http_client.ServiceBackoffError("nominatim asked us to stay away"), "stay away"),
-        (urllib.error.URLError("down"), "request failed"),
+        (b"<html>rate limited</html>", geocode.GeocodeError, None),
+        (b"{}", geocode.NoMatchError, None),
+        (b'[{"lat": "x", "lon": "1"}]', geocode.GeocodeError, None),
+        (b'[{"lon": "1"}]', geocode.GeocodeError, None),
+        (b'["string"]', geocode.GeocodeError, None),
+        (b"null", geocode.NoMatchError, None),
+        (b"[]", geocode.NoMatchError, None),
+        (http_client.ServiceBackoffError("nominatim asked us to stay away"), geocode.GeocodeError, "stay away"),
+        (urllib.error.URLError("down"), geocode.GeocodeError, "request failed"),
     ],
+    ids=["html", "empty object", "bad lat", "no lat", "string entry", "null", "empty list", "backoff", "request error"],
 )
-def test_a_backoff_or_request_error_is_a_geocode_error(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, failure: Exception, message: str):
-    monkeypatch.setattr(geocode, "NOMINATIM_URL", "http://nominatim.internal/search")
-
-    def fails(policy, url, **k):
-        raise failure
-
-    monkeypatch.setattr(http_client, "request", fails)
-    with pytest.raises(geocode.GeocodeError, match=message):
+def test_an_unusable_response_or_failed_request_is_a_geocode_error_and_is_not_cached(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, outcome: bytes | Exception, error: type[Exception], message: str | None
+):
+    _answer_with(monkeypatch, "http://nominatim.internal/search", outcome)
+    with pytest.raises(error, match=message) as raised:
         geocode.geocode(conn, "Anywhere")
+    assert isinstance(raised.value, geocode.NoMatchError) is issubclass(error, geocode.NoMatchError)
+    assert conn.execute("SELECT COUNT(*) FROM geocode_cache").fetchone()[0] == 0

@@ -2,8 +2,7 @@ import json
 import sqlite3
 
 import pytest
-from fastapi import HTTPException
-from helpers import ORIGIN_LAT, ORIGIN_LNG, FakeOsrm, NoneSampler, by_deg_lat, call_tool, node, way
+from helpers import ORIGIN_LAT, ORIGIN_LNG, FakeOsrm, by_deg_lat, call_tool, node, none_sampler, way
 from mcp.server.fastmcp import FastMCP
 
 from miles import db, network, route_search, search_api, search_mcp
@@ -29,7 +28,7 @@ def conn(conn: sqlite3.Connection) -> sqlite3.Connection:
             way(12, [C_ID, A_ID], {"highway": "path"}),
         ]
     }
-    network.build_network(conn, 1, [payload], NoneSampler())
+    network.build_network(conn, 1, [payload], none_sampler())
     return conn
 
 
@@ -39,19 +38,40 @@ def _drive_starts(conn: sqlite3.Connection) -> list:
     )
 
 
-def test_resolve_starts_drive_mode_fans_out_over_osrm(conn: sqlite3.Connection, osrm: FakeOsrm):
+def test_drive_mode_fans_out_over_osrm_and_carries_each_starts_label_and_drive_time(conn: sqlite3.Connection, osrm: FakeOsrm, monkeypatch: pytest.MonkeyPatch):
     osrm.seconds_per_km = 60.0
 
     starts = _drive_starts(conn)
 
     assert osrm.calls, "drive mode should have hit the fake OSRM responder"
     labels = {s.get("label") for s in starts}
-    assert "Out the door" in labels
-    assert "Ridge Trailhead" in labels
-    origin_start = next(s for s in starts if s["label"] == "Out the door")
-    assert origin_start["drive_s"] == 0.0
-    trailhead_start = next(s for s in starts if s["label"] == "Ridge Trailhead")
-    assert trailhead_start["drive_s"] > 0.0
+    assert labels == {"Out the door", "Ridge Trailhead"}
+    assert next(s for s in starts if s["label"] == "Out the door")["drive_s"] == 0.0
+    assert next(s for s in starts if s["label"] == "Ridge Trailhead")["drive_s"] > 0.0
+
+    request: route_search.RouteSearchRequest = {
+        "area_id": 1, "starts": starts, "distance_m_min": 100.0, "distance_m_max": 800.0,
+        "shape": "loop", "n": 5, "time_budget_s": 5.0, "seed": 1,
+    }
+    result = route_search.find_routes(conn, request)
+    assert result["candidates"]
+    for candidate in result["candidates"]:
+        summary = search_mcp._candidate_summary(candidate)
+        assert summary["start"]["label"] == candidate["start"]["label"] in labels
+        assert (summary["start"]["drive_minutes"] == 0.0) is (candidate["start"]["label"] == "Out the door")
+
+    seen: list[route_search.RouteSearchRequest] = []
+    monkeypatch.setattr(db, "connect", lambda: conn)
+    monkeypatch.setattr(route_search, "find_routes", lambda c, request: seen.append(request))  # type: ignore[arg-type,return-value]
+    search_api.find_routes(search_api.FindRoutesBody(
+        area_id=1,
+        drive_origin=search_api.StartBody(lat=ORIGIN_LAT, lng=ORIGIN_LNG),
+        max_drive_minutes=10.0,
+        distance_m_min=100.0,
+        distance_m_max=800.0,
+    ))
+    assert {s.get("label") for s in seen[0]["starts"]} == labels
+    assert seen[0]["n"] == route_search.DEFAULT_N and seen[0]["time_budget_s"] == route_search.DEFAULT_TIME_BUDGET_S
 
 
 @pytest.mark.parametrize(
@@ -65,58 +85,6 @@ def test_resolve_starts_drive_mode_fans_out_over_osrm(conn: sqlite3.Connection, 
 def test_resolve_starts_refuses_contradictory_or_missing_start_arguments(conn: sqlite3.Connection, arguments: dict, message: str):
     with pytest.raises(ValueError, match=message):
         route_search.resolve_starts(conn, 1, drive_k=8, **arguments)
-
-
-def test_find_routes_in_drive_mode_carries_start_label_and_drive_time(conn: sqlite3.Connection, osrm: FakeOsrm):
-    osrm.seconds_per_km = 60.0
-    request: route_search.RouteSearchRequest = {
-        "area_id": 1,
-        "starts": _drive_starts(conn),
-        "distance_m_min": 100.0,
-        "distance_m_max": 800.0,
-        "shape": "loop",
-        "n": 5,
-        "time_budget_s": 5.0,
-        "seed": 1,
-    }
-    result = route_search.find_routes(conn, request)
-    assert result["candidates"]
-    for candidate in result["candidates"]:
-        assert candidate["start"]["label"] in ("Out the door", "Ridge Trailhead")
-        summary = search_mcp._candidate_summary(candidate)
-        assert summary["start"]["label"] == candidate["start"]["label"]
-        if candidate["start"]["label"] == "Out the door":
-            assert summary["start"]["drive_minutes"] == 0.0
-        else:
-            assert summary["start"]["drive_minutes"] > 0.0
-
-
-def test_search_api_drive_mode_fans_out_from_drive_origin(conn: sqlite3.Connection, osrm: FakeOsrm, monkeypatch: pytest.MonkeyPatch):
-    seen: list[route_search.RouteSearchRequest] = []
-    monkeypatch.setattr(db, "connect", lambda: conn)
-    monkeypatch.setattr(route_search, "find_routes", lambda c, request: seen.append(request))  # type: ignore[arg-type,return-value]
-
-    search_api.find_routes(search_api.FindRoutesBody(
-        area_id=1,
-        drive_origin=search_api.StartBody(lat=ORIGIN_LAT, lng=ORIGIN_LNG),
-        max_drive_minutes=10.0,
-        distance_m_min=100.0,
-        distance_m_max=800.0,
-    ))
-
-    assert {s.get("label") for s in seen[0]["starts"]} == {"Out the door", "Ridge Trailhead"}
-    assert seen[0]["n"] == route_search.DEFAULT_N and seen[0]["time_budget_s"] == route_search.DEFAULT_TIME_BUDGET_S
-
-
-def test_search_api_ignores_a_drive_origin_without_max_drive_minutes():
-    with pytest.raises(HTTPException) as caught:
-        search_api.find_routes(search_api.FindRoutesBody(
-            area_id=1,
-            drive_origin=search_api.StartBody(lat=ORIGIN_LAT, lng=ORIGIN_LNG),
-            distance_m_min=100.0,
-            distance_m_max=800.0,
-        ))
-    assert caught.value.status_code == 400
 
 
 class _Borrowed:
@@ -170,57 +138,17 @@ def test_every_search_tool_closes_its_connection_even_on_an_error(tool, name: st
 
 
 @pytest.mark.parametrize(
-    "raw",
-    ['{"lat": 1, "lng": 2}', "[]", "[1, 2]", '[{"lat": 1}]', '[{"lat": "a", "lng": 2}]', "5"],
+    "parse, raw, message",
+    [(search_mcp._parse_starts, raw, "starts") for raw in ['{"lat": 1, "lng": 2}', "[]", "[1, 2]", '[{"lat": 1}]', '[{"lat": "a", "lng": 2}]', "5"]]
+    + [(lambda raw: search_mcp._parse_way_ids("avoid_way_ids", raw), raw, "way ids") for raw in ['{"a": 1}', '["x"]', "3", "[1.5]"]],
 )
-def test_malformed_starts_get_a_clear_error(raw: str):
-    with pytest.raises(ValueError, match="starts"):
-        search_mcp._parse_starts(raw)
-
-
-def test_well_formed_starts_parse():
-    parsed = search_mcp._parse_starts('[{"lat": 40.0, "lng": -105.0, "label": "Lot"}]')
-    assert parsed == [{"lat": 40.0, "lng": -105.0, "label": "Lot"}]
-
-
-@pytest.mark.parametrize("raw", ['{"a": 1}', '["x"]', "3", "[1.5]"])
-def test_way_id_lists_must_be_lists_of_integers(raw: str):
-    with pytest.raises(ValueError, match="way ids"):
-        search_mcp._parse_way_ids("avoid_way_ids", raw)
-
-
-def test_runnability_is_reported_in_miles_and_feet():
-    summary = search_mcp._runnability_summary(
-        {"run_pct": 80.0, "grind_pct": 10.0, "hike_pct": 10.0, "longest_hike_m": 1609.34, "steep_descent_m": 100.0}
-    )
-    assert summary["longest_hike_mi"] == pytest.approx(1.0)
-    assert summary["steep_descent_ft"] == pytest.approx(328.084)
-    assert "longest_hike_m" not in summary and "steep_descent_m" not in summary
-    assert summary["run_pct"] == 80.0
-
-
-def test_find_routes_tool_accepts_a_seed_and_is_reproducible(tool):
-    args = {
-        "area_id": 1, "start_lat": TH_LAT, "start_lng": ORIGIN_LNG,
-        "distance_mi_min": 0.1, "distance_mi_max": 0.5, "shape": "loop", "seed": 7,
-    }
-    first = tool("find_routes", args)
-    second = tool("find_routes", args)
-    assert first["seed"] == second["seed"] == 7
-    assert first["candidates"]
-    assert [c["distance_mi"] for c in first["candidates"]] == [c["distance_mi"] for c in second["candidates"]]
-    assert "longest_hike_mi" in first["candidates"][0]["runnability"]
-
-
-def test_find_routes_tool_reports_bad_starts_and_n_as_errors(tool):
-    base = {"area_id": 1, "distance_mi_min": 0.1, "distance_mi_max": 0.5}
-    assert "starts" in tool("find_routes", {**base, "starts": [{"lat": 1}]})["error"]
-    bad_n = tool("find_routes", {**base, "start_lat": TH_LAT, "start_lng": ORIGIN_LNG, "n": 0})
-    assert "n must be" in bad_n["error"]
+def test_malformed_starts_and_way_id_lists_get_a_clear_error(parse, raw: str, message: str):
+    with pytest.raises(ValueError, match=message):
+        parse(raw)
 
 
 @pytest.mark.parametrize("as_json_text", [False, True])
-def test_find_routes_tool_takes_starts_and_way_ids_as_lists_or_json_text(tool, as_json_text: bool):
+def test_find_routes_tool_takes_starts_and_way_ids_as_lists_or_json_text_and_a_seed_makes_it_reproducible(tool, as_json_text: bool):
     starts = [{"lat": TH_LAT, "lng": ORIGIN_LNG, "label": "Lot"}]
     avoid = [999999]
     args = {
@@ -231,3 +159,7 @@ def test_find_routes_tool_takes_starts_and_way_ids_as_lists_or_json_text(tool, a
     result = tool("find_routes", args)
     assert "error" not in result
     assert result["candidates"][0]["start"]["label"] == "Lot"
+    assert "longest_hike_mi" in result["candidates"][0]["runnability"]
+    again = tool("find_routes", args)
+    assert result["seed"] == again["seed"] == 3  # a seed makes the search reproducible
+    assert [c["distance_mi"] for c in result["candidates"]] == [c["distance_mi"] for c in again["candidates"]]

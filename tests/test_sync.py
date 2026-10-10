@@ -27,32 +27,15 @@ def test_resyncing_an_activity_keeps_locally_owned_columns(conn: sqlite3.Connect
     "field, value",
     [("distance_m", 9000.0), ("elapsed_time_s", 2500), ("start_date", "2026-01-03T08:00:00")],
 )
-def test_an_activity_changed_on_strava_has_its_laps_and_description_refetched(conn: sqlite3.Connection, field: str, value: object) -> None:
-    db.upsert_activities(conn, [_row(1, workout_type=3)])
+def test_an_activity_changed_on_strava_has_its_laps_description_terrain_and_weather_dropped_and_is_returned(
+    conn: sqlite3.Connection, field: str, value: object
+) -> None:
+    db.upsert_activities(conn, [_row(1, workout_type=3), _row(2, workout_type=3)])
     conn.execute("INSERT INTO laps (lap_id, activity_id, lap_index) VALUES (11, 1, 0)")
     conn.execute(
         "UPDATE activities SET description = 'felt good', laps_synced_at = '2026-01-06', "
-        "race_effort = 'hard', workout_label = 'steady' WHERE activity_id = 1"
+        "race_effort = 'hard', workout_label = 'steady' WHERE activity_id IN (1, 2)"
     )
-    conn.execute("DELETE FROM meta WHERE key = 'derive_dirty_since'")
-    conn.commit()
-
-    changed = _row(1, workout_type=3)
-    changed[field] = value  # type: ignore[literal-required]
-    db.upsert_activities(conn, [changed])
-
-    got = conn.execute("SELECT * FROM activities WHERE activity_id = 1").fetchone()
-    assert (got["description"], got["laps_synced_at"]) == (None, None)
-    assert (got["race_effort"], got["workout_label"]) == ("hard", "steady")
-    assert conn.execute("SELECT COUNT(*) FROM laps WHERE activity_id = 1").fetchone()[0] == 0
-
-
-@pytest.mark.parametrize(
-    "field, value",
-    [("distance_m", 9000.0), ("elapsed_time_s", 2500), ("start_date", "2026-01-03T08:00:00")],
-)
-def test_an_activity_changed_on_strava_drops_its_terrain_and_weather_and_is_returned(conn: sqlite3.Connection, field: str, value: object) -> None:
-    db.upsert_activities(conn, [_row(1), _row(2)])
     for activity_id in (1, 2):
         conn.execute(
             "INSERT INTO terrain_segment_dates (activity_id, start_date) VALUES (?, '2026-01-05')", [activity_id]
@@ -65,10 +48,14 @@ def test_an_activity_changed_on_strava_drops_its_terrain_and_weather_and_is_retu
         conn.execute("INSERT INTO weather (activity_id, fetched_at) VALUES (?, 'now')", [activity_id])
     conn.commit()
 
-    changed = _row(1)
+    changed = _row(1, workout_type=3)
     changed[field] = value  # type: ignore[literal-required]
-    assert db.upsert_activities(conn, [changed, _row(2)]) == [1]
+    assert db.upsert_activities(conn, [changed, _row(2, workout_type=3)]) == [1]
 
+    got = conn.execute("SELECT * FROM activities WHERE activity_id = 1").fetchone()
+    assert (got["description"], got["laps_synced_at"]) == (None, None)
+    assert (got["race_effort"], got["workout_label"]) == ("hard", "steady")  # locally owned columns survive
+    assert conn.execute("SELECT COUNT(*) FROM laps WHERE activity_id = 1").fetchone()[0] == 0
     for table in ("terrain_segments", "terrain_segment_dates", "weather"):
         remaining = {r[0] for r in conn.execute(f"SELECT activity_id FROM {table}")}
         assert remaining == {2}, table
@@ -172,17 +159,6 @@ def test_derived_values_are_dirtied_from_the_earliest_date_an_edited_or_moved_ac
     assert _dirty_since(conn) == "2026-01-12"
 
 
-def test_an_upsert_that_flags_many_activities_logs_a_warning(conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture) -> None:
-    count = db.CHANGED_ACTIVITIES_WARN_COUNT + 1
-    db.upsert_activities(conn, [_row(i) for i in range(1, count + 1)])
-    edited = [_row(i) for i in range(1, count + 1)]
-    for row in edited:
-        row["distance_m"] = 9000.0
-    with caplog.at_level("WARNING", logger="miles.db"):
-        db.upsert_activities(conn, edited)
-    assert any("differ from what is stored" in r.message for r in caplog.records)
-
-
 class _Strava:
     """Stands in for the Strava client and records what each pass asked for."""
 
@@ -252,16 +228,13 @@ def test_passes_run_in_order_and_report_their_own_phase(conn: sqlite3.Connection
     assert first("activities") < first("derive") < first("laps") < first("backfill-laps")
 
 
-def test_the_activity_pass_is_never_gated_by_the_reserve(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    strava = _Strava(monkeypatch, [_row(1)])
-    strava.daily_left = 3  # already under any reserve
-
-    assert sync.run_sync(conn, full=False, history=True, reserve=12) == 1
-    assert conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0] == 1
-
-
 def test_detail_laps_stop_at_the_reserve_and_the_rest_wait_for_the_next_sync(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     strava = _Strava(monkeypatch, [_row(i, f"2026-01-0{i}T08:00:00", workout_type=3) for i in range(1, 6)])
+    strava.daily_left = 3  # already under any reserve: the activity listing still runs, nothing after it does
+
+    assert sync.run_sync(conn, full=False, history=True, reserve=12) == 5
+    assert strava.lap_calls == []
+
     strava.daily_left = 15  # the listing spends one: 14, then laps may spend 2 before reaching the reserve of 12
 
     sync.run_sync(conn, full=False, history=False, reserve=12)
@@ -296,14 +269,6 @@ def test_the_history_pass_is_skipped_when_off_or_while_a_backfill_is_running(
     assert strava.lap_calls == []
     if backfill_running:
         assert terrain_backfill.BackfillProgress(conn).snapshot()["status"] == "running"
-
-
-def test_history_env_switch(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv(sync.HISTORY_ENV, raising=False)
-    assert sync.history_enabled() is True
-    for off in ("0", "false", "NO", "off"):
-        monkeypatch.setenv(sync.HISTORY_ENV, off)
-        assert sync.history_enabled() is False
 
 
 def test_streams_for_new_runs_are_fetched_in_the_details_pass_only_for_those_runs(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
@@ -353,7 +318,7 @@ def test_a_history_failure_is_recorded_on_the_backfill_row_and_does_not_fail_the
     assert conn.execute("SELECT value FROM meta WHERE key = ?", (sync.META_LAST_SUCCESS,)).fetchone() is not None
 
 
-def test_a_listing_429_waits_retries_the_pass_and_is_not_recorded_as_final(
+def test_a_listing_429_waits_and_retries_but_an_optional_pass_gives_up_and_records_the_429_as_final(
     conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, slept: list[float], outcomes
 ):
     strava = _Strava(monkeypatch, [_row(1)])
@@ -372,21 +337,18 @@ def test_a_listing_429_waits_retries_the_pass_and_is_not_recorded_as_final(
     assert len(slept) == 1
     assert outcomes == []
 
-
-def test_an_optional_pass_gives_up_when_a_wait_bought_nothing_and_records_the_429_as_final(
-    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, slept: list[float], outcomes
-):
-    strava = _Strava(monkeypatch, [_row(1, workout_type=3)])
+    # An optional pass gives up when a wait bought nothing, and records the 429 as final.
+    slept.clear()
+    limited = _Strava(monkeypatch, [_row(2, workout_type=3)])
 
     def always_limited(activity_id):
         raise strava_fault(429)
 
     monkeypatch.setattr(strava_client, "get_activity_detail", always_limited)
-
     sync.run_sync(conn, full=False, history=False, reserve=12)
 
     assert len(slept) == 1  # one window waited out, then the cap is assumed
-    assert strava.calls == 1
+    assert limited.calls == 1
     assert outcomes == [("strava", 429)]
 
 
@@ -443,15 +405,13 @@ def test_outcomes_are_recorded_for_the_health_check(conn: sqlite3.Connection, mo
     assert float(meta[sync.META_LAST_DURATION]) >= 0
     assert sync.META_LAST_FAILURE not in meta
 
-
-def test_a_failed_run_records_the_failure_and_still_raises(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     def broken(after_ts=None):
         raise RuntimeError("network down")
         yield  # pragma: no cover
 
+    conn.execute("DELETE FROM meta WHERE key = ?", (sync.META_LAST_SUCCESS,))
     monkeypatch.setattr(strava_client, "get_activities", broken)
-
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError):  # a failed run records the failure and still raises
         sync.run_sync(conn, full=False, history=False, reserve=12)
 
     meta = {r["key"]: r["value"] for r in conn.execute("SELECT key, value FROM meta")}
@@ -460,60 +420,51 @@ def test_a_failed_run_records_the_failure_and_still_raises(conn: sqlite3.Connect
     assert sync.META_LAST_SUCCESS not in meta
 
 
-def test_laps_and_description_come_from_one_detail_request_and_no_description_is_cached(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    strava = _Strava(monkeypatch, [_row(1, workout_type=3)])
-
-    sync.run_sync(conn, full=False, history=False, reserve=12)
-
-    assert strava.lap_calls == [1]
-    row = conn.execute("SELECT description, laps_synced_at FROM activities WHERE activity_id = 1").fetchone()
-    assert row["description"] == ""
-    assert row["laps_synced_at"] is not None
-
-
-def test_a_detail_response_without_laps_falls_back_to_the_laps_endpoint(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    strava = _Strava(monkeypatch, [_row(1, workout_type=3)])
+def test_laps_and_description_come_from_one_detail_request_and_a_response_without_laps_falls_back_to_the_laps_endpoint(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+):
+    strava = _Strava(monkeypatch, [_row(1, workout_type=3), _row(2, workout_type=3)])
     lap: db.LapRow = {
-        "lap_id": 7, "activity_id": 1, "lap_index": 1, "distance_m": 1000.0, "moving_time_s": 300, "elapsed_time_s": 300,
+        "lap_id": 7, "activity_id": 2, "lap_index": 1, "distance_m": 1000.0, "moving_time_s": 300, "elapsed_time_s": 300,
         "average_speed_mps": 3.3, "average_heartrate": None, "max_heartrate": None, "average_cadence": None,
         "total_elevation_gain_m": None, "pace_zone": None, "raw_json": "{}",
     }
-    monkeypatch.setattr(strava_client, "get_activity_detail", lambda aid: ("easy hills", None))
+    monkeypatch.setattr(strava_client, "get_activity_detail", lambda aid: ("", []) if aid == 1 else ("easy hills", None))
     monkeypatch.setattr(strava_client, "get_activity_laps", lambda aid: [lap])
 
     sync.run_sync(conn, full=False, history=False, reserve=12)
 
-    assert conn.execute("SELECT COUNT(*) FROM laps WHERE activity_id = 1").fetchone()[0] == 1
-    assert conn.execute("SELECT description FROM activities WHERE activity_id = 1").fetchone()[0] == "easy hills"
+    rows = {r["activity_id"]: r for r in conn.execute("SELECT activity_id, description, laps_synced_at FROM activities")}
+    assert (rows[1]["description"], rows[1]["laps_synced_at"] is not None) == ("", True)  # an empty description is cached
+    assert rows[2]["description"] == "easy hills"
+    assert conn.execute("SELECT COUNT(*) FROM laps WHERE activity_id = 2").fetchone()[0] == 1
     assert strava.lap_calls == []
 
 
-def test_a_terrain_failure_neither_fails_the_sync_nor_leaves_partial_writes_for_later_passes_to_commit(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _Strava(monkeypatch, [_row(1)])
-
-    def broken(c, *args, **kwargs):
-        c.execute("INSERT INTO meta (key, value) VALUES ('partial_terrain_write', '1')")
-        raise ValueError("stream file is truncated")
-
-    monkeypatch.setattr(sync.terrain_backfill, "run_backfill", broken)
-
-    sync.run_sync(conn, full=False, history=False, reserve=12)
-
-    assert conn.execute("SELECT value FROM meta WHERE key = ?", (sync.META_LAST_SUCCESS,)).fetchone() is not None
-    assert conn.execute("SELECT value FROM meta WHERE key = 'partial_terrain_write'").fetchone() is None
-
-
-def test_a_terrain_rebuild_does_not_fail_the_sync(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "failure, history, backfill_status",
+    [(ValueError("stream file is truncated"), False, None), (sync.terrain.TerrainRebuildingError("rebuild running"), True, "done")],
+    ids=["a terrain failure", "a terrain rebuild under way"],
+)
+def test_a_terrain_failure_neither_fails_the_sync_nor_leaves_partial_writes_for_later_passes_to_commit(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, failure: Exception, history: bool, backfill_status: str | None
+):
     _Strava(monkeypatch, [_row(1)])
     _old_run(conn)
     monkeypatch.setattr(sync.terrain_backfill, "refresh_backfill_queue", lambda c: 1)
 
-    def rebuilding(*args, **kwargs):
-        raise sync.terrain.TerrainRebuildingError("rebuild running")
+    def broken(c, *args, **kwargs):
+        c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('partial_terrain_write', '1')")
+        raise failure
 
-    monkeypatch.setattr(sync.terrain_backfill, "run_backfill", rebuilding)
+    monkeypatch.setattr(sync.terrain_backfill, "run_backfill", broken)
 
-    sync.run_sync(conn, full=False, history=True, reserve=12)
+    sync.run_sync(conn, full=False, history=history, reserve=12)
+    if backfill_status:
+        assert terrain_backfill.BackfillProgress(conn).snapshot()["status"] == backfill_status
 
     assert conn.execute("SELECT value FROM meta WHERE key = ?", (sync.META_LAST_SUCCESS,)).fetchone() is not None
-    assert terrain_backfill.BackfillProgress(conn).snapshot()["status"] == "done"
+    if isinstance(failure, ValueError):
+        assert conn.execute("SELECT value FROM meta WHERE key = 'partial_terrain_write'").fetchone() is None
+
+

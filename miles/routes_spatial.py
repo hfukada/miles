@@ -15,7 +15,13 @@ from typing import Hashable, Iterable, Iterator
 from typing_extensions import TypedDict
 
 _EARTH_RADIUS_M = 6371000.0
-_METERS_PER_DEG_LAT = 111320.0
+METERS_PER_DEG_LAT = 111320.0
+
+
+def meters_per_deg_lng(lat: float) -> float:
+    """Meters per degree of longitude at `lat` degrees; the cosine is floored
+    so the poles don't divide by zero."""
+    return METERS_PER_DEG_LAT * max(math.cos(math.radians(lat)), 1e-6)
 
 
 class Junction(TypedDict):
@@ -79,10 +85,9 @@ class Grid:
     def __init__(self, points: list[tuple[float, float]], cell_size_m: float):
         self._points = points
         self._cell_size_m = cell_size_m
-        ref_lat = math.radians(sum(p[0] for p in points) / len(points)) if points else 0.0
-        self._deg_per_m_lat = 1.0 / _METERS_PER_DEG_LAT
-        cos_ref = max(math.cos(ref_lat), 1e-6)  # guard the poles; irrelevant at running scale
-        self._deg_per_m_lng = 1.0 / (_METERS_PER_DEG_LAT * cos_ref)
+        ref_lat = sum(p[0] for p in points) / len(points) if points else 0.0
+        self._deg_per_m_lat = 1.0 / METERS_PER_DEG_LAT
+        self._deg_per_m_lng = 1.0 / meters_per_deg_lng(ref_lat)
         self._cell_lat = cell_size_m * self._deg_per_m_lat
         self._cell_lng = cell_size_m * self._deg_per_m_lng
         self._cells: dict[tuple[int, int], list[int]] = {}
@@ -121,7 +126,7 @@ class NearestIndex:
 
     def __init__(self, cell_size_m: float) -> None:
         self._cell_m = cell_size_m
-        self._cell_lat = cell_size_m / _METERS_PER_DEG_LAT
+        self._cell_lat = cell_size_m / METERS_PER_DEG_LAT
         self._cell_lng: float | None = None  # fixed by the first point added
         self._cells: dict[tuple[int, int], list[tuple[Hashable, int, float, float, float]]] = {}
         # Key -> generation of its points; remove() advances it, so points
@@ -139,8 +144,7 @@ class NearestIndex:
         generation = self._generation.get(key, 0)
         for lat, lng, offset_m in points:
             if self._cell_lng is None:
-                cos_ref = max(math.cos(math.radians(lat)), 1e-6)
-                self._cell_lng = self._cell_m / (_METERS_PER_DEG_LAT * cos_ref)
+                self._cell_lng = self._cell_m / meters_per_deg_lng(lat)
             self._cells.setdefault(self._cell_of(lat, lng), []).append((key, generation, lat, lng, offset_m))
 
     def remove(self, key: Hashable) -> None:
@@ -153,8 +157,8 @@ class NearestIndex:
             return
         row, col = self._cell_of(lat, lng)
         reach_rows = max(1, math.ceil(radius_m / max(self._cell_m, 1e-9)))
-        widest_lat = min(abs(lat) + radius_m / _METERS_PER_DEG_LAT, 89.9)
-        lng_deg = radius_m / (_METERS_PER_DEG_LAT * max(math.cos(math.radians(widest_lat)), 1e-6))
+        widest_lat = min(abs(lat) + radius_m / METERS_PER_DEG_LAT, 89.9)
+        lng_deg = radius_m / meters_per_deg_lng(widest_lat)
         reach_cols = max(1, math.ceil(lng_deg / self._cell_lng))
         for d_row in range(-reach_rows, reach_rows + 1):
             for d_col in range(-reach_cols, reach_cols + 1):

@@ -26,7 +26,6 @@ miles-api = "miles.api:main"
 miles-derive = "miles.derive:main"
 miles-route-import = "miles.route_import:main"
 miles-terrain-backfill = "miles.terrain_backfill:main"
-miles-terrain-rebuild = "miles.terrain_backfill:rebuild_main"
 miles-area-import = "miles.area_import:main"
 miles-area-refresh = "miles.area_refresh:main"
 

@@ -1,23 +1,15 @@
-"""Area import: the athlete names a place (or a point), and the tiles
-covering it get cut from a regional OpenStreetMap extract and a DEM and
-cached locally, so a trail/road graph can later be built over an area
-without ever making its own HTTP calls.
+"""Area import: tiles covering a place are cut from a regional OpenStreetMap
+extract plus elevation tiles and cached, so a network graph can be built
+without further HTTP calls.
 
-An area is a lens onto the tile cache (tilecache.py's map_tiles, keyed by
-tiles.py's fixed grid), not a copy of it -- two overlapping areas share
-whatever tiles they have in common. Areas themselves follow the same
-raw-data-is-ground-truth split as everything else in this project: an
-area's own row (center, radius, label, pinned) is athlete-authored, while
-its tile membership and import status are maintained by the background
-import job and safe to recompute.
+An area is a lens onto the shared tile cache (map_tiles on tiles.py's fixed
+grid): overlapping areas share tiles. An area's own row (center, radius,
+label, pinned) is athlete-authored; tile membership and import status belong
+to the import job and are safe to recompute.
 
-Refresh policy: map data is refreshed only when asked (import_area with
-refresh=True); nothing ages out on its own. An area reports the date its map
-data is as of and, once that is older than REFRESH_SUGGESTED_AFTER_DAYS, a
-refresh_suggested flag. Pinning protects an area from garbage collection: an
-unpinned area untouched for UNPINNED_GC_DAYS is deleted outright on the next
-import_area call (any area's), and any tile no area references any longer
-is deleted alongside it.
+Map data refreshes only on request (import_area with refresh=True). An
+unpinned area untouched for UNPINNED_GC_DAYS is deleted on the next
+import_area call, along with any tile no area references.
 """
 
 import os
@@ -31,14 +23,12 @@ from typing_extensions import NotRequired, TypedDict
 from . import db, elevation, extracts, geocode, geofabrik, metrics, network, tilecache, tiles
 from .errors import describe_error
 
-# Rough throughput of a filtered pass over an extract, used only to estimate
-# an import's expected seconds, never to gate anything.
+# Rough throughput of a filtered pass over an extract; estimates only.
 EXTRACT_CUT_MB_PER_S = 13.7
 
 DRIVE_KM_PER_MINUTE = 1.0
-# Largest import radius, for an explicit radius_km and for the drive-minutes
-# heuristic alike: a bigger area is a much bigger cut, elevation prefetch and
-# graph for a search that never needs to look that far.
+# Largest import radius (explicit or from drive minutes): a bigger area is a
+# much bigger cut, elevation prefetch and graph than a search needs.
 MAX_RADIUS_KM = 60.0
 
 REFRESH_SUGGESTED_AFTER_DAYS = 180.0
@@ -78,10 +68,9 @@ class AreaDetail(AreaSummary):
 
 
 class ImportEstimate(TypedDict):
-    # "extract:<region>" for a registered file, "pending-extract:<region>"
-    # for one still to be downloaded (several regions comma-separated for an
-    # area cut from more than one extract), "pending-extract" when the region
-    # is not known without fetching Geofabrik's index.
+    # "extract:<region>" for a registered file, "pending-extract:<region>" for
+    # one still to download (regions comma-separated), "pending-extract" when
+    # the region is unknown without fetching the index.
     source: str
     tile_count: int
     # None while the extract still has to be downloaded.
@@ -97,18 +86,16 @@ class AreaStatus(TypedDict):
     total: NotRequired[int | None]
     error: NotRequired[str | None]
     estimate: NotRequired[ImportEstimate]
-    # Present when the center was geocoded from a place name: Nominatim's
-    # display name for it, and the attribution its data licence requires.
+    # Present when the center was geocoded: display name and licence attribution.
     geocode: NotRequired[geocode.GeocodeResult]
     data_as_of: NotRequired[str | None]
     refresh_suggested: NotRequired[bool]
 
 
 def init_area_schema(conn: sqlite3.Connection) -> None:
-    # source is "extract:<region>"; rows written before extracts were the only
-    # map source may say "overpass" and stay readable. inputs is a JSON object
-    # of region -> fetched_at of the extract files a tile was cut from, NULL
-    # for tiles uploaded or written before it existed.
+    # source is "extract:<region>"; older rows may say "overpass" and stay
+    # readable. inputs is a JSON object of region -> fetched_at of the extract
+    # files a tile was cut from, NULL for uploaded or older tiles.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS map_tiles (
             gx            INTEGER NOT NULL,
@@ -228,11 +215,10 @@ def _row_to_detail(conn: sqlite3.Connection, row: sqlite3.Row) -> AreaDetail:
 
 
 def area_freshness(conn: sqlite3.Connection, area_id: int) -> tuple[str | None, bool]:
-    """(data_as_of, refresh_suggested) for an area: the oldest date any of its
-    tiles' data is as of -- the oldest of the extracts' own dates for tiles cut
-    from one or several, the cut time for tiles from an uploaded cut -- and
-    whether that is older than REFRESH_SUGGESTED_AFTER_DAYS. (None, False)
-    before any tile is cached."""
+    """(data_as_of, refresh_suggested): the oldest date any tile's data is as
+    of (the extracts' own dates, or the cut time for an uploaded cut) and
+    whether it is older than REFRESH_SUGGESTED_AFTER_DAYS. (None, False) before
+    any tile is cached."""
     rows = conn.execute(
         """
         SELECT mt.source, MIN(mt.fetched_at) AS fetched_at
@@ -277,11 +263,9 @@ def get_area(conn: sqlite3.Connection, area_id: int) -> AreaDetail:
 
 
 def rebuild_stale_network(conn: sqlite3.Connection, area_id: int) -> bool:
-    """Rebuild an area's network from its cached tiles when it was built by
-    an older network.NETWORK_DERIVE_VERSION -- no extract fetch,
-    the same job import_tiles runs. Returns True while the stale graph is
-    being replaced (started by this call or already running), which callers
-    must not search or treat as ready."""
+    """Rebuild an area's network from cached tiles when built by an older
+    network.NETWORK_DERIVE_VERSION (no extract fetch). Returns True while the
+    stale graph is being replaced; callers must not search or treat it as ready."""
     if not network.graph_is_stale(conn, area_id):
         return False
     if _try_start_import(conn, area_id):
@@ -323,8 +307,8 @@ def unpin_area(conn: sqlite3.Connection, area_id: int) -> AreaDetail:
 
 def gc_areas_and_tiles(conn: sqlite3.Connection) -> None:
     """Delete unpinned areas untouched for UNPINNED_GC_DAYS and any map tile
-    no remaining area references. Run opportunistically at the start of
-    import_area rather than on a schedule -- there's no daemon here."""
+    no remaining area references. Runs at the start of import_area; there is
+    no scheduler."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=UNPINNED_GC_DAYS)).isoformat()
     stale_ids = [
         r["area_id"]
@@ -362,9 +346,7 @@ def _resolve_radius_km(radius_km: float | None, drive_minutes: float | None) -> 
             raise ValueError(f"radius_km must be above 0 and at most {MAX_RADIUS_KM:g}")
         return radius_km
     if drive_minutes is not None:
-        # A flat km-per-minute stand-in for a real drive-time isochrone,
-        # capped so a long drive estimate doesn't request a wildly
-        # oversized import.
+        # A flat stand-in for a drive-time isochrone.
         return min(drive_minutes * DRIVE_KM_PER_MINUTE, MAX_RADIUS_KM)
     raise ValueError("import_area needs radius_km or drive_minutes")
 
@@ -385,9 +367,8 @@ def _resolve_center(
 
 
 def _try_start_import(conn: sqlite3.Connection, area_id: int) -> bool:
-    """Atomically flip an area to 'importing' unless an import already holds
-    it. SQLite serializes writers, so two callers racing this UPDATE can't
-    both see rowcount > 0."""
+    """Atomically flip an area to 'importing' unless an import holds it;
+    SQLite serializes writers, so racing callers cannot both win."""
     cur = conn.execute(
         """
         UPDATE areas SET status = 'importing', status_phase = NULL,
@@ -402,9 +383,8 @@ def _try_start_import(conn: sqlite3.Connection, area_id: int) -> bool:
 
 
 def _estimate_import(conn: sqlite3.Connection, bbox: tuple[float, float, float, float], region: str | None) -> ImportEstimate:
-    """Estimate an import's source, unit of work, and expected seconds --
-    never triggers a download or an index fetch, just checks what is already
-    registered and cached."""
+    """Source, tile count, and expected seconds, from what is already
+    registered and cached; never downloads or fetches the index."""
     needed = tiles.tiles_in_bbox(*bbox)
     planned = extracts.planned_regions(conn, bbox, region)
     records = [extracts.get_extract(conn, path) for path in planned]
@@ -438,26 +418,17 @@ def import_area(
     refresh_geocode: bool = False,
 ) -> AreaStatus:
     """Create (or reuse, keyed by label) an area and start a background
-    import unless one is already running. Returns immediately with the
-    area's current status plus an import estimate -- poll get_area_status
-    for progress.
+    import unless one is running; returns the status plus an import estimate.
 
-    region is a Geofabrik path (e.g. "continent/country"), or several as a list
-    or comma-separated, the athlete has told us to use for this place; it's
-    used only when no already-registered extract covers the bbox, and
-    downloaded on demand. Without one, the cheapest set of Geofabrik regions
-    covering the area is chosen (several at a border). A path Geofabrik's
-    index does not list is refused (checked at once when the index has been
-    fetched before, else by the background job).
-    pinned and region are left as they are on an existing area when None,
-    so re-importing never silently unpins an area or forgets its region.
-    Giving no place, coordinates, or size for an existing label reuses the
-    area's stored center and radius.
+    region is a Geofabrik path or several (list or comma-separated), used only
+    when no registered extract covers the bbox; otherwise the cheapest covering
+    set is chosen. An unlisted path is refused (at once if the index was
+    fetched before, else by the background job). pinned and region are kept
+    when None, as are the stored center and radius when no place, coordinates,
+    or size is given for an existing label.
 
-    Cached map data is reused as it is. refresh=True re-fetches it: a
-    registered extract is re-downloaded if Geofabrik has a newer one (at most
-    once a day per region). refresh_geocode=True looks `place` up in
-    Nominatim again instead of trusting the cached answer."""
+    Cached map data is reused; refresh=True re-downloads an extract Geofabrik
+    has a newer version of. refresh_geocode=True re-looks-up `place`."""
     if not label:
         raise ValueError("import_area needs a label")
     region_paths = extracts.split_regions(region)
@@ -527,11 +498,9 @@ def import_area(
 
 
 def refresh_area(conn: sqlite3.Connection, label: str, *, force_extract: bool = False) -> AreaStatus:
-    """Re-fetch an existing area's map data now, in this thread, and return
-    its final status. For the CLI; the API and MCP tool start the same job in
-    the background through import_area(refresh=True). force_extract replaces
-    the area's regional extract unconditionally, for a file that is bad but
-    still registered."""
+    """Re-fetch an existing area's map data in this thread and return its
+    final status (the CLI path). force_extract replaces the regional extract
+    unconditionally, for a bad file that is still registered."""
     row = conn.execute("SELECT area_id FROM areas WHERE label = ?", (label,)).fetchone()
     if row is None:
         raise AreaNotFoundError(f"no area labeled {label!r}")
@@ -554,10 +523,9 @@ def select_area_extracts(
     conn: sqlite3.Connection, area_id: int, refresh: bool = False, force_extract: bool = False
 ) -> list[extracts.ExtractRecord]:
     """The extracts to cut area_id from (extracts.select_extracts), downloading
-    any that are missing. While another import holds a region's download the
-    area's phase reads "waiting-for-download"; while this one downloads
-    a region itself it reads "downloading" with the bytes received (the total is None
-    when the server declared no size)."""
+    missing ones. Phase reads "waiting-for-download" while another import holds
+    the download, "downloading" (bytes received; total None if undeclared)
+    while this one does."""
     area = _get_area_row(conn, area_id)
     bbox = tiles.bbox_for_center_radius(area["center_lat"], area["center_lng"], area["radius_km"])
 
@@ -583,17 +551,12 @@ def _fetch_tiles_phase(
     force_extract: bool = False,
     selected: list[extracts.ExtractRecord] | None = None,
 ) -> None:
-    """Fill map_tiles for everything area's bbox needs from the extracts
-    extracts.select_extracts picks (one fast local pass over each registered
-    file, downloaded first when none covers the area) -- see
-    docs/design-terrain-and-route-search.md section 2 and extracts.py's
-    module docstring. A caller that already ran select_area_extracts passes
-    its result as selected. The area's tile membership
-    is recorded before any tile is fetched, so gc_areas_and_tiles run by a
-    concurrent import can't evict tiles this one is still filling. The tiles
-    are cut again unless every one was already cut from exactly the extracts
-    it now needs, at their current fetched_at (extracts.tiles_cut_from);
-    refresh matters only through the extract it may replace."""
+    """Fill map_tiles for the area's bbox from the selected extracts
+    (docs/design-terrain-and-route-search.md section 2). A caller that already
+    ran select_area_extracts passes its result as selected. Tile membership is
+    recorded first so a concurrent import's gc cannot evict tiles still being
+    filled. Tiles are re-cut unless all were cut from exactly the extracts
+    needed now, at their current fetched_at (extracts.tiles_cut_from)."""
     bbox = tiles.bbox_for_center_radius(area["center_lat"], area["center_lng"], area["radius_km"])
     needed = tiles.tiles_in_bbox(*bbox)
     total = len(needed)
@@ -635,9 +598,8 @@ def _payload_extent(payloads: Iterable[dict]) -> tuple[float, float, float, floa
 
 
 def _finish_import(conn: sqlite3.Connection, area_id: int, area: sqlite3.Row) -> None:
-    """Elevation prefetch + network build, shared by _do_import (tiles just
-    fetched by this process) and import_tiles (tiles uploaded by the CLI,
-    already fetched and cut somewhere else)."""
+    """Elevation prefetch and network build, shared by _do_import and
+    import_tiles (tiles uploaded already cut)."""
     needed = [(r["gx"], r["gy"]) for r in conn.execute(
         "SELECT gx, gy FROM area_tiles WHERE area_id = ?", (area_id,)
     ).fetchall()]
@@ -646,11 +608,10 @@ def _finish_import(conn: sqlite3.Connection, area_id: int, area: sqlite3.Row) ->
     if missing:
         raise AreaImportError(f"{len(missing)} of {total} map tiles are missing from the cache")
 
-    # Every DEM tile under the area is fetched here, in the background job and
-    # outside any transaction. The build then reads the cache alone: a fetch
-    # during it would hold the write lock across network calls. Ways are stored
-    # with their full geometry and run past the area's tile edge, so the range
-    # follows the coordinates in the payloads, not the tile boundaries.
+    # DEM tiles are fetched here, outside any transaction, so the build reads
+    # the cache alone and never holds the write lock across network calls.
+    # Ways run past the area's tile edge, so the range follows the payload
+    # coordinates, not the tile boundaries.
     extent = _payload_extent(area_tile_payloads(conn, area_id))
     elevation.ensure_tiles(
         conn,
@@ -670,10 +631,8 @@ def _do_import(
     force_extract: bool = False,
     selected: list[extracts.ExtractRecord] | None = None,
 ) -> None:
-    """The actual tile + elevation fetch, against a caller-owned connection.
-    Split from _run_import_job so it can run synchronously (tests; a caller
-    that already holds an open connection) without a second thread opening
-    a second connection to the same database."""
+    """The tile and elevation work on a caller-owned connection, so it can
+    run synchronously without a second connection."""
     area = _get_area_row(conn, area_id)
     _fetch_tiles_phase(conn, area_id, area, refresh, force_extract, selected)
     _finish_import(conn, area_id, area)
@@ -697,10 +656,8 @@ def import_tiles(
     source: str = "extract:cli",
 ) -> AreaStatus:
     """Create (or reuse, keyed by label) an area from tiles already cut and
-    uploaded by miles-area-import, skipping the tile-fetch phase entirely,
-    then run the same elevation-prefetch + network-build tail _do_import
-    does. For an operator with a pbf the miles-api host can't reach itself:
-    cut it locally, upload just the result."""
+    uploaded by miles-area-import, skipping the tile fetch and running the
+    elevation and network tail. For a pbf the API host cannot reach."""
     if not label:
         raise ValueError("import_tiles needs a label")
     gc_areas_and_tiles(conn)
@@ -751,18 +708,15 @@ def _run_job(
     body: Callable[[sqlite3.Connection, int], None],
     before_lock: Callable[[sqlite3.Connection, int], None] | None = None,
 ) -> None:
-    """Thread target shared by import_area and import_tiles: opens its own
-    connection (a sqlite3.Connection isn't safe to share across threads),
-    runs body, and reports ready/error into the areas row, polled by
-    get_area_status.
+    """Thread target for an import: opens its own connection, runs body, and
+    records ready/error in the areas row.
 
-    body runs under _import_lock. before_lock runs first, outside it, for
-    work that may wait on another import's extract download, which can take
-    hours and must not hold up every other import."""
+    body runs under _import_lock. before_lock runs first, outside it, because
+    it may wait hours on another import's extract download."""
     conn = db.connect()
     try:
-        # One import's network phase at a time, process-wide: each one is a
-        # burst of requests to shared public services (see http_client).
+        # One network phase at a time process-wide: each is a burst of requests
+        # to shared public services.
         _set_progress(conn, area_id, phase="queued", done=0, total=1)
         if before_lock is not None:
             before_lock(conn, area_id)
@@ -780,8 +734,7 @@ def _run_job(
         )
         conn.commit()
     except Exception as e:
-        # Whatever the failed job left uncommitted must not be saved along
-        # with the error status.
+        # Uncommitted work of the failed job must not be saved with the error.
         conn.rollback()
         conn.execute(
             "UPDATE areas SET status = 'error', status_error = ? WHERE area_id = ?",

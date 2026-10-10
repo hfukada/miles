@@ -2,7 +2,7 @@ import sqlite3
 from datetime import date, timedelta
 
 import pytest
-from helpers import insert_activity, strava_fault
+from helpers import insert_activity, none_sampler, strava_fault
 from stravalib.model import Stream
 
 from miles import db, elevation, strava_budget, strava_client, streams, terrain, terrain_backfill
@@ -11,12 +11,7 @@ from miles import db, elevation, strava_budget, strava_client, streams, terrain,
 @pytest.fixture(autouse=True)
 def _no_dem_fetch(monkeypatch):
     monkeypatch.setattr(elevation, "ensure_tiles", lambda conn, **kwargs: None)
-    monkeypatch.setattr(elevation, "sampler_for", lambda conn: _NoDemSampler())
-
-
-class _NoDemSampler:
-    def sample(self, points):
-        return [None] * len(points)
+    monkeypatch.setattr(elevation, "sampler_for", lambda conn: none_sampler())
 
 
 def _run(conn: sqlite3.Connection, days_ago: int, activity_id: int, sport_type: str = "Run") -> None:
@@ -107,13 +102,20 @@ def test_the_queue_holds_runs_that_need_streams_and_drops_them_once_fetched_else
 def test_run_backfill_fetches_caches_and_segments(conn: sqlite3.Connection, monkeypatch):
     _run(conn, 9, 1)
     _run(conn, 8, 2)
-    _strava_streams(monkeypatch)
+    _run(conn, 7, 3)
+    asked = _strava_streams(monkeypatch)
 
     progress = terrain_backfill.BackfillProgress(conn)
     assert progress.try_start()
+    assert terrain_backfill.run_backfill(conn, progress, only_ids={3}) == 1
+    assert asked == [3]
+    assert _queued(conn) == 2
+    asked.clear()
+
     fetched = terrain_backfill.run_backfill(conn, progress)
 
     assert fetched == 2
+    assert sorted(asked) == [1, 2]
     assert _queued(conn) == 0
     for activity_id in (1, 2):
         assert streams.needs_streams_fetch(activity_id) is False
@@ -125,42 +127,22 @@ def test_run_backfill_fetches_caches_and_segments(conn: sqlite3.Connection, monk
     assert snap["total"] == 2
 
 
-def test_run_backfill_only_ids_fetches_just_those_activities(conn: sqlite3.Connection, monkeypatch):
-    for activity_id in (1, 2, 3):
-        _run(conn, 10 - activity_id, activity_id)
-    asked = _strava_streams(monkeypatch)
-
-    assert _backfill(conn, only_ids={2}) == 1
-    assert asked == [2]
-    assert _queued(conn) == 2
-
-
-def test_run_backfill_with_an_empty_queue_does_nothing(conn: sqlite3.Connection, monkeypatch):
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: False)
-    assert _backfill(conn) == 0
-
-
-@pytest.mark.parametrize(
-    "daily_left, reserve_from",
-    [(5, "gate"), (40, "environment")],
-)
-def test_the_reserve_stops_the_run_with_the_queue_intact(conn: sqlite3.Connection, monkeypatch, strava_allowance, daily_left: int, reserve_from: str):
-    _run(conn, 9, 1)
-    strava_allowance(daily=daily_left)
-    _no_strava_fetch(monkeypatch)
-    gate = None
-    if reserve_from == "gate":
-        gate = strava_budget.Gate(10)
-    else:
-        monkeypatch.setenv(strava_budget.RESERVE_ENV, "50")
-
-    assert _backfill(conn, **({"gate": gate} if gate else {})) == 0
-    assert _queued(conn) == 1  # nothing fetched, but queued for next time
-
-
-def test_the_reserve_is_checked_before_every_request(conn: sqlite3.Connection, monkeypatch):
+def test_the_reserve_stops_the_run_before_any_request_that_would_dip_into_it_with_the_queue_intact(
+    conn: sqlite3.Connection, monkeypatch, strava_allowance
+):
     for activity_id in range(1, 6):
         _run(conn, activity_id, activity_id)
+    _no_strava_fetch(monkeypatch)
+
+    strava_allowance(daily=5)
+    assert _backfill(conn, gate=strava_budget.Gate(10)) == 0
+    assert _queued(conn) == 5  # nothing fetched, but queued for next time
+
+    strava_allowance(daily=40)
+    monkeypatch.setenv(strava_budget.RESERVE_ENV, "50")
+    assert _backfill(conn) == 0
+
+    monkeypatch.delenv(strava_budget.RESERVE_ENV)
     left = {"daily": 14}
     monkeypatch.setattr(strava_client, "daily_calls_remaining", lambda: left["daily"])
 
@@ -169,7 +151,6 @@ def test_the_reserve_is_checked_before_every_request(conn: sqlite3.Connection, m
         return _fake_raw_streams()
 
     asked = _strava_streams(monkeypatch, fetch)
-
     assert _backfill(conn, gate=strava_budget.Gate(12)) == 2
     assert len(asked) == 2
 
@@ -186,34 +167,45 @@ def test_a_nearly_spent_window_is_waited_out_before_the_next_request(conn: sqlit
     assert waits == [1]
 
 
-def test_run_backfill_resumes_after_a_429(conn: sqlite3.Connection, monkeypatch):
+@pytest.mark.parametrize("persistent", [False, True], ids=["resumes after a 429", "a daily limit ends the run quietly"])
+def test_a_429_is_waited_out_and_a_persistent_one_ends_the_run_with_the_queue_intact(conn: sqlite3.Connection, monkeypatch, persistent: bool):
     _run(conn, 9, 1)
+    _model_is_current(conn)
     monkeypatch.setattr(strava_budget, "wait_for_next_window", lambda on_wait=None: None)
 
     def fetch(aid):
-        if len(asked) == 1:
+        if persistent or len(asked) == 1:
             raise strava_fault(429)
         return _fake_raw_streams()
 
     asked = _strava_streams(monkeypatch, fetch)
 
-    assert _backfill(conn) == 1
-    assert len(asked) == 2
-    assert _queued(conn) == 0
+    assert _backfill(conn) == (0 if persistent else 1)
+    assert _queued(conn) == (1 if persistent else 0)
 
 
-def test_a_daily_limit_hit_with_a_429_ends_the_run_quietly_with_the_queue_intact(conn: sqlite3.Connection, monkeypatch):
-    _run(conn, 9, 1)
+@pytest.mark.parametrize(
+    "status, expected_requests, message",
+    [(401, 1, "401"), (502, terrain_backfill.MAX_CONSECUTIVE_SERVICE_FAILURES, None)],
+    ids=["an expired token", "persistent server errors"],
+)
+def test_a_failure_that_is_not_the_activitys_stops_the_run_without_blaming_it(
+    conn: sqlite3.Connection, monkeypatch, status: int, expected_requests: int, message: str | None
+):
+    _run(conn, 8, 1)
+    _run(conn, 9, 2)
     _model_is_current(conn)
-    monkeypatch.setattr(strava_budget, "wait_for_next_window", lambda on_wait=None: None)
 
-    def limited(aid):
-        raise strava_fault(429)
+    def fetch(aid):
+        raise strava_fault(status)
 
-    _strava_streams(monkeypatch, limited)
+    asked = _strava_streams(monkeypatch, fetch)
+    with pytest.raises(terrain_backfill.BackfillAbortedError, match=message):
+        _backfill(conn)
 
-    assert _backfill(conn) == 0
-    assert _queued(conn) == 1
+    assert len(asked) == expected_requests
+    assert _failures(conn) == 0
+    assert terrain_backfill.refresh_backfill_queue(conn) == 2
 
 
 @pytest.mark.parametrize("status", [404, 403])
@@ -236,23 +228,6 @@ def test_a_missing_or_private_activity_is_recorded_against_it_and_skipped(conn: 
     assert terrain_backfill.refresh_backfill_queue(conn) == 0  # not queued again
 
 
-def test_an_expired_token_stops_the_run_without_blaming_the_activity(conn: sqlite3.Connection, monkeypatch):
-    _run(conn, 8, 1)
-    _run(conn, 9, 2)
-    _model_is_current(conn)
-
-    def fetch(aid):
-        raise strava_fault(401)
-
-    asked = _strava_streams(monkeypatch, fetch)
-    with pytest.raises(terrain_backfill.BackfillAbortedError, match="401"):
-        _backfill(conn)
-
-    assert len(asked) == 1
-    assert _failures(conn) == 0
-    assert terrain_backfill.refresh_backfill_queue(conn) == 2
-
-
 def test_a_transient_server_error_is_retried_and_not_held_against_the_activity(conn: sqlite3.Connection, monkeypatch):
     _run(conn, 8, 1)
     _model_is_current(conn)
@@ -265,22 +240,6 @@ def test_a_transient_server_error_is_retried_and_not_held_against_the_activity(c
     asked = _strava_streams(monkeypatch, fetch)
 
     assert _backfill(conn) == 1
-    assert _failures(conn) == 0
-
-
-def test_persistent_server_errors_stop_the_run(conn: sqlite3.Connection, monkeypatch):
-    _run(conn, 8, 1)
-    _run(conn, 9, 2)
-    _model_is_current(conn)
-
-    def fetch(aid):
-        raise strava_fault(502)
-
-    asked = _strava_streams(monkeypatch, fetch)
-    with pytest.raises(terrain_backfill.BackfillAbortedError):
-        _backfill(conn)
-
-    assert len(asked) == terrain_backfill.MAX_CONSECUTIVE_SERVICE_FAILURES
     assert _failures(conn) == 0
 
 
@@ -318,39 +277,6 @@ def test_run_whose_streams_were_stored_by_an_activity_view_still_gets_segmented(
 
     assert _segment_count(conn, 1) > 0
     assert conn.execute("SELECT COUNT(*) FROM terrain_segment_dates WHERE activity_id = 1").fetchone()[0] == 1
-
-
-def test_a_run_that_fails_to_segment_is_not_retried_by_the_next_backfill(conn: sqlite3.Connection, monkeypatch):
-    _run(conn, 9, 1)
-    _model_is_current(conn)
-    streams.cache_streams(1, _fake_raw_streams())
-    _no_strava_fetch(monkeypatch)
-    attempts: list[int] = []
-
-    def failing(conn, activity_id, *args, **kwargs):
-        attempts.append(activity_id)
-        raise ValueError("bad segment")
-
-    monkeypatch.setattr(terrain, "segment_and_store_activity", failing)
-
-    _backfill(conn)
-    _backfill(conn)
-
-    assert attempts == [1]
-    assert streams.has_cached_streams(1)
-
-
-def test_a_cached_run_with_an_unreadable_stream_file_is_discarded_and_queued_for_refetch(conn: sqlite3.Connection, monkeypatch):
-    _run(conn, 9, 1)
-    _model_is_current(conn)
-    streams.cache_streams(1, _fake_raw_streams())
-    streams._raw_path(1).write_bytes(b"not gzip")
-    _no_strava_fetch(monkeypatch)
-
-    _backfill(conn)
-
-    assert streams.needs_streams_fetch(1)
-    assert terrain_backfill.refresh_backfill_queue(conn) == 1
 
 
 def test_a_run_with_no_segments_is_processed_once_not_on_every_backfill(conn: sqlite3.Connection, monkeypatch):

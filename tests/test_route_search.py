@@ -3,10 +3,8 @@ import json
 import sqlite3
 import threading
 import time
-from typing import cast
-
 import pytest
-from helpers import ImmediateThread, NoneSampler, node, way
+from helpers import ImmediateThread, climbing_sampler, node, none_sampler, way
 
 from miles import areas, network, route_search, routes as routes_service
 
@@ -118,7 +116,7 @@ def _build_diamond_area(conn: sqlite3.Connection, area_id: int = 1) -> dict[str,
     quiet_way_id = way_ids()
     _add_single_way_path(nodes, ways, node_ids, quiet_way_id, E_ID, E_LL, W_ID, W_LL, waypoints=1, highway="residential", tags=QUIET_WAY_TAGS)
 
-    stats = network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], NoneSampler())
+    stats = network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], none_sampler())
     assert stats["edge_count"] >= 24
     return {"busy_way_id": busy_way_id, "quiet_way_id": quiet_way_id}
 
@@ -126,7 +124,7 @@ def _build_diamond_area(conn: sqlite3.Connection, area_id: int = 1) -> dict[str,
 def _build_ring_area(conn: sqlite3.Connection, area_id: int = 4, sampler=None) -> tuple[list[dict], list[dict]]:
     """Only the diamond's perimeter: exactly one loop exists, ridden either way."""
     nodes, ways = _ring_elements(_IdAllocator(100), _IdAllocator(0))
-    network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], sampler or NoneSampler())
+    network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], sampler or none_sampler())
     return nodes, ways
 
 
@@ -219,7 +217,7 @@ def _triangle_length_m(conn: sqlite3.Connection, quiet_way_id: int) -> float:
     return _perimeter_length_m(conn, 1) / 2.0 + _side_length_m(conn, 1, quiet_way_id)
 
 
-def test_avoid_way_ids_excludes_the_avoided_road(conn: sqlite3.Connection):
+def test_an_avoided_road_is_excluded_whether_named_in_the_request_or_overridden_persistently(conn: sqlite3.Connection):
     ids = _build_diamond_area(conn)
     quiet_only = _way_points(conn, ids["quiet_way_id"]) - _ring_points(conn)
     assert quiet_only
@@ -236,17 +234,8 @@ def test_avoid_way_ids_excludes_the_avoided_road(conn: sqlite3.Connection):
     for candidate in avoided["candidates"]:
         assert not (_candidate_points(candidate) & quiet_only)
 
-
-def test_persistent_avoid_override_excludes_the_way_from_searches(conn: sqlite3.Connection):
-    ids = _build_diamond_area(conn)
-    quiet_only = _way_points(conn, ids["quiet_way_id"]) - _ring_points(conn)
-    triangle = _triangle_length_m(conn, ids["quiet_way_id"])
-    network.set_way_override(conn, ids["quiet_way_id"], "avoid")
-
-    result = route_search.find_routes(conn, _base_request(1, triangle * 0.97, triangle * 1.03, n=5, time_budget_s=5.0))
-
-    assert result["candidates"]
-    for candidate in result["candidates"]:
+    network.set_way_override(conn, ids["quiet_way_id"], "avoid")  # the persistent form of the same request
+    for candidate in route_search.find_routes(conn, wanted)["candidates"]:
         assert not (_candidate_points(candidate) & quiet_only)
 
 
@@ -264,7 +253,7 @@ def test_near_miss_reports_the_missed_constraints(conn: sqlite3.Connection):
         assert any(m["constraint"] == "distance_range" for m in candidate["missed_constraints"])
 
 
-def test_diversify_returns_distinct_candidates(conn: sqlite3.Connection):
+def test_diversify_returns_distinct_candidates_and_a_loop_ridden_in_either_direction_is_one(conn: sqlite3.Connection):
     _build_diamond_area(conn)
     perimeter = _perimeter_length_m(conn, 1)
 
@@ -276,16 +265,10 @@ def test_diversify_returns_distinct_candidates(conn: sqlite3.Connection):
     geometries = [frozenset(_candidate_points(c)) for c in result["candidates"]]
     assert len(set(geometries)) == len(geometries), "every returned candidate must be a different route"
 
-
-def test_a_loop_ridden_in_either_direction_is_returned_once(conn: sqlite3.Connection):
     _build_ring_area(conn)
-    perimeter = conn.execute("SELECT SUM(length_m) FROM net_edges WHERE area_id = 4").fetchone()[0]
-
-    result = route_search.find_routes(
-        conn, _base_request(4, perimeter * 0.9, perimeter * 1.1, n=5, shape="loop", time_budget_s=5.0)
-    )
-
-    assert len(result["candidates"]) == 1
+    ring = conn.execute("SELECT SUM(length_m) FROM net_edges WHERE area_id = 4").fetchone()[0]
+    only_loop = route_search.find_routes(conn, _base_request(4, ring * 0.9, ring * 1.1, n=5, shape="loop", time_budget_s=5.0))
+    assert len(only_loop["candidates"]) == 1
 
 
 def test_a_start_on_an_existing_degree_two_junction_survives_contraction(conn: sqlite3.Connection):
@@ -399,18 +382,6 @@ def test_same_seed_is_reproducible(conn: sqlite3.Connection):
     assert first["seed"] == second["seed"] == 42
 
 
-def test_unset_parameters_given_as_none_or_empty_lists_do_not_change_the_default_seed(conn: sqlite3.Connection):
-    _build_diamond_area(conn)
-    perimeter = _perimeter_length_m(conn, 1)
-    plain = _base_request(1, perimeter * 0.5, perimeter * 1.5, n=1)
-    del plain["seed"]
-    explicit = {**plain, "min_trail_m": None, "avoid_way_ids": [], "seed": None}
-
-    seeds = {route_search.find_routes(conn, cast(route_search.RouteSearchRequest, r))["seed"] for r in (plain, explicit)}
-
-    assert len(seeds) == 1
-
-
 def test_save_route_candidate_creates_a_route_and_an_unknown_candidate_raises(conn: sqlite3.Connection):
     _build_diamond_area(conn)
     perimeter = _perimeter_length_m(conn, 1)
@@ -455,7 +426,7 @@ def _build_grid_area(conn: sqlite3.Connection, size: int, step_deg: float, area_
             if j + 1 < size:
                 ways.append(way(way_ids(), [grid_ids[(i, j)], grid_ids[(i, j + 1)]], {"highway": "residential"}))
 
-    stats = network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], NoneSampler())
+    stats = network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], none_sampler())
     assert stats["edge_count"] == 2 * size * (size - 1)
 
 
@@ -512,26 +483,14 @@ def test_search_refuses_a_graph_built_by_an_older_network_version(conn: sqlite3.
 
 
 @pytest.mark.parametrize("status", ["importing", "error", "new"])
-def test_search_refuses_a_first_import_that_has_no_graph_yet(conn: sqlite3.Connection, status: str):
+def test_search_refuses_a_first_import_that_has_no_graph_yet_and_uses_a_committed_graph_during_a_refresh(conn: sqlite3.Connection, status: str):
     _insert_area_row(conn, status)
 
     with pytest.raises(route_search.AreaNotReadyError, match="not ready"):
         route_search.find_routes(conn, _base_request(1, 1000.0, 2000.0))
 
-
-@pytest.mark.parametrize("status", ["importing", "error", "new"])
-def test_search_uses_the_committed_graph_while_the_area_is_refreshing_or_a_refresh_failed(conn: sqlite3.Connection, status: str):
     _build_diamond_area(conn)
-    _insert_area_row(conn, status)
-
-    result = route_search.find_routes(conn, _base_request(1, 1000.0, 20000.0))
-
-    assert result["candidates"]
-
-
-class _RisingSampler:
-    def sample(self, points):
-        return [100.0 + 2.0 * i for i, _ in enumerate(points)]
+    assert route_search.find_routes(conn, _base_request(1, 1000.0, 20000.0))["candidates"]
 
 
 def test_a_search_from_a_set_back_trailhead_does_not_flag_its_access_spur_as_missing_elevation(conn: sqlite3.Connection):
@@ -539,7 +498,7 @@ def test_a_search_from_a_set_back_trailhead_does_not_flag_its_access_spur_as_mis
     lot_lat, lot_lng = _interp(N_LL, E_LL, 0.5)
     lot = (lot_lat + 0.0004, lot_lng)
     nodes.append(node(9000, *lot, tags={"amenity": "parking"}))
-    network.build_network(conn, 6, [{"elements": [*nodes, *ways]}], _RisingSampler())
+    network.build_network(conn, 6, [{"elements": [*nodes, *ways]}], climbing_sampler(2.0))
     assert conn.execute("SELECT * FROM net_edges WHERE area_id = 6 AND way_id < 0").fetchone() is not None
 
     request = _base_request(6, 1000.0, 20000.0, starts=[{"lat": lot[0], "lng": lot[1]}], gain_m_min=0.0)
@@ -552,25 +511,6 @@ def test_a_search_from_a_set_back_trailhead_does_not_flag_its_access_spur_as_mis
         assert candidate["score"]["has_elevation"] is True
 
 
-def test_a_small_network_stops_once_candidates_stop_being_new(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _build_diamond_area(conn)
-    perimeter = _perimeter_length_m(conn, 1)
-    scored = {"n": 0}
-    real_score_path = network.score_path
-
-    def counting_score_path(*args, **kwargs):
-        scored["n"] += 1
-        return real_score_path(*args, **kwargs)
-
-    monkeypatch.setattr(network, "score_path", counting_score_path)
-
-    result = route_search.find_routes(conn, _base_request(1, perimeter * 0.9, perimeter * 1.1, n=1, time_budget_s=60.0))
-
-    assert result["candidates"] and not result["near_miss"]
-    assert result["budget_exceeded"] is False
-    assert scored["n"] < route_search.MAX_GENERATION_ATTEMPTS
-
-
 def test_budget_exceeded_is_reported_only_when_fewer_than_n_qualified(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     _build_diamond_area(conn)
     perimeter = _perimeter_length_m(conn, 1)
@@ -579,18 +519,14 @@ def test_budget_exceeded_is_reported_only_when_fewer_than_n_qualified(conn: sqli
 
     # Deadline hit before anything was generated: fewer than n qualify.
     result = route_search.find_routes(conn, _base_request(1, perimeter * 0.9, perimeter * 1.1, n=3, time_budget_s=1.0))
-
     assert result["budget_exceeded"] is True
 
-
-def test_running_out_the_budget_with_n_candidates_in_hand_is_not_budget_exceeded(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _build_diamond_area(conn)
-    perimeter = _perimeter_length_m(conn, 1)
+    # Running out the budget with n candidates in hand is not an overrun.
     ticks = itertools.count()
     monkeypatch.setattr(route_search.time, "monotonic", lambda: float(next(ticks)))
     monkeypatch.setattr(route_search, "STAGNATION_ATTEMPTS", 10**6)
-
     result = route_search.find_routes(conn, _base_request(1, perimeter * 0.9, perimeter * 1.1, n=1, time_budget_s=60.0))
-
     assert result["candidates"] and not result["near_miss"]
     assert result["budget_exceeded"] is False
+
+

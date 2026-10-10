@@ -21,22 +21,18 @@ def _old(offset: int) -> date:
     return date(2020, 1, 1) + timedelta(days=offset)
 
 
-def test_runs_within_a_fortnight_share_a_window_and_a_later_run_starts_another():
+def test_runs_within_a_fortnight_share_a_window_none_spans_more_and_recent_runs_use_the_forecast_endpoint():
     specs = [_spec(1, _old(0)), _spec(2, _old(13)), _spec(3, _old(14))]
     windows = weather.plan_windows(specs)
     assert [[s["activity_id"] for s in w.specs] for w in windows] == [[1, 2], [3]]
     assert (windows[0].start_date, windows[0].end_date) == (_old(0), _old(13))
 
-
-def test_a_window_never_spans_more_than_a_fortnight():
     specs = [_spec(i, _old(i * 5)) for i in range(60)]
     windows = weather.plan_windows(specs)
     assert len(windows) == 20  # three runs (days 0, 5, 10) fit each fourteen-day window
     assert all((w.end_date - w.start_date).days + 1 <= weather.MAX_WINDOW_DAYS for w in windows)
     assert sum(len(w.specs) for w in windows) == 60
 
-
-def test_recent_runs_go_to_the_forecast_endpoint_in_their_own_window():
     today = date(2026, 3, 20)
     specs = [_spec(1, today - timedelta(days=30)), _spec(2, today - timedelta(days=1))]
     windows = weather.plan_windows(specs, today=today)
@@ -172,20 +168,16 @@ def test_hours_with_no_values_leave_a_marker_that_is_not_requested_again_until_t
     assert len(fake.urls) == 2
     assert conn.execute("SELECT hourly_json FROM weather WHERE activity_id = 1").fetchone()[0] is not None
 
-
-def test_a_stored_row_with_no_values_is_asked_about_again_after_the_retry_age(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    _insert_run(conn, 1, _old(0))
+    # A stored row whose hours hold no values is asked about again after the retry age too.
+    _insert_run(conn, 2, _old(100))
     conn.execute(
-        "INSERT INTO weather (activity_id, fetched_at, hourly_json, raw_json) VALUES (1, ?, '[{\"temp_c\": null}]', '{}')",
+        "INSERT INTO weather (activity_id, fetched_at, hourly_json, raw_json) VALUES (2, ?, '[{\"temp_c\": null}]', '{}')",
         [_stale()],
     )
     conn.commit()
-    fake = FakeOpenMeteo(monkeypatch)
-
     sync._pass_weather(conn, sync.SyncProgress())
-
-    assert len(fake.urls) == 1
-    assert conn.execute("SELECT temp_c_avg FROM weather WHERE activity_id = 1").fetchone()[0] == 10.0
+    assert len(fake.urls) == 3
+    assert conn.execute("SELECT temp_c_avg FROM weather WHERE activity_id = 2").fetchone()[0] == 10.0
 
 
 def test_a_long_history_at_one_location_costs_one_request_per_window(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):

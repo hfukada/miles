@@ -1,11 +1,9 @@
 """The one outbound HTTP path for every public service miles calls.
 
-Each service has a ServicePolicy: a minimum interval between requests, whether
-requests must run strictly one at a time, which statuses are worth retrying,
-and a minimum pause after a "slow down" answer. State is process-wide (module
-level, not per connection or per caller), so concurrent background jobs and
-request handlers share one budget per service. docs/external-services.md lists
-each service's published usage policy and how these numbers follow from it.
+Each service has a ServicePolicy (interval, exclusivity, retryable statuses,
+pause after "slow down"). State is process-wide, so concurrent jobs and
+handlers share one budget per service. docs/external-services.md lists each
+service's usage policy and how these numbers follow from it.
 """
 
 import email.utils
@@ -68,9 +66,8 @@ def _version() -> str:
 
 
 def user_agent() -> str:
-    """`miles/<version> (+self-hosted)`, followed by `; contact: <value>` inside
-    the parentheses when MILES_CONTACT is set. Operators of public services ask
-    for a way to reach whoever is generating the traffic."""
+    """`miles/<version> (+self-hosted[; contact: <MILES_CONTACT>])`; public
+    services ask for a way to reach whoever generates the traffic."""
     contact = os.environ.get(CONTACT_ENV, "").strip()
     suffix = f"; contact: {contact}" if contact else ""
     return f"{PROJECT_NAME}/{_version()} (+self-hosted{suffix})"
@@ -93,9 +90,8 @@ class ServicePolicy:
     timeout_s: float = 60.0
 
 
-# Nominatim's policy is one request a second, no hammering after a refusal: a
-# 429 means back off for a minute, and a 403 means the client is blocked, so
-# the process stays away for an hour. Neither is retried.
+# Nominatim: a 429 means back off a minute, a 403 means blocked (stay away an
+# hour); neither is retried.
 NOMINATIM = ServicePolicy(
     "nominatim",
     min_interval_s=1.1,
@@ -111,8 +107,7 @@ TERRARIUM = ServicePolicy("terrarium", min_interval_s=0.1, max_attempts=4, backo
 OPEN_METEO = ServicePolicy(
     "open-meteo", min_interval_s=1.0, max_attempts=3, backoff_base_s=2.0, min_pause_s={429: 60.0}, timeout_s=60.0
 )
-# Two attempts: a connection that drops mid-file restarts the whole download,
-# so one retry is the most a multi-hundred-megabyte transfer should cost.
+# Two attempts: a dropped connection restarts the whole (large) download.
 GEOFABRIK = ServicePolicy("geofabrik", exclusive=True, max_attempts=2, backoff_base_s=5.0, timeout_s=300.0)
 
 
@@ -139,11 +134,9 @@ def _state(policy: ServicePolicy) -> _State:
 
 
 def _wait_turn(policy: ServicePolicy, state: _State) -> None:
-    """Sleep until the service's interval and any quiet period have passed,
-    then stamp this request as the latest. The stamp lock is held across the
-    sleep so two threads can never both conclude it is their turn; the quiet
-    period is re-read after each sleep, since another caller's 429 can extend
-    it while this one waits."""
+    """Sleep until the interval and any quiet period pass, then stamp this
+    request. The stamp lock is held across the sleep so two threads never both
+    take the turn; the quiet period is re-read since a 429 can extend it."""
     with state.stamp_lock:
         while True:
             now = time.monotonic()
@@ -201,7 +194,7 @@ def _attempt_loop(policy: ServicePolicy, state: _State, send: Callable[[], T], h
             retry_after = _retry_after_s(e.headers) or 0.0
             if retry_after > _MAX_RETRY_AFTER_S:
                 report_outcome(policy.name, e.code)
-                raise  # the server asked for longer than we will wait; retrying sooner would ignore it
+                raise  # retrying sooner would ignore the server's request
             delay = max(min(policy.backoff_base_s * (2**attempt), _MAX_BACKOFF_S), pause, retry_after)
         except _TRANSIENT_ERRORS as e:
             report(policy.name, host, "error")
@@ -230,12 +223,10 @@ def request(
     method: str | None = None,
 ) -> T:
     """One polite request: throttled per policy, retried on the policy's
-    statuses and on connection errors with exponential backoff (honoring
-    Retry-After and the policy's minimum pauses), bounded by max_attempts. The
-    last HTTPError/URLError propagates once attempts run out; any status the
-    policy does not retry propagates at once. `reader` receives the open
-    response and turns it into the return value (the default reads all bytes);
-    a streaming reader lets a large download go straight to disk."""
+    statuses and connection errors with exponential backoff (honoring
+    Retry-After and minimum pauses). The last error propagates when attempts
+    run out; a non-retryable status propagates at once. `reader` turns the open
+    response into the result (default: all bytes), so a download can stream to disk."""
     state = _state(policy)
     host = urllib.parse.urlsplit(url).hostname or ""
     all_headers = {"User-Agent": user_agent(), **(headers or {})}
@@ -243,8 +234,8 @@ def request(
     def send() -> T:
         req = urllib.request.Request(url, data=data, headers=all_headers, method=method)
         with urllib.request.urlopen(req, timeout=timeout_s or policy.timeout_s) as resp:
-            # Reported once the body is in hand: a connection that dies while
-            # it is read is an error, not a 200 that then also counts as one.
+            # Reported after the body is read, so a connection dying mid-body
+            # counts as an error, not also as a 200.
             result = reader(resp)
             report(policy.name, host, getattr(resp, "status", 200))
             return result

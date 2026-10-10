@@ -1,6 +1,5 @@
 import gzip
 import json
-import math
 
 import pandas as pd
 import pytest
@@ -35,19 +34,11 @@ def _entry(data: list, stream_type: str = "time", series_type: str = "time") -> 
     return {"type": stream_type, "data": data, "series_type": series_type, "original_size": len(data), "resolution": "high"}
 
 
-def test_minetti_cost_ratio_is_one_on_the_flat_dearer_uphill_cheaper_downhill_and_clipped_when_extreme():
-    assert minetti_cost_ratio(0.0) == pytest.approx(1.0)
-    # Uphill must cost strictly more than flat ground, otherwise GAP would
-    # make hills "faster" than flat, which is physically wrong.
-    assert minetti_cost_ratio(10.0) > 1.0
-    # Moderate downhill costs less than flat but never reaches zero.
-    assert 0 < minetti_cost_ratio(-10.0) < 1.0
-    # Grades steeper than +/-45% clip rather than extrapolate the polynomial,
-    # which is only fit to a bounded range and blows up outside it.
-    assert minetti_cost_ratio(45.0) == pytest.approx(minetti_cost_ratio(1000.0))
-
-
 def test_gap_pace_equals_real_pace_on_the_flat_and_is_faster_uphill():
+    assert minetti_cost_ratio(0.0) == pytest.approx(1.0)
+    assert minetti_cost_ratio(10.0) > 1.0 > minetti_cost_ratio(-10.0) > 0  # uphill costs more than flat, downhill less but never nothing
+    assert minetti_cost_ratio(45.0) == pytest.approx(minetti_cost_ratio(1000.0))  # steeper than +/-45% clips instead of extrapolating
+
     flat = pd.DataFrame({"velocity_smooth_mps": [3.0] * 10, "grade_smooth": [0.0] * 10})
     assert compute_gap_pace_s_per_m(flat).iloc[5] == pytest.approx(1.0 / 3.0, rel=1e-6)
 
@@ -86,25 +77,11 @@ def test_windows_without_samples_are_none_and_a_missing_column_or_boundary_gives
     assert median_per_window(df, [0, 1, 2], "no_such_column") == []
     assert median_per_window(df, [0], "heartrate") == []
 
-
-def test_min_median_max_per_window_summarizes_each_window():
-    df = pd.DataFrame({"time_s": [0, 1, 2, 3], "velocity_smooth_mps": [2.0, 4.0, 3.0, 5.0]})
-    result = min_median_max_per_window(df, [0, 4], "velocity_smooth_mps")
-    assert len(result) == 1
-    assert result[0]["min"] == pytest.approx(2.0)
-    assert result[0]["max"] == pytest.approx(5.0)
-    assert result[0]["median"] == pytest.approx(3.5)
-
-
-def test_min_value_floor_excludes_low_samples_such_as_a_paused_watch():
-    # A near-zero speed sample within a lap would otherwise blow out "min
-    # speed" (max pace) to near-infinity.
-    df = pd.DataFrame({"time_s": [0, 1, 2, 3], "velocity_smooth_mps": [0.01, 3.0, 3.2, 2.9]})
-    assert min_median_max_per_window(df, [0, 4], "velocity_smooth_mps")[0]["min"] == pytest.approx(0.01)
-    assert min_median_max_per_window(df, [0, 4], "velocity_smooth_mps", min_value=1.0)[0]["min"] == pytest.approx(2.9)
-
-    all_low = pd.DataFrame({"time_s": [0, 1], "velocity_smooth_mps": [0.01, 0.02]})
-    assert min_median_max_per_window(all_low, [0, 2], "velocity_smooth_mps", min_value=1.0)[0] == {"min": None, "median": None, "max": None}
+    speeds = pd.DataFrame({"time_s": [0, 1, 2, 3], "velocity_smooth_mps": [0.01, 4.0, 3.0, 5.0]})
+    summary = min_median_max_per_window(speeds, [0, 4], "velocity_smooth_mps", min_value=1.0)[0]  # a paused watch's near-zero sample is excluded
+    assert (summary["min"], summary["median"], summary["max"]) == (pytest.approx(3.0), pytest.approx(4.0), pytest.approx(5.0))
+    assert min_median_max_per_window(speeds, [0, 4], "velocity_smooth_mps")[0]["min"] == pytest.approx(0.01)
+    assert min_median_max_per_window(speeds, [0, 4], "velocity_smooth_mps", min_value=10.0)[0] == {"min": None, "median": None, "max": None}
 
 
 # ---------------------------------------------------------------------------
@@ -131,30 +108,12 @@ def test_build_dataframe_maps_streams_to_columns():
     assert list(df["temp_c"]) == [18, 18, 19]
     assert df["cadence"].isna().all()  # a stream that was not recorded becomes all-NA
 
-
-def test_build_dataframe_pads_shorter_stream_with_nan():
-    # Strava can omit a sensor stream's trailing samples (e.g. HR strap
-    # disconnects) — the shorter stream must align from the start, not
-    # error or silently misalign the whole series.
-    raw = {
-        "time": _entry([0, 1, 2, 3]),
-        "heartrate": _entry([100, 110], "heartrate"),
-    }
-    df = _build_dataframe(raw)
-    assert len(df) == 4
-    assert list(df["heartrate"][:2]) == [100, 110]
-    assert math.isnan(df["heartrate"][2])
-    assert math.isnan(df["heartrate"][3])
-
-
-def test_build_dataframe_truncates_longer_stream():
-    # A stream longer than the reference must be cut to fit, not shift the
-    # rest of the row out of alignment.
-    raw = {
-        "time": _entry([0, 1, 2]),
-        "heartrate": _entry([100, 110, 120, 130], "heartrate"),
-    }
-    assert list(_build_dataframe(raw)["heartrate"]) == [100, 110, 120]
+    # A stream shorter than the reference aligns from the start and is padded; a longer one is cut to fit.
+    ragged = _build_dataframe({"time": _entry([0, 1, 2, 3]), "heartrate": _entry([100, 110], "heartrate")})
+    assert len(ragged) == 4
+    assert list(ragged["heartrate"][:2]) == [100, 110]
+    assert ragged["heartrate"][2:].isna().all()
+    assert list(_build_dataframe({"time": _entry([0, 1, 2]), "heartrate": _entry([100, 110, 120, 130], "heartrate")})["heartrate"]) == [100, 110, 120]
 
 
 def test_build_dataframe_missing_time_stream_falls_back_to_distance_and_neither_returns_empty():

@@ -1,7 +1,5 @@
-"""`miles-area-refresh`: re-fetch an area's map data, or a place's geocode,
-on request. Cached map data and geocoded places never refresh by age; this is
-how an operator asks for it, run on the host that owns the database.
-"""
+"""`miles-area-refresh`: re-fetch an area's map data or a place's geocode on
+request, on the host that owns the database."""
 
 import click
 

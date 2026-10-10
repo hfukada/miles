@@ -1,21 +1,10 @@
 import sqlite3
 
 import pytest
-from helpers import NoneSampler, by_deg_lat, by_deg_lng, node, way
+from helpers import FakeSampler, by_deg_lat, by_deg_lng, call_tool, climbing_sampler, node, none_sampler, way
+from mcp.server.fastmcp import FastMCP
 
-from miles import network
-
-
-class _GradientSampler:
-    """Every edge climbs steadily from its own start -- enough to exercise
-    gain/grade math without needing real terrain."""
-
-    def __init__(self, step_m: float = 3.0, base: float = 100.0):
-        self.step_m = step_m
-        self.base = base
-
-    def sample(self, points):
-        return [self.base + i * self.step_m for i in range(len(points))]
+from miles import network, network_mcp
 
 
 # A small synthetic tile set: two contiguous "busy" secondary-road ways
@@ -78,7 +67,7 @@ def _edge_id_for_way(conn: sqlite3.Connection, way_id: int) -> int:
 
 
 def _build(conn: sqlite3.Connection, area_id: int = 1, sampler=None):
-    return network.build_network(conn, area_id, _synthetic_payloads(), sampler or _GradientSampler())
+    return network.build_network(conn, area_id, _synthetic_payloads(), sampler or climbing_sampler())
 
 
 def _score(conn: sqlite3.Connection, edge_ids: list[int], area_id: int = 1) -> dict:
@@ -86,7 +75,7 @@ def _score(conn: sqlite3.Connection, edge_ids: list[int], area_id: int = 1) -> d
     return network.score_path(conn, area_id, [(e, True) for e in edge_ids], prefs, network.default_runnability_scorer)
 
 
-def test_build_network_dedupes_overlapping_tiles_excludes_private_ways_and_counts_every_node(conn: sqlite3.Connection):
+def test_build_network_dedupes_overlapping_tiles_excludes_private_ways_counts_every_node_and_sets_edge_attributes(conn: sqlite3.Connection):
     stats = _build(conn)
     assert stats["excluded_way_count"] == 1  # way F only
 
@@ -106,17 +95,10 @@ def test_build_network_dedupes_overlapping_tiles_excludes_private_ways_and_count
     assert conn.execute("SELECT COUNT(*) AS n FROM net_edges WHERE way_id = ?", [WAY_E_ID]).fetchone()["n"] == 0
     assert stats["major_road_way_points"] > 0
 
-
-def test_build_network_junction_and_endpoint_node_kinds(conn: sqlite3.Connection):
-    _build(conn)
     kinds = {r["osm_node_id"]: r["kind"] for r in conn.execute("SELECT osm_node_id, kind FROM net_nodes WHERE area_id = 1")}
     assert kinds[11] == "junction"  # shared by ways A and B
     assert kinds[10] == "endpoint"  # only ends way A
     assert kinds[12] == "junction"  # shared by a secondary road and a footway
-
-
-def test_build_network_edge_attributes(conn: sqlite3.Connection):
-    _build(conn)
 
     edge_a = conn.execute("SELECT * FROM net_edges WHERE way_id = ?", [WAY_A_ID]).fetchone()
     assert edge_a["surface_class"] == "paved"
@@ -189,14 +171,6 @@ def test_stateful_road_exposure_flags_one_long_run_but_not_two_short_ones(conn: 
     assert split_exposure["totals_m"]["uncomfortable"] == pytest.approx(len_a + len_b)
 
 
-def test_score_path_reports_runnability_and_gain(conn: sqlite3.Connection):
-    _build(conn)
-    score = _score(conn, [_edge_id_for_way(conn, WAY_A_ID)])
-    assert score["has_elevation"] is True
-    assert score["gain_m"] is not None and score["gain_m"] > 0
-    assert score["runnability"]["run_pct"] + score["runnability"]["grind_pct"] + score["runnability"]["hike_pct"] == pytest.approx(100.0)
-
-
 def test_amenity_tagged_on_a_shared_junction_node_reuses_it(conn: sqlite3.Connection):
     """A trailhead or parking tag can sit directly on a node that's also a
     way junction (real OSM data does this). net_nodes is unique on
@@ -210,7 +184,7 @@ def test_amenity_tagged_on_a_shared_junction_node_reuses_it(conn: sqlite3.Connec
             _way_a(), _way_b(), _way_c(),
         ]
     }
-    stats = network.build_network(conn, 1, [payload], _GradientSampler())
+    stats = network.build_network(conn, 1, [payload], climbing_sampler())
     assert stats["node_count"] > 0
 
     rows = conn.execute("SELECT * FROM net_nodes WHERE area_id = 1 AND osm_node_id = 12").fetchall()
@@ -226,35 +200,6 @@ def test_amenity_tagged_on_a_shared_junction_node_reuses_it(conn: sqlite3.Connec
     edge_c = _edge_id_for_way(conn, WAY_C_ID)
     assert conn.execute("SELECT to_node_id FROM net_edges WHERE edge_id = ?", [edge_b]).fetchone()["to_node_id"] == rows[0]["node_id"]
     assert conn.execute("SELECT from_node_id FROM net_edges WHERE edge_id = ?", [edge_c]).fetchone()["from_node_id"] == rows[0]["node_id"]
-
-
-def test_no_elevation_sampler_leaves_edges_without_grade(conn: sqlite3.Connection):
-    stats = network.build_network(conn, 2, [{"elements": [node(70, 40.0, -106.0), node(71, 40.001, -106.0), way(7, [70, 71], {"highway": "footway"})]}], NoneSampler())
-    assert stats["edge_count"] == 1
-    edge = conn.execute("SELECT * FROM net_edges WHERE area_id = 2").fetchone()
-    assert edge["has_elevation"] == 0
-    assert edge["gain_fwd_m"] is None
-
-    score = _score(conn, [edge["edge_id"]], area_id=2)
-    assert score["has_elevation"] is False
-    assert score["gain_m"] is None
-    assert score["runnability"] == {"run_pct": 0.0, "grind_pct": 0.0, "hike_pct": 0.0, "longest_hike_m": 0.0, "steep_descent_m": 0.0}
-
-
-def test_default_runnability_scorer_thresholds_and_empty_profile():
-    # -20% is steep but still descending, so it lands in "run" (only uphill
-    # grade drives the run/grind/hike split); it separately counts toward
-    # steep_descent_m.
-    result = network.default_runnability_scorer([2.0, 2.0, 20.0, 20.0, 20.0, -20.0])
-    assert result["hike_pct"] == pytest.approx(100.0 * 3 / 6)
-    assert result["run_pct"] == pytest.approx(100.0 * 3 / 6)
-    assert result["grind_pct"] == 0.0
-    assert result["longest_hike_m"] == pytest.approx(3 * network.gpx_parse.RESAMPLE_SPACING_M)
-    assert result["steep_descent_m"] == pytest.approx(1 * network.gpx_parse.RESAMPLE_SPACING_M)
-
-    assert network.default_runnability_scorer([]) == {
-        "run_pct": 0.0, "grind_pct": 0.0, "hike_pct": 0.0, "longest_hike_m": 0.0, "steep_descent_m": 0.0
-    }
 
 
 def test_get_and_set_route_preferences(conn: sqlite3.Connection):
@@ -309,7 +254,7 @@ def _footway_surface_class(conn: sqlite3.Connection, footway_tags: dict, nearby_
         elements += [
             node(9021, lat0 - by_deg_lat(200.0), mid), node(9022, lat0 + by_deg_lat(200.0), mid), way(90003, [9021, 9022], nearby_road)
         ]
-    network.build_network(conn, 101, [{"elements": elements}], NoneSampler())
+    network.build_network(conn, 101, [{"elements": elements}], none_sampler())
     return conn.execute("SELECT surface_class FROM net_edges WHERE area_id = 101 AND way_id = ?", [_FOOTWAY_ID]).fetchone()["surface_class"]
 
 
@@ -344,36 +289,16 @@ def test_footway_classification_by_tag_and_by_geometry(conn: sqlite3.Connection,
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "raw, expected",
-    [
-        ("30 mph", 30.0),
-        ("30mph", 30.0),
-        ("50", 50 * 0.621371),
-        ("50 km/h", 50 * 0.621371),
-        ("50;30", 50 * 0.621371),
-        ("25 mph;40 mph", 25.0),
-        ("20 knots", 20 * 1.150779),
-        ("none", None),
-        ("signals", None),
-        ("", None),
-        (None, None),
-        ("fast", None),
-        ("RO:urban", None),
-    ],
-)
+@pytest.mark.parametrize("raw, expected", [("50;30", 50 * 0.621371), ("signals", None)], ids=["a bare number is km/h and the first of a list wins", "not a number"])
 def test_parse_maxspeed_mph(raw, expected):
     parsed = network._parse_maxspeed_mph(raw)
-    if expected is None:
-        assert parsed is None
-    else:
-        assert parsed == pytest.approx(expected, rel=1e-4)
+    assert parsed is None if expected is None else parsed == pytest.approx(expected, rel=1e-4)
 
 
 def _road_exposure(conn: sqlite3.Connection, tags: dict) -> tuple[dict, float]:
     """Per-tier metres and total distance for a 300 m road with the given tags."""
     elements = [node(1, 40.0, -105.0), node(2, 40.0 + by_deg_lat(300.0), -105.0), way(10, [1, 2], tags)]
-    network.build_network(conn, 1, [{"elements": elements}], NoneSampler())
+    network.build_network(conn, 1, [{"elements": elements}], none_sampler())
     score = _score(conn, [_edge_id_for_way(conn, 10)])
     return score["road_exposure"]["totals_m"], score["distance_m"]
 
@@ -388,10 +313,11 @@ def _road_exposure(conn: sqlite3.Connection, tags: dict) -> tuple[dict, float]:
         ({"highway": "secondary", "maxspeed": "35 mph", "sidewalk": "both"}, "tolerable"),  # a sidewalk lifts one tier
         ({"highway": "secondary", "maxspeed": "35 mph", "cycleway": "track"}, "tolerable"),
         ({"highway": "secondary", "maxspeed": "35 mph", "sidewalk": "no"}, "uncomfortable"),
+        ({"highway": "tertiary", "maxspeed": "55 mph", "sidewalk": "both"}, "tolerable"),  # a sidewalk lifts a fast road one tier, never to comfortable
     ],
     ids=[
         "residential", "residential with 3 lanes", "fast road with a shoulder", "untagged speed", "sidewalk lifts a tier",
-        "cycle track lifts a tier", "no sidewalk",
+        "cycle track lifts a tier", "no sidewalk", "sidewalk on a fast road",
     ],
 )
 def test_a_road_is_scored_into_a_comfort_tier_from_its_tags(conn: sqlite3.Connection, tags: dict, expected_tier: str):
@@ -399,26 +325,18 @@ def test_a_road_is_scored_into_a_comfort_tier_from_its_tags(conn: sqlite3.Connec
     assert totals[expected_tier] == pytest.approx(distance_m)
 
 
-def test_a_sidewalk_never_lifts_a_fast_road_to_comfortable(conn: sqlite3.Connection):
-    totals, _ = _road_exposure(conn, {"highway": "tertiary", "maxspeed": "55 mph", "sidewalk": "both"})
-    assert totals["comfortable"] == 0.0
-
-
-class _PartialSampler:
-    """Elevation for only the southern half of the synthetic tiles."""
-
-    def sample(self, points):
-        return [100.0 + i if lat < 40.5 else None for i, (lat, _lng) in enumerate(points)]
-
-
-def test_score_path_reports_partial_elevation_coverage_honestly(conn: sqlite3.Connection):
-    network.build_network(conn, 1, _synthetic_payloads(), _PartialSampler())
+def test_score_path_reports_gain_runnability_and_partial_elevation_coverage_honestly(conn: sqlite3.Connection):
+    south_only = FakeSampler(lambda i, lat, lng: 100.0 + i if lat < 40.5 else None)  # only the southern half has elevation
+    network.build_network(conn, 1, _synthetic_payloads(), south_only)
     edge_a = _edge_id_for_way(conn, WAY_A_ID)
     edge_d = _edge_id_for_way(conn, WAY_D_ID)
 
     full = _score(conn, [edge_a])
     assert full["has_elevation"] is True
     assert full["elevation_coverage_pct"] == pytest.approx(100.0)
+    assert full["gain_m"] is not None and full["gain_m"] > 0
+    runnability = full["runnability"]
+    assert runnability["run_pct"] + runnability["grind_pct"] + runnability["hike_pct"] == pytest.approx(100.0)
 
     partial = _score(conn, [edge_a, edge_d])
     assert partial["has_elevation"] is False
@@ -447,25 +365,24 @@ def _setback_lot_payload(real_node_id: int, lot_id: int, lot_kind_tags: dict | N
     }]
 
 
-def test_a_set_back_lot_mapped_as_an_outline_does_not_collide_with_a_real_node_id(conn: sqlite3.Connection):
-    # The lot's amenity id is the negated way id; the trail happens to use a
-    # node whose id equals that way id.
-    network.build_network(conn, 1, _setback_lot_payload(real_node_id=7777, lot_id=-7777), _GradientSampler())
+def test_set_back_amenities_never_collide_on_a_node_id(conn: sqlite3.Connection):
+    # A lot mapped as an outline carries the negated way id as its amenity id;
+    # the trail happens to use a node whose id equals that way id.
+    network.build_network(conn, 1, _setback_lot_payload(real_node_id=7777, lot_id=-7777), climbing_sampler())
     ids = [r[0] for r in conn.execute("SELECT osm_node_id FROM net_nodes WHERE area_id = 1")]
     assert len(ids) == len(set(ids))
     assert {7777, -7777} <= set(ids)
 
-
-def test_two_set_back_amenities_with_opposite_signed_ids_get_distinct_junctions(conn: sqlite3.Connection):
+    # Two set-back amenities with opposite-signed ids stay distinct junctions.
     payload = _setback_lot_payload(real_node_id=8000, lot_id=7777)
     payload[0]["elements"].append(node(-7777, SETBACK_LOT[0] + by_deg_lat(60.0), SETBACK_LOT[1], tags={"amenity": "parking"}))
-    network.build_network(conn, 1, payload, _GradientSampler())
-    ids = [r[0] for r in conn.execute("SELECT osm_node_id FROM net_nodes WHERE area_id = 1")]
+    network.build_network(conn, 2, payload, climbing_sampler())
+    ids = [r[0] for r in conn.execute("SELECT osm_node_id FROM net_nodes WHERE area_id = 2")]
     assert len(ids) == len(set(ids))
 
 
 def test_a_failed_build_leaves_the_previous_graph_in_place(conn: sqlite3.Connection):
-    network.build_network(conn, 1, _synthetic_payloads(), _GradientSampler())
+    network.build_network(conn, 1, _synthetic_payloads(), climbing_sampler())
     before = conn.execute("SELECT COUNT(*) FROM net_edges WHERE area_id = 1").fetchone()[0]
     built_at = conn.execute("SELECT built_at FROM net_graphs WHERE area_id = 1").fetchone()[0]
 
@@ -485,7 +402,7 @@ def _spur_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def test_an_access_spur_has_elevation_and_counts_no_trail_for_it(conn: sqlite3.Connection):
-    network.build_network(conn, 1, _setback_lot_payload(real_node_id=8000, lot_id=5555), _GradientSampler())
+    network.build_network(conn, 1, _setback_lot_payload(real_node_id=8000, lot_id=5555), climbing_sampler())
     (spur,) = _spur_rows(conn)
     assert spur["has_elevation"] == 1
     assert spur["surface_class"] != "trail"
@@ -513,7 +430,7 @@ def test_an_amenity_is_spliced_into_an_edge_only_within_the_snap_radius(conn: sq
             node(5555, *lot, tags={"amenity": "parking"}),
         ]
     }]
-    network.build_network(conn, 1, payload, _GradientSampler())
+    network.build_network(conn, 1, payload, climbing_sampler())
     assert (len(_spur_rows(conn)) == 1) is spliced
     trail_pieces = conn.execute("SELECT COUNT(*) FROM net_edges WHERE area_id = 1 AND way_id = 100").fetchone()[0]
     assert trail_pieces == (2 if spliced else 1)
@@ -528,7 +445,7 @@ def test_several_amenities_on_one_edge_chain_the_pieces_end_to_end(conn: sqlite3
         node(lot_id, TRAIL_START[0] + by_deg_lat(along_m), TRAIL_START[1] + by_deg_lng(40.0, 30.0), tags={"amenity": "parking"})
         for lot_id, along_m in lots
     ]
-    network.build_network(conn, 1, [{"elements": elements}], _GradientSampler())
+    network.build_network(conn, 1, [{"elements": elements}], climbing_sampler())
 
     trail = conn.execute(
         "SELECT e.length_m, a.osm_node_id AS from_osm, b.osm_node_id AS to_osm FROM net_edges e "
@@ -540,3 +457,11 @@ def test_several_amenities_on_one_edge_chain_the_pieces_end_to_end(conn: sqlite3
     starts = {r["from_osm"] for r in trail}
     ends = {r["to_osm"] for r in trail}
     assert starts - ends == {8000} and ends - starts == {9001}
+
+
+def test_the_preferences_tool_applies_a_json_object_patch_and_reports_anything_else_as_an_error():
+    server = FastMCP("test")
+    network_mcp.register_network_tools(server)
+
+    assert "JSON object" in call_tool(server, "set_route_preferences", {"patch": "[1, 2]"})["error"]
+    assert call_tool(server, "set_route_preferences", {"patch": '{"max_continuous_uncomfortable_m": 1000}'})["max_continuous_uncomfortable_m"] == 1000

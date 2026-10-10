@@ -38,8 +38,12 @@ def memory_db() -> sqlite3.Connection:
 
 
 class FakeResponse:
-    def __init__(self, body: bytes = b"ok") -> None:
-        self._body = body
+    """A urlopen-style response. Headers default to a Content-Length matching
+    the body; `send` truncates what is actually delivered (a short read)."""
+
+    def __init__(self, body: bytes = b"ok", headers: dict | None = None, *, send: int | None = None) -> None:
+        self.headers = headers if headers is not None else {"Content-Length": str(len(body))}
+        self._body = body[: len(body) if send is None else send]
 
     def __enter__(self):
         return self
@@ -48,7 +52,54 @@ class FakeResponse:
         return False
 
     def read(self, n: int = -1) -> bytes:
-        return self._body
+        if n < 0:
+            n = len(self._body)
+        chunk, self._body = self._body[:n], self._body[n:]
+        return chunk
+
+
+class FakeTokenResponse:
+    """The token endpoint's answer: `ok` follows the status, `request` is present
+    so a test can check that a Fault built from it carries none."""
+
+    def __init__(self, payload: dict[str, object] | None = None, status: int = 200) -> None:
+        self.ok = status == 200
+        self.status_code = status
+        self.request = object()
+        self._payload = payload or {}
+
+    def json(self) -> dict[str, object]:
+        return self._payload
+
+
+class FakeStravaSession:
+    """Stands in for the requests session behind the Strava client. The token
+    endpoint answers `payload` with `status` and records each form body;
+    `token_error` and `api_error` make the token request or any API call raise."""
+
+    def __init__(
+        self, payload: dict[str, object] | None = None, *, status: int = 200,
+        token_error: Exception | None = None, api_error: Exception | None = None,
+    ) -> None:
+        self.payload, self.status = payload, status
+        self.token_error, self.api_error = token_error, api_error
+        self.posts: list[dict[str, str]] = []
+
+    def mount(self, *args: object) -> None:
+        pass
+
+    def post(self, url: str, **kwargs: object) -> FakeTokenResponse:
+        assert "?" not in url
+        if self.token_error is not None:
+            raise self.token_error
+        self.posts.append(kwargs.get("data"))  # type: ignore[arg-type]
+        return FakeTokenResponse(self.payload, self.status)
+
+    def get(self, url: str, **kwargs: object) -> None:
+        if self.api_error is not None:
+            raise self.api_error
+
+    put = delete = get
 
 
 class FakeClock:
@@ -101,20 +152,15 @@ def urlopen_sequence(monkeypatch: pytest.MonkeyPatch, outcomes: list) -> list:
     return calls
 
 
-def recent_day(days_ago: int = 3) -> str:
-    """An ISO date a few days back: activity inserts that default to a fixed
-    old date make weekly-snapshot backfills walk years of weeks."""
-    return (date.today() - timedelta(days=days_ago)).isoformat()
-
-
 def insert_activity(conn: sqlite3.Connection, activity_id: int, *, start_date: str | None = None, sport_type: str = "Run", **cols: object) -> None:
-    """One plain easy run (a recent date unless given); `cols` override or add
-    any column of the activities table."""
+    """One plain easy run (a recent date unless given: a fixed old default
+    makes weekly-snapshot backfills walk years of weeks); `cols` override or
+    add any column of the activities table."""
     values: dict[str, object] = {
         "activity_id": activity_id,
         "name": "Run",
         "sport_type": sport_type,
-        "start_date": start_date or f"{recent_day()}T08:00:00",
+        "start_date": start_date or f"{date.today() - timedelta(days=3):%Y-%m-%d}T08:00:00",
         "workout_type": 0,
         "run_type": "easy",
         "synced_at": "2026-01-01",
@@ -125,17 +171,6 @@ def insert_activity(conn: sqlite3.Connection, activity_id: int, *, start_date: s
         list(values.values()),
     )
     conn.commit()
-
-
-def wait_until(condition, timeout: float = 5.0) -> bool:
-    """Poll `condition` until it is true or the timeout passes; True when it
-    became true. For states reached on another thread that no event announces."""
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if condition():
-            return True
-        time.sleep(0.005)
-    return bool(condition())
 
 
 METERS_PER_DEG_LAT = 111194.9
@@ -175,19 +210,43 @@ class ImmediateThread:
         self._target(*self._args)
 
 
-class NoneSampler:
-    """An elevation sampler with no coverage anywhere: every edge reads as
-    having no elevation."""
+class FakeSampler:
+    """An elevation sampler that never touches a tile cache or the network.
+    `elevation_at(index, lat, lng)` gives each point's reading, None for no
+    coverage (100 m everywhere by default). Every call is recorded."""
+
+    def __init__(self, elevation_at=None) -> None:
+        self._elevation_at = elevation_at or (lambda i, lat, lng: 100.0)
+        self.calls: list[list[tuple[float, float]]] = []
+
+    @property
+    def points(self) -> list[tuple[float, float]]:
+        return [p for call in self.calls for p in call]
 
     def sample(self, points):
-        return [None for _ in points]
+        self.calls.append(list(points))
+        return [self._elevation_at(i, lat, lng) for i, (lat, lng) in enumerate(points)]
 
 
-class FlatSampler:
-    """An elevation sampler with 100 m everywhere."""
+def none_sampler() -> FakeSampler:
+    """No coverage anywhere: every edge reads as having no elevation."""
+    return FakeSampler(lambda i, lat, lng: None)
 
-    def sample(self, points):
-        return [100.0 for _ in points]
+
+def flat_sampler() -> FakeSampler:
+    """100 m everywhere."""
+    return FakeSampler()
+
+
+def climbing_sampler(step_m: float = 3.0, base: float = 100.0) -> FakeSampler:
+    """Each sampled sequence climbs steadily from its first point."""
+    return FakeSampler(lambda i, lat, lng: base + i * step_m)
+
+
+def latitude_sampler(base: float = 100.0, no_coverage: frozenset[int] = frozenset()) -> FakeSampler:
+    """Elevation rises with latitude, so a draped track always has gain;
+    the points at the given indices have no coverage."""
+    return FakeSampler(lambda i, lat, lng: None if i in no_coverage else base + (lat - 40.0) * 10000.0)
 
 
 def parse_osrm_coords(url: str) -> list[tuple[float, float]]:

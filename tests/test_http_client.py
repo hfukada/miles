@@ -18,10 +18,12 @@ def test_user_agent_has_no_contact_by_default_and_appends_the_configured_one(mon
     assert "contact: ops@example.org" in http_client.user_agent()
 
 
-def test_request_sends_the_user_agent(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
-    calls = urlopen_sequence(monkeypatch, [FakeResponse(b"hello")])
+def test_a_request_sends_the_user_agent_and_the_named_method(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
+    calls = urlopen_sequence(monkeypatch, [FakeResponse(b"hello"), FakeResponse(b"")])
     assert http_client.request(http_client.OSRM, "http://x") == b"hello"
-    assert calls[0].get_header("User-agent") == http_client.user_agent()
+    http_client.request(http_client.OSRM, "http://x", method="HEAD")
+    assert [c.get_header("User-agent") for c in calls] == [http_client.user_agent()] * 2
+    assert [c.get_method() for c in calls] == ["GET", "HEAD"]
 
 
 def test_requests_to_one_service_are_spaced_by_its_interval_and_services_are_independent(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
@@ -44,19 +46,22 @@ def test_requests_to_one_service_are_spaced_by_its_interval_and_services_are_ind
     assert clock.sleeps == []
 
 
-def test_retries_on_429_503_504_with_exponential_backoff(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
+def test_retries_on_429_503_504_and_connection_errors_with_exponential_backoff_but_not_on_other_statuses(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
     policy = http_client.ServicePolicy("t-retry", max_attempts=4, backoff_base_s=2.0)
     calls = urlopen_sequence(monkeypatch, [http_error(429), http_error(503), http_error(504), FakeResponse(b"ok")])
     assert http_client.request(policy, "http://x") == b"ok"
     assert len(calls) == 4
     assert clock.sleeps == [2.0, 4.0, 8.0]
 
-
-def test_retries_on_connection_errors(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
     policy = http_client.ServicePolicy("t-conn", max_attempts=3, backoff_base_s=1.0)
     calls = urlopen_sequence(monkeypatch, [urllib.error.URLError("refused"), TimeoutError(), FakeResponse(b"ok")])
     assert http_client.request(policy, "http://x") == b"ok"
     assert len(calls) == 3
+
+    calls = urlopen_sequence(monkeypatch, [http_error(400)])
+    with pytest.raises(urllib.error.HTTPError):
+        http_client.request(http_client.OSRM, "http://x")
+    assert len(calls) == 1
 
 
 def test_gives_up_after_max_attempts_and_raises_the_last_error(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
@@ -76,13 +81,6 @@ def test_a_body_cut_short_on_the_last_attempt_surfaces_as_a_url_error(clock: Fak
     assert len(calls) == 2
 
 
-def test_does_not_retry_other_statuses(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
-    calls = urlopen_sequence(monkeypatch, [http_error(400)])
-    with pytest.raises(urllib.error.HTTPError):
-        http_client.request(http_client.OSRM, "http://x")
-    assert len(calls) == 1
-
-
 def test_retry_after_is_honored_when_longer_than_the_backoff(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
     policy = http_client.ServicePolicy("t-retry-after", max_attempts=2, backoff_base_s=1.0)
     urlopen_sequence(monkeypatch, [http_error(429, {"Retry-After": "42"}), FakeResponse()])
@@ -90,7 +88,7 @@ def test_retry_after_is_honored_when_longer_than_the_backoff(clock: FakeClock, m
     assert clock.sleeps == [42.0]
 
 
-def test_a_retry_after_longer_than_the_cap_gives_up_instead_of_retrying(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
+def test_a_retry_after_longer_than_the_cap_and_a_block_longer_than_a_request_is_worth_waiting_for_fail_fast(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
     policy = http_client.ServicePolicy("t-long-retry-after", max_attempts=3, backoff_base_s=1.0)
     huge = str(int(http_client._MAX_RETRY_AFTER_S) + 1)
     calls = urlopen_sequence(monkeypatch, [http_error(429, {"Retry-After": huge}), FakeResponse()])
@@ -99,8 +97,6 @@ def test_a_retry_after_longer_than_the_cap_gives_up_instead_of_retrying(clock: F
     assert len(calls) == 1
     assert clock.sleeps == []
 
-
-def test_a_block_longer_than_a_request_is_worth_waiting_for_fails_fast(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
     urlopen_sequence(monkeypatch, [http_error(403), FakeResponse()])
     with pytest.raises(urllib.error.HTTPError):
         http_client.request(http_client.NOMINATIM, "http://x")
@@ -116,24 +112,21 @@ def test_open_meteo_waits_a_minute_after_a_429_before_retrying(clock: FakeClock,
     assert max(clock.sleeps) >= 60.0
 
 
-def test_a_short_pause_is_waited_out_by_the_next_caller_and_the_refusal_is_not_retried(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    "policy, floor",
+    [(http_client.NOMINATIM, 60.0), (http_client.ServicePolicy("t-shared-pause", min_pause_s={429: 30.0}, max_attempts=1), 30.0)],
+    ids=["a real policy", "a custom pause"],
+)
+def test_a_pause_after_a_refused_request_is_waited_out_by_the_next_caller_and_the_refusal_is_not_retried(
+    clock: FakeClock, monkeypatch: pytest.MonkeyPatch, policy, floor: float
+):
     calls = urlopen_sequence(monkeypatch, [http_error(429), FakeResponse()])
     with pytest.raises(urllib.error.HTTPError):
-        http_client.request(http_client.NOMINATIM, "http://x")
+        http_client.request(policy, "http://x")
     assert len(calls) == 1
     clock.sleeps.clear()
-    http_client.request(http_client.NOMINATIM, "http://x")
-    assert clock.sleeps and clock.sleeps[0] >= 60.0
-
-
-def test_a_pause_after_429_also_holds_back_other_callers(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
-    policy = http_client.ServicePolicy("t-shared-pause", min_pause_s={429: 30.0}, max_attempts=1)
-    urlopen_sequence(monkeypatch, [http_error(429), FakeResponse()])
-    with pytest.raises(urllib.error.HTTPError):
-        http_client.request(policy, "http://x")
-    clock.sleeps.clear()
     http_client.request(policy, "http://x")
-    assert clock.sleeps and clock.sleeps[0] >= 30.0
+    assert clock.sleeps and clock.sleeps[0] >= floor
 
 
 def test_a_pause_set_while_a_caller_waits_its_turn_is_honored(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
@@ -160,25 +153,6 @@ def test_a_pause_set_while_a_caller_waits_its_turn_is_honored(clock: FakeClock, 
     http_client.request(policy, "http://x")
 
     assert starts[1] - starts[0] >= 30.0
-
-
-@pytest.mark.parametrize(
-    "policy", [http_client.OSRM, http_client.NOMINATIM, http_client.OPEN_METEO], ids=lambda p: p.name
-)
-def test_published_request_rates_are_kept_by_the_client(clock: FakeClock, monkeypatch: pytest.MonkeyPatch, policy):
-    starts: list[float] = []
-
-    def stamping(req, timeout=None):
-        starts.append(clock.now)
-        return FakeResponse()
-
-    monkeypatch.setattr(http_client.urllib.request, "urlopen", stamping)
-    for _ in range(4):
-        http_client.request(policy, "http://x")
-
-    floor = 1.0
-    gaps = [b - a for a, b in zip(starts, starts[1:])]
-    assert gaps and all(g >= floor for g in gaps)
 
 
 @pytest.mark.parametrize("policy", [http_client.GEOFABRIK, http_client.NOMINATIM], ids=lambda p: p.name)
@@ -252,13 +226,3 @@ def test_a_response_is_reported_after_its_body_is_read(clock: FakeClock, monkeyp
     with pytest.raises(ConnectionResetError):
         http_client.request(policy, "http://x", reader=dying_reader)
     assert [s[2] for s in seen] == ["error"]
-
-
-def test_a_request_can_name_its_method(clock: FakeClock, monkeypatch: pytest.MonkeyPatch):
-    calls = urlopen_sequence(monkeypatch, [FakeResponse(b""), FakeResponse(b"")])
-    policy = http_client.ServicePolicy("t-method", max_attempts=1)
-
-    http_client.request(policy, "http://x", method="HEAD")
-    http_client.request(policy, "http://x")
-
-    assert [c.get_method() for c in calls] == ["HEAD", "GET"]

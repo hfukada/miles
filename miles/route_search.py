@@ -1,14 +1,11 @@
 """Route search over an area's network graph
 (docs/design-terrain-and-route-search.md, section 4): bound the graph around
-each start, contract degree-2 chains, generate randomized/beam-limited
-candidates per shape, score each one fully through network.score_path, and
-diversify before returning.
+each start, contract degree-2 chains, generate randomized candidates per
+shape, score each through network.score_path, and diversify.
 
-A search never writes to the network graph itself -- a request's start point
-is spliced into an in-memory copy the same way an amenity is spliced into
-net_edges at build time (network.split_edge_row), just never persisted.
-Candidates are ephemeral: kept in net_search_results/net_candidates behind a
-TTL until saved (save_route_candidate) into the routes table proper.
+A search never writes to the network graph: a start point is spliced into an
+in-memory copy. Candidates are kept behind a TTL until saved
+(save_route_candidate) into the routes table.
 """
 
 import hashlib
@@ -34,33 +31,23 @@ DEFAULT_N = 5
 DEFAULT_TIME_BUDGET_S = 10.0
 CANDIDATE_TTL_HOURS = 24.0
 
-# How close a request's own start point may snap onto an existing edge --
-# more permissive than an amenity's AMENITY_SNAP_RADIUS_M, since an
-# athlete-given point (an address, "home") is less precise than a mapped node.
+# How far a request's start may snap onto an edge; wider than
+# AMENITY_SNAP_RADIUS_M because an athlete-given point is less precise.
 START_SNAP_RADIUS_M = 500.0
 
 BEAM_WIDTH = 4
-# A loop walk's step count isn't itself bounded -- edge length varies wildly
-# between a dense street grid (short blocks, many steps to cover a given
-# distance) and a trail network (long segments, few) -- so this is only a
-# backstop against pathological wandering, well above what LOOP_MAX_OVERRUN
-# should ever require.
+# Step-count backstop against pathological wandering; edge length varies too
+# much between street grids and trail networks to bound steps tighter.
 LOOP_STEP_CEILING = 600
-# A loop walk gives up once it has covered this multiple of the target
-# distance without closing -- a distance bound rather than a step count, so
-# it scales with the network's own edge length.
+# A loop walk gives up after covering this multiple of the target distance.
 LOOP_MAX_OVERRUN = 1.6
 # A walk turns home once the distance left to the target is within this
-# multiple of the shortest path back -- slack against the walk's own
-# meandering rather than a straight line home.
+# multiple of the shortest path back.
 TURN_HOME_SLACK = 1.15
-# Cheap gate on the exact (Dijkstra) distance-home check: skip it whenever
-# straight-line distance to the start, inflated by this factor, already
-# rules a turn out. A real path is never shorter than the straight line, so
-# this only has to stay loose enough to not skip past the step where turning
-# home actually becomes possible -- it trades a few extra steps of wandering
-# for not running a full shortest-path search on every single step of every
-# attempt.
+# Gate on the exact distance-home check: skipped when the straight-line
+# distance to the start, inflated by this factor, already rules a turn out.
+# Must stay loose enough not to skip the step where turning home becomes
+# possible.
 HOME_ESTIMATE_INFLATION = 1.75
 # Fraction of the target distance an out-and-back turnaround or a lollipop's
 # stem may land within and still be accepted.
@@ -69,9 +56,8 @@ LOLLIPOP_STEM_FRACTION = 0.25
 MAX_GENERATION_ATTEMPTS = 300
 # Candidates to generate per requested result before diversifying down.
 POOL_FACTOR = 3
-# Consecutive attempts that add no new unique qualifying candidate, once n
-# qualify, after which a small network is judged exhausted rather than
-# searched until the time budget runs out.
+# Consecutive attempts adding no new qualifying candidate (once n qualify)
+# after which a small network is judged exhausted.
 STAGNATION_ATTEMPTS = 40
 DIVERSITY_WEIGHT = 2.0
 
@@ -194,14 +180,11 @@ class NodeInfo:
 class GraphEdge:
     """One traversable connection between two search-graph nodes.
 
-    edge_key is a real net_edges id for an untouched edge, a negative
-    synthetic id for a start-point split piece (kept in edge_rows but never
-    persisted), or a negative synthetic id for a degree-2-chain contraction
-    (never scored directly -- traverse() only ever hands back the real
-    segments it stands in for). `segments` lists the real (edge_id, forward)
-    steps for walking from `a` to `b`; forward matches whether that step
-    reads its own points_blob in stored order or reversed, independent of
-    this edge's own a/b labels.
+    edge_key is a net_edges id for an untouched edge, or a negative synthetic
+    id for a start-split piece or a degree-2-chain contraction (contractions
+    are never scored directly). `segments` lists the real (edge_id, forward)
+    steps for walking from `a` to `b`; forward says whether a step reads its
+    points_blob in stored order, independent of this edge's a/b labels.
     """
     edge_key: int
     a: int
@@ -245,9 +228,8 @@ _ALLOWED_BY_ONEWAY: dict[str, Literal["both", "a_to_b", "b_to_a"]] = {
 
 
 def _load_graph(conn: sqlite3.Connection, area_id: int) -> tuple[SearchGraph, dict[int, dict]]:
-    """The area's full graph plus edge_rows, a lookup used both for
-    geometry/way-id access and as score_path's DB fallback surrogate for
-    edges that don't exist there (start-point splits)."""
+    """The area's full graph plus edge_rows, a lookup for geometry and way ids
+    and for score_path's edges that are not in the database."""
     graph = SearchGraph()
     edge_rows: dict[int, dict] = {}
     for row in conn.execute("SELECT * FROM net_nodes WHERE area_id = ?", [area_id]).fetchall():
@@ -260,12 +242,10 @@ def _load_graph(conn: sqlite3.Connection, area_id: int) -> tuple[SearchGraph, di
     return graph, edge_rows
 
 
-# Loading and indexing an area's whole graph from SQLite dwarfs the cost of
-# actually searching it once the graph is large -- cached per area, keyed on
-# net_graphs.built_at so a rebuild invalidates it rather than serving a stale graph.
+# Loading an area's graph dwarfs the cost of searching it, so graphs are cached
+# per area, keyed on net_graphs.built_at so a rebuild invalidates the entry.
 _graph_cache: OrderedDict[int, tuple[str | None, SearchGraph, dict[int, dict]]] = OrderedDict()
-# Each entry holds a whole area's graph in memory, so only the most recently
-# searched few stay.
+# Each entry is a whole area's graph in memory.
 _GRAPH_CACHE_MAX_AREAS = 3
 
 
@@ -274,9 +254,9 @@ def _built_at(conn: sqlite3.Connection, area_id: int) -> str | None:
     return row["built_at"] if row is not None else None
 
 
-# Searches run on worker threads. The first lock guards the cache and the
-# table of build locks, and is never held while a graph loads; a build lock
-# makes concurrent searches of one area share a single load.
+# Searches run on worker threads. The first lock guards the cache and the build
+# locks and is never held during a load; a build lock lets concurrent searches
+# of one area share a single load.
 _graph_cache_lock = threading.Lock()
 _graph_build_locks: dict[int, threading.Lock] = {}
 
@@ -312,10 +292,8 @@ def _cached_base_graph(conn: sqlite3.Connection, area_id: int) -> tuple[SearchGr
 
 
 def _copy_graph(graph: SearchGraph) -> SearchGraph:
-    """A per-request working copy cheap enough to make on every search --
-    GraphEdge/NodeInfo instances are never mutated in place once built, only
-    added to or removed from a graph's own node/adjacency indexes, so this
-    only has to copy those indexes, not the objects they point to."""
+    """A per-request working copy. GraphEdge/NodeInfo are never mutated once
+    built, so only the indexes are copied."""
     copy = SearchGraph()
     copy.nodes = dict(graph.nodes)
     copy.adjacency = {node: list(edges) for node, edges in graph.adjacency.items()}
@@ -324,8 +302,7 @@ def _copy_graph(graph: SearchGraph) -> SearchGraph:
 
 
 def _remove_ways(graph: SearchGraph, edge_rows: Mapping[int, dict], way_ids: set[int]) -> None:
-    """Drop every edge belonging to one of way_ids, so a search can't route
-    over them at all."""
+    """Drop every edge belonging to one of way_ids."""
     if not way_ids:
         return
     for edge in list(graph.edges_by_key.values()):
@@ -335,11 +312,9 @@ def _remove_ways(graph: SearchGraph, edge_rows: Mapping[int, dict], way_ids: set
 
 
 def _bound_graph(graph: SearchGraph, centers: Sequence[tuple[float, float]], radius_m: float) -> None:
-    """Drop every node farther than radius_m from all centers (a search's
-    starts), and any edge that loses either endpoint -- an approximation of
-    "half the maximum distance around each start" using straight-line rather
-    than graph distance, since graph distance isn't known until a graph this
-    size has already been built."""
+    """Drop every node farther than radius_m from all centers, and any edge that
+    loses an endpoint. Straight-line distance stands in for graph distance,
+    which isn't known until the graph is built."""
     def _keep(node: NodeInfo) -> bool:
         return any(routes_spatial.equirect_distance_m(node.lat, node.lng, clat, clng) <= radius_m for clat, clng in centers)
 
@@ -369,12 +344,9 @@ def _splice_start(
     graph: SearchGraph, edge_rows: MutableMapping[int, dict], index: routes_spatial.NearestIndex,
     lat: float, lng: float, ids: Iterable[int],
 ) -> int | None:
-    """Snap (lat, lng) onto the graph's nearest edge and cut that edge there,
-    at query time and in memory only -- mirrors network.build_network's
-    amenity splicing but against a live edge_rows dict instead of net_edges.
-    index covers the graph's current edges and is updated with each cut (so a
-    second start on an edge a prior start already cut finds the right,
-    already-split piece). Returns None when nothing is within
+    """Snap (lat, lng) onto the graph's nearest edge and cut it there, in memory
+    only. index covers the graph's current edges and is updated with each cut.
+    Returns the start's node id, or None when nothing is within
     START_SNAP_RADIUS_M.
     """
     cut = network.splice_at(edge_rows, index, lat, lng, START_SNAP_RADIUS_M, ids)
@@ -403,12 +375,9 @@ def _splice_start(
 
 
 def contract_degree2_chains(graph: SearchGraph, ids: Iterable[int], protected: Collection[int] = ()) -> None:
-    """Collapse junction nodes with exactly two (two-way) incident edges into
-    a single edge spanning both, shrinking the search space without losing
-    any node a candidate might need to stop at -- amenity and split-in start
-    nodes carry a kind other than "junction" and are never touched, and
-    protected lists the nodes that must survive regardless (a start that
-    snapped onto an existing junction)."""
+    """Collapse junction nodes with exactly two incident edges into one edge.
+    Amenity and start nodes are never touched, and `protected` lists further
+    nodes that must survive (a start snapped onto an existing junction)."""
     keep = set(protected)
     queue: list[int] = [
         n for n, edges in graph.adjacency.items()
@@ -454,9 +423,8 @@ def contract_degree2_chains(graph: SearchGraph, ids: Iterable[int], protected: C
 def _dijkstra(
     graph: SearchGraph, source: int, target: int | None = None, max_dist: float | None = None
 ) -> tuple[dict[int, float], dict[int, GraphEdge], dict[int, int]]:
-    """max_dist prunes the search once the frontier passes it -- safe because
-    heapq pops in non-decreasing distance order, so every node still on the
-    heap is at least as far as the one just popped."""
+    """max_dist prunes the search once the frontier passes it (safe: pops come
+    in non-decreasing distance)."""
     dist: dict[int, float] = {source: 0.0}
     prev_edge: dict[int, GraphEdge] = {}
     prev_node: dict[int, int] = {}
@@ -510,18 +478,15 @@ ShortestPathTree = tuple[dict[int, float], dict[int, GraphEdge], dict[int, int]]
 
 @dataclass
 class _SearchContext:
-    """Per-search state shared across generation attempts. Out-and-back and
-    lollipop attempts differ only in which turnaround/stem junction gets
-    picked -- the shortest-path tree it's picked from depends solely on
-    (start_node, outbound target), both fixed for the whole search, so it's
-    memoized here instead of recomputed on every attempt."""
+    """Per-search state shared across attempts. The shortest-path tree depends
+    only on (start_node, outbound target), both fixed for the search, so it is
+    memoized."""
     graph: SearchGraph
     _trees: dict[tuple[int, float], ShortestPathTree] = field(default_factory=dict)
 
     def tree(self, start_node: int, outbound_target: float) -> ShortestPathTree:
-        """The shortest-path tree from start_node, pruned to what a
-        turnaround near outbound_target can need. Nodes just past the bound
-        are still reached, so the source's own neighbors are always in it."""
+        """The shortest-path tree from start_node, pruned to what a turnaround
+        near outbound_target can need."""
         key = (start_node, outbound_target)
         if key not in self._trees:
             self._trees[key] = _dijkstra(self.graph, start_node, max_dist=outbound_target * (1.0 + TURNAROUND_TOLERANCE))
@@ -602,8 +567,7 @@ def _retrace(steps: Steps) -> Traversal | None:
 def _outbound_leg(
     ctx: _SearchContext, start_node: int, outbound_target: float, rng: random.Random
 ) -> tuple[Steps, float] | None:
-    """The steps from start_node to a turnaround node near outbound_target
-    away, and that node's distance."""
+    """The steps to a turnaround node near outbound_target, and its distance."""
     dist_map, prev_edge, prev_node = ctx.tree(start_node, outbound_target)
     turnaround = _pick_turnaround(dist_map, start_node, outbound_target, rng)
     if turnaround is None:
@@ -752,9 +716,8 @@ def _diversify(candidates: list[_Candidate], edge_rows: Mapping[int, dict], targ
 
 
 def _default_seed(request: RouteSearchRequest) -> int:
-    """A request with no explicit seed still reproduces: hash the request's
-    own parameters rather than the wall clock or Python's (per-process
-    randomized) string hashing."""
+    """A request with no explicit seed still reproduces: a hash of its
+    parameters (Python's string hash is randomized per process)."""
     canonical = json.dumps(request, sort_keys=True, default=str)
     return int.from_bytes(hashlib.sha256(canonical.encode()).digest()[:8], "big")
 
@@ -769,11 +732,10 @@ def resolve_starts(
     drive_k: int,
     origin_field: str = "start_lat/start_lng",
 ) -> list[Start]:
-    """Either an explicit starts list, a single out-the-door start at origin,
-    or -- given max_drive_minutes -- the fanned-out drive-to-trailhead set
-    around origin (drive_starts.drive_starts already includes the origin
-    itself as a zero-drive-time start). origin_field names the caller's
-    parameter for origin in error messages."""
+    """An explicit starts list, a single start at origin, or (with
+    max_drive_minutes) the drive-to-trailhead set around origin, which
+    includes origin itself. origin_field names the caller's origin parameter
+    in error messages."""
     if max_drive_minutes is not None:
         if starts:
             raise ValueError("max_drive_minutes and starts are mutually exclusive")
@@ -791,8 +753,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     starts_in = request["starts"]
     if not starts_in:
         raise ValueError("find_routes needs at least one start")
-    # An absent parameter and an explicit None or empty list are the same
-    # request: they read the same defaults and hash to the same default seed.
+    # Absent, None, and empty-list parameters are the same request, seed included.
     request = cast(RouteSearchRequest, {k: v for k, v in request.items() if v not in (None, [])})
     if request["distance_m_min"] > request["distance_m_max"]:
         raise ValueError("distance_m_min must be <= distance_m_max")
@@ -812,8 +773,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
 
     area_status = conn.execute("SELECT status FROM areas WHERE area_id = ?", [area_id]).fetchone()
     if area_status is not None and area_status["status"] != "ready":
-        # A refresh, or a failed refresh or interrupted import, leaves the
-        # previously committed graph intact, and that graph stays searchable.
+        # A failed or interrupted refresh leaves the committed graph searchable.
         has_graph = conn.execute("SELECT 1 FROM net_graphs WHERE area_id = ?", [area_id]).fetchone()
         if has_graph is None:
             raise AreaNotReadyError(
@@ -836,9 +796,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     # Avoided ways leave the graph entirely, so no candidate can touch one.
     avoid_way_ids = set(request.get("avoid_way_ids") or []) | network.avoided_way_ids(conn)
     _remove_ways(graph, cached_edge_rows, avoid_way_ids)
-    # Splicing writes synthetic (negative-id) pieces for a start's own split
-    # edges; layering them over the shared cached rows keeps those writes
-    # request-local instead of mutating the cache other searches read.
+    # Layered so splicing's synthetic rows stay request-local, off the shared cache.
     edge_rows: MutableMapping[int, dict] = ChainMap({}, cached_edge_rows)
     target_m = (request["distance_m_min"] + request["distance_m_max"]) / 2.0
     radius_m = request["distance_m_max"] / 2.0
@@ -857,9 +815,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     contract_degree2_chains(graph, ids, protected=[node_id for node_id, _ in start_nodes])
     ctx = _SearchContext(graph=graph)
 
-    # The whole bounded area's rows, already loaded -- handed to score_path
-    # as extra_edges so it never re-queries net_edges for a real edge id
-    # either, not just the synthetic start-split ones.
+    # Handed to score_path as extra_edges so it never re-queries net_edges.
     extra_edges = edge_rows
     shapes_to_try: list[str] = [shape] if shape != "any" else ["loop", "out_and_back", "lollipop"]
 
@@ -868,8 +824,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     near_misses: dict[frozenset[int], _Candidate] = {}
     budget_exceeded = False
     attempts = 0
-    # Generate well past n so diversification has a pool to choose among,
-    # rather than stopping at the first n (which may be n variants of one loop).
+    # Generate well past n so diversification has a pool to choose from.
     pool_target = n * POOL_FACTOR
     attempts_since_new = 0
     while len(qualifying) < pool_target and attempts < MAX_GENERATION_ATTEMPTS:
@@ -992,9 +947,8 @@ def get_route_candidate(conn: sqlite3.Connection, candidate_id: str) -> RouteCan
 
 
 def save_route_candidate(conn: sqlite3.Connection, candidate_id: str, name: str) -> dict:
-    """Generate a GPX from a candidate's stored geometry and upload it as a
-    normal route (source "generated"), reusing routes.py's own GPX writer
-    rather than duplicating the XML."""
+    """Upload a GPX built from a candidate's stored geometry as a route
+    (source "generated")."""
     candidate = get_route_candidate(conn, candidate_id)
     points = [(cast(float, lat), cast(float, lng), ele) for lat, lng, ele in candidate["geometry"]]
     gpx_bytes = routes.build_gpx(name, points)

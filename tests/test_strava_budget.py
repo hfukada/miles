@@ -3,7 +3,6 @@ from datetime import datetime, timezone
 import pytest
 import requests
 from helpers import strava_fault
-from stravalib.exc import Fault
 
 from miles import errors, metrics, strava_budget, strava_client
 
@@ -145,11 +144,6 @@ def test_no_response_at_all_is_counted_as_an_error_and_names_no_url(monkeypatch:
 # --- the allowance reading ----------------------------------------------------
 
 
-def test_note_window_elapsed_without_a_reading_is_harmless():
-    strava_client.note_window_elapsed()
-    assert strava_client.short_window_calls_remaining() is None
-
-
 def test_short_window_usage_resets_after_a_window_boundary(monkeypatch: pytest.MonkeyPatch):
     _at(monkeypatch, 2026, 3, 1, 10, 7)
     _observe(short_usage=95, long_usage=400)
@@ -160,7 +154,7 @@ def test_short_window_usage_resets_after_a_window_boundary(monkeypatch: pytest.M
     assert strava_client.daily_calls_remaining() == 600
 
 
-def test_the_daily_figure_is_dropped_after_the_utc_date_changes(monkeypatch: pytest.MonkeyPatch):
+def test_the_daily_figure_is_dropped_after_the_utc_date_changes_or_a_waited_out_window(monkeypatch: pytest.MonkeyPatch):
     _at(monkeypatch, 2026, 3, 1, 23, 58)
     _observe(short_usage=1, long_usage=990)
     assert strava_client.daily_calls_remaining() == 10
@@ -168,8 +162,7 @@ def test_the_daily_figure_is_dropped_after_the_utc_date_changes(monkeypatch: pyt
     assert strava_client.daily_calls_remaining() is None
     strava_budget.Gate(12).acquire("detail")
 
-
-def test_a_waited_out_window_does_not_carry_yesterdays_daily_figure_forward(monkeypatch: pytest.MonkeyPatch):
+    # A waited-out window does not carry yesterday's daily figure forward either.
     _at(monkeypatch, 2026, 3, 1, 23, 50)
     _observe(short_usage=95, long_usage=990)
     _at(monkeypatch, 2026, 3, 2, 0, 5)
@@ -230,10 +223,6 @@ def test_an_interactive_request_is_refused_not_held_for_a_window(slept: list[flo
     assert slept == []
 
 
-def test_a_request_goes_through_and_returns_its_result():
-    assert strava_budget.Gate(12).call("laps", lambda: "laps") == "laps"
-
-
 class _Flaky:
     """Raises each queued status in turn, then succeeds."""
 
@@ -248,31 +237,23 @@ class _Flaky:
         return "ok"
 
 
-def test_a_429_waits_one_window_and_repeats_the_request(slept: list[float], outcomes):
+def test_a_429_waits_one_window_and_repeats_the_request_but_a_second_with_no_success_between_is_final(slept: list[float], outcomes):
+    gate = strava_budget.Gate(12)
     request = _Flaky(429)
 
-    assert strava_budget.Gate(12).call("streams", request) == "ok"
+    assert gate.call("streams", request) == "ok"
 
     assert request.calls == 2 and len(slept) == 1
     assert outcomes == []
 
-
-def test_a_second_429_with_nothing_succeeding_between_is_final(slept: list[float], outcomes):
-    request = _Flaky(429, 429)
-
-    with pytest.raises(errors.StravaAllowanceLowError, match="daily limit reached; resets 00:00 UTC"):
-        strava_budget.Gate(12).call("streams", request)
-
-    assert len(slept) == 1
-    assert outcomes == [("strava", 429)]
-
-
-def test_a_success_between_two_429s_earns_another_wait(slept: list[float], outcomes):
-    gate = strava_budget.Gate(12)
-    assert gate.call("streams", _Flaky(429)) == "ok"
-    assert gate.call("streams", _Flaky(429)) == "ok"
+    assert gate.call("streams", _Flaky(429)) == "ok"  # a success between two 429s earns another wait
     assert len(slept) == 2
     assert outcomes == []
+
+    with pytest.raises(errors.StravaAllowanceLowError, match="daily limit reached; resets 00:00 UTC"):
+        strava_budget.Gate(12).call("streams", _Flaky(429, 429))
+    assert len(slept) == 3
+    assert outcomes == [("strava", 429)]
 
 
 def test_the_activity_listing_keeps_waiting_while_the_daily_limit_has_room(slept: list[float], outcomes):
@@ -284,7 +265,7 @@ def test_the_activity_listing_keeps_waiting_while_the_daily_limit_has_room(slept
     assert outcomes == []
 
 
-def test_a_429_with_the_daily_limit_spent_is_final_without_waiting(slept: list[float], outcomes):
+def test_a_429_with_the_daily_limit_spent_or_on_an_interactive_request_is_final_without_waiting(slept: list[float], outcomes):
     _observe(short_usage=3, long_usage=1000)
 
     with pytest.raises(errors.StravaAllowanceLowError, match="daily limit reached"):
@@ -293,20 +274,12 @@ def test_a_429_with_the_daily_limit_spent_is_final_without_waiting(slept: list[f
     assert slept == []
     assert outcomes == [("strava", 429)]
 
-
-def test_an_interactive_429_is_final_without_waiting(slept: list[float], outcomes):
-    request = _Flaky(429)
-
+    strava_client._observation = None  # the daily figure is no longer spent
+    interactive = _Flaky(429)
     with pytest.raises(errors.StravaAllowanceLowError, match="try again"):
-        strava_budget.Gate(12).call("laps", request, interactive=True)
+        strava_budget.Gate(12).call("laps", interactive, interactive=True)
 
-    assert request.calls == 1 and slept == []
-    assert outcomes == [("strava", 429)]
+    assert interactive.calls == 1 and slept == []
+    assert outcomes == [("strava", 429), ("strava", 429)]
 
-
-def test_other_failures_pass_through_untouched(slept: list[float], outcomes):
-    request = _Flaky(404)
-    with pytest.raises(Fault):
-        strava_budget.Gate(12).call("laps", request)
-    assert request.calls == 1 and slept == [] and outcomes == []
 

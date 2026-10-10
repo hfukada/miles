@@ -8,18 +8,11 @@
   <link rel="stylesheet" href="/theme.css">
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous"></script>
   <style>
-    .terrain-view h1 {
-      font-size: 1.25rem;
-      font-weight: 650;
-      letter-spacing: -0.02em;
-      margin-bottom: 0.25rem;
-    }
-    .terrain-view .subtitle { font-size: 0.8125rem; color: var(--muted); margin-bottom: 1.25rem; max-width: 68ch; }
+    .terrain-view .subtitle { margin-bottom: 1.25rem; max-width: 68ch; }
     .terrain-view .data-credit { font-size: 0.75rem; color: var(--muted); margin-top: 2rem; }
     .terrain-view .data-credit a { color: inherit; }
-    .terrain-view .loading, .terrain-view .error { font-size: 0.8125rem; color: var(--muted); padding: 1rem 0; }
 
-    .terrain-view .controls {
+    .terrain-view .controls, .terrain-view .trend-controls {
       display: flex;
       align-items: center;
       gap: 0.5rem;
@@ -27,7 +20,7 @@
       font-size: 0.8125rem;
       color: var(--text-secondary);
     }
-    .terrain-view .controls select {
+    .terrain-view .controls select, .terrain-view .trend-controls select {
       font-size: 0.8125rem;
       padding: 0.25rem 0.5rem;
       border-radius: 6px;
@@ -35,35 +28,6 @@
       background: var(--surface);
       color: var(--text);
     }
-
-    .terrain-view .stat-strip {
-      display: flex;
-      flex-wrap: wrap;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      margin-bottom: 1.5rem;
-    }
-    .terrain-view .stat { padding: 0.625rem 1.25rem; }
-    .terrain-view .stat + .stat { border-left: 1px solid var(--border); }
-    .terrain-view .stat-label {
-      font-size: 0.625rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--muted);
-      margin-bottom: 0.1875rem;
-    }
-    .terrain-view .stat-value {
-      display: flex;
-      align-items: baseline;
-      gap: 0.375rem;
-      font-size: 1.0625rem;
-      font-weight: 700;
-      font-variant-numeric: tabular-nums;
-      color: var(--text);
-    }
-    .terrain-view .stat-sub { font-size: 0.6875rem; font-weight: 400; color: var(--muted); }
 
     .terrain-view section h2 {
       font-size: 0.9375rem;
@@ -74,22 +38,7 @@
     }
     .terrain-view .desc { font-size: 0.8rem; color: var(--muted); margin-bottom: 0.875rem; max-width: 68ch; }
     .terrain-view .chart-wrap { height: 300px; }
-    .terrain-view .trend-controls {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      margin-bottom: 0.75rem;
-      font-size: 0.8125rem;
-      color: var(--text-secondary);
-    }
-    .terrain-view .trend-controls select {
-      font-size: 0.8125rem;
-      padding: 0.25rem 0.5rem;
-      border-radius: 6px;
-      border: 1px solid var(--border);
-      background: var(--surface);
-      color: var(--text);
-    }
+    .terrain-view .trend-controls { margin-bottom: 0.75rem; }
   </style>
 </head>
 <body>
@@ -97,7 +46,7 @@
 <script src="/charts.js"></script>
 <script src="/map.js"></script>
 
-<main class="terrain-view">
+<main class="terrain-view page-view">
   <div id="root">Loading…</div>
 </main>
 
@@ -175,17 +124,6 @@
     });
   }
 
-  function binLabel(b) {
-    if (b.lo_pct <= -999) return `< ${b.hi_pct.toFixed(0)}%`;
-    if (b.hi_pct >= 999) return `≥ ${b.lo_pct.toFixed(0)}%`;
-    return `${b.lo_pct.toFixed(0)}–${b.hi_pct.toFixed(0)}%`;
-  }
-
-  function speedToPace(speedMps) {
-    if (speedMps == null || speedMps <= 0) return null;
-    return (1609.344 / speedMps) / 60;
-  }
-
   async function loadProfile(windowDays) {
     document.getElementById('window-select').value = String(windowDays);
     try {
@@ -200,23 +138,16 @@
     renderBinCharts();
   }
 
+  function gradeStat(label, pct) {
+    return statTile(label, pct.toFixed(1), '%', `${profile.confidence} confidence`);
+  }
+
   function renderThresholds() {
     document.getElementById('thresholds').innerHTML = `
       <div class="stat-strip">
-        <div class="stat">
-          <div class="stat-label">Walk-onset grade</div>
-          <div class="stat-value">${profile.walk_onset_grade_pct.toFixed(1)}<span class="stat-sub">%</span></div>
-          <div class="stat-sub">${profile.confidence} confidence</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">Comfortable descent grade</div>
-          <div class="stat-value">${profile.descent_comfort_grade_pct.toFixed(1)}<span class="stat-sub">%</span></div>
-          <div class="stat-sub">${profile.confidence} confidence</div>
-        </div>
-        <div class="stat">
-          <div class="stat-label">Window</div>
-          <div class="stat-value">${profile.window_days}<span class="stat-sub">days, as of ${profile.as_of}</span></div>
-        </div>
+        ${gradeStat('Walk-onset grade', profile.walk_onset_grade_pct)}
+        ${gradeStat('Comfortable descent grade', profile.descent_comfort_grade_pct)}
+        ${statTile('Window', profile.window_days, `days, as of ${profile.as_of}`)}
       </div>
     `;
   }
@@ -224,88 +155,39 @@
   function renderBinCharts() {
     const theme = chartTheme();
     const bins = profile.bins;
-    const categories = bins.map(binLabel);
+    const categories = bins.map(gradeBinLabel);
+    const faded = (b) => (b.sample_count < LOW_SAMPLE_THRESHOLD ? 0.25 : 0.9);
 
-    const paceData = bins.map(b => {
-      const pace = speedToPace(b.median_speed_mps);
-      const faded = b.sample_count < LOW_SAMPLE_THRESHOLD;
-      return { value: pace, itemStyle: { color: theme.series[0], opacity: faded ? 0.25 : 0.9 } };
-    });
+    const paceData = bins.map(b => ({
+      value: speedToPace(b.median_speed_mps),
+      itemStyle: { color: theme.series[0], opacity: faded(b) },
+    }));
+    const walkData = bins.map(b => ({
+      value: b.walk_fraction != null ? b.walk_fraction * 100 : null,
+      itemStyle: { color: theme.series[1], opacity: faded(b) },
+    }));
 
-    if (!paceChart) paceChart = echarts.init(document.getElementById('chart-pace'));
-    paceChart.setOption({
-      animation: false,
-      grid: { top: 16, right: 24, bottom: 40, left: 56 },
-      tooltip: {
-        trigger: 'axis',
-        backgroundColor: theme.surface,
-        borderColor: theme.gridline,
-        textStyle: { fontSize: 12, color: theme.text },
-        formatter(items) {
+    const binChart = (existing, id, data, describe, yAxis) => {
+      const chart = existing || echarts.init(document.getElementById(id));
+      chart.setOption({
+        animation: false,
+        grid: chartGrid(40),
+        tooltip: chartAxisTooltip(theme, (items) => {
           const i = items[0].dataIndex;
-          const b = bins[i];
-          const pace = paceData[i].value;
-          return `${categories[i]}<br>${pace != null ? `${fmt.pace(pace)}/mi` : 'no data'}<br>${b.sample_count} samples`;
-        },
-      },
-      xAxis: {
-        type: 'category',
-        data: categories,
-        axisLabel: { color: theme.muted, fontSize: 10, rotate: 45 },
-        axisLine: { lineStyle: { color: theme.gridline } },
-      },
-      yAxis: {
-        type: 'value',
-        inverse: true,
-        name: 'min/mi',
-        nameTextStyle: { color: theme.muted, fontSize: 10 },
-        axisLabel: { formatter: (v) => fmt.pace(v), color: theme.muted, fontSize: 10 },
-        splitLine: { lineStyle: { color: theme.gridline, opacity: 0.4 } },
-      },
-      series: [{ type: 'bar', data: paceData }],
-    }, { notMerge: true });
+          const v = data[i].value;
+          return `${categories[i]}<br>${v != null ? describe(v) : 'no data'}<br>${bins[i].sample_count} samples`;
+        }),
+        xAxis: chartCategoryAxis(theme, categories, { rotate: 45 }),
+        yAxis,
+        series: [{ type: 'bar', data }],
+      }, { notMerge: true });
+      return chart;
+    };
 
-    const walkData = bins.map(b => {
-      const faded = b.sample_count < LOW_SAMPLE_THRESHOLD;
-      return {
-        value: b.walk_fraction != null ? b.walk_fraction * 100 : null,
-        itemStyle: { color: theme.series[1], opacity: faded ? 0.25 : 0.9 },
-      };
-    });
-
-    if (!walkChart) walkChart = echarts.init(document.getElementById('chart-walk'));
-    walkChart.setOption({
-      animation: false,
-      grid: { top: 16, right: 24, bottom: 40, left: 56 },
-      tooltip: {
-        trigger: 'axis',
-        backgroundColor: theme.surface,
-        borderColor: theme.gridline,
-        textStyle: { fontSize: 12, color: theme.text },
-        formatter(items) {
-          const i = items[0].dataIndex;
-          const b = bins[i];
-          const v = walkData[i].value;
-          return `${categories[i]}<br>${v != null ? `${v.toFixed(0)}% walking` : 'no data'}<br>${b.sample_count} samples`;
-        },
-      },
-      xAxis: {
-        type: 'category',
-        data: categories,
-        axisLabel: { color: theme.muted, fontSize: 10, rotate: 45 },
-        axisLine: { lineStyle: { color: theme.gridline } },
-      },
-      yAxis: {
-        type: 'value',
-        min: 0,
-        max: 100,
-        name: '%',
-        nameTextStyle: { color: theme.muted, fontSize: 10 },
-        axisLabel: { color: theme.muted, fontSize: 10 },
-        splitLine: { lineStyle: { color: theme.gridline, opacity: 0.4 } },
-      },
-      series: [{ type: 'bar', data: walkData }],
-    }, { notMerge: true });
+    paceChart = binChart(paceChart, 'chart-pace', paceData, (v) => `${fmt.pace(v)}/mi`,
+      chartValueAxis(theme, { inverse: true, name: 'min/mi', axisLabel: { formatter: (v) => fmt.pace(v) } }));
+    walkChart = binChart(walkChart, 'chart-walk', walkData, (v) => `${v.toFixed(0)}% walking`,
+      chartValueAxis(theme, { min: 0, max: 100, name: '%' }));
   }
 
   async function loadOnsetTrend() {
@@ -330,7 +212,7 @@
   function populateBandSelect() {
     const select = document.getElementById('band-select');
     const bins = profile.bins.filter(b => b.lo_pct > -999 && b.hi_pct < 999);
-    select.innerHTML = bins.map((b, i) => `<option value="${i}">${binLabel(b)}</option>`).join('');
+    select.innerHTML = bins.map((b, i) => `<option value="${i}">${gradeBinLabel(b)}</option>`).join('');
     const zeroIdx = bins.findIndex(b => b.lo_pct <= 0 && b.hi_pct > 0);
     selectedBandIdx = zeroIdx >= 0 ? zeroIdx : 0;
     select.value = String(selectedBandIdx);
@@ -358,36 +240,18 @@
   function trendOption(theme, points, name, unitLabel, tooltipFmt, inverse) {
     return {
       animation: false,
-      grid: { top: 16, right: 24, bottom: 32, left: 56 },
-      tooltip: {
-        trigger: 'axis',
-        backgroundColor: theme.surface,
-        borderColor: theme.gridline,
-        textStyle: { fontSize: 12, color: theme.text },
-        formatter(items) {
-          if (!items.length) return '';
-          const v = items[0].data[1];
-          return `${items[0].axisValue}<br>${v != null ? tooltipFmt(v) : 'no data'}`;
-        },
-      },
-      xAxis: {
-        type: 'category',
-        data: points.map(p => p.as_of),
-        axisLabel: { color: theme.muted, fontSize: 10 },
-        axisLine: { lineStyle: { color: theme.gridline } },
-      },
-      yAxis: {
-        type: 'value',
+      grid: chartGrid(32),
+      tooltip: chartAxisTooltip(theme, (items) => {
+        if (!items.length) return '';
+        const v = items[0].data[1];
+        return `${items[0].axisValue}<br>${v != null ? tooltipFmt(v) : 'no data'}`;
+      }),
+      xAxis: chartCategoryAxis(theme, points.map(p => p.as_of)),
+      yAxis: chartValueAxis(theme, {
         inverse: !!inverse,
         name: unitLabel,
-        nameTextStyle: { color: theme.muted, fontSize: 10 },
-        axisLabel: {
-          formatter: (v) => (inverse ? fmt.pace(v) : v.toFixed(1)),
-          color: theme.muted,
-          fontSize: 10,
-        },
-        splitLine: { lineStyle: { color: theme.gridline, opacity: 0.4 } },
-      },
+        axisLabel: { formatter: (v) => (inverse ? fmt.pace(v) : v.toFixed(1)) },
+      }),
       series: [{
         name,
         type: 'line',

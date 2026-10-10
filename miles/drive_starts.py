@@ -2,24 +2,18 @@
 an imported area, ranked by drive time from a point and by how much trail
 they put within reach.
 
-Candidates come straight out of network.py's net_nodes (built by
-build_network, which already excludes private parking and keeps each node's
-name). Drive time comes from one OSRM table call per search: candidates whose
-fastest possible drive (straight line at MAX_DRIVE_KM_PER_MINUTE) already
-exceeds the budget are dropped, the rest are ranked by the best score that
-time could still give them, and only the most promising uncached ones are
-sent. Answers are
-cached by origin cell and destination node, so a repeated search from "the
-same place" never re-hits OSRM. When OSRM cannot be reached, drive times are
-estimated from straight-line distance, flagged as estimates, never cached,
-and OSRM is left alone for OSRM_RETRY_COOLDOWN_S (kept in process memory:
-one long-running API process owns the outbound calls, so a restart is the
-only thing it does not survive).
+Candidates come from network.py's net_nodes. Drive time comes from one OSRM
+table call per search: candidates whose fastest possible drive (straight line
+at MAX_DRIVE_KM_PER_MINUTE) exceeds the budget are dropped, the rest ranked
+by the best score that time could still give them, and only the most
+promising uncached ones sent. Answers are cached by origin cell and
+destination node. When OSRM cannot be reached, drive times are straight-line
+estimates, flagged, never cached, and OSRM is left alone for
+OSRM_RETRY_COOLDOWN_S (kept in process memory).
 """
 
 import http.client
 import json
-import math
 import os
 import sqlite3
 import threading
@@ -39,56 +33,44 @@ OSRM_BASE = os.environ.get("MILES_OSRM_URL", "https://router.project-osrm.org")
 # one of those is the origin, so a chunk holds at most this many destinations.
 OSRM_MAX_DESTINATIONS_PER_CALL = 99
 
-# Longest drive a search will consider: past this the prefilter
-# admits most of the area and the result is not "a nearby trailhead" anymore.
+# Longest drive a search considers; past it the prefilter admits most of the area.
 MAX_DRIVE_MINUTES = 90.0
 
 DRIVE_TIME_CACHE_TTL_DAYS = 180
-# An unreachable answer (OSRM's null) may be a gap in the road data or a bad
-# snap, so it expires sooner than a measured time.
+# An unreachable answer (null) may be a data gap or bad snap, so it expires sooner.
 UNREACHABLE_CACHE_TTL_DAYS = 7
 ORIGIN_CACHE_GRID_M = 100.0
 
-# Candidates sent to OSRM per search: a multiple of the number wanted back,
-# so a search is one request, never more than one table call's worth.
+# Candidates sent to OSRM per search, as a multiple of the number wanted.
 OSRM_CANDIDATES_PER_RESULT = 3
 
-# After a failed OSRM request, drive times are estimated for this long
-# instead of trying again.
+# After a failed OSRM request, estimate for this long instead of retrying.
 OSRM_RETRY_COOLDOWN_S = 600.0
-# The estimate used when OSRM is down: straight-line distance, lengthened by
-# this factor, driven at areas.DRIVE_KM_PER_MINUTE.
+# Estimate when OSRM is down: straight-line distance times this, at
+# areas.DRIVE_KM_PER_MINUTE.
 STRAIGHT_LINE_DETOUR = 1.4
-# The prefilter and ranking bound: no road is driven faster than this on
-# average, so a straight line at this speed never overestimates the real time
-# and a reachable trailhead is not dropped before OSRM has been asked.
+# Prefilter and ranking bound: no road averages faster, so a straight line at
+# this speed never overestimates and no reachable trailhead is dropped early.
 MAX_DRIVE_KM_PER_MINUTE = 2.0
 
 DEDUPE_RADIUS_M = 300.0
 PARKING_TRAIL_PROXIMITY_M = 150.0
 TRAIL_NEARBY_RADIUS_M = 1000.0
 
-# Edges are resampled to this spacing (network.py), so counting a trail
-# edge's sample points within TRAIL_NEARBY_RADIUS_M and multiplying by this
-# constant approximates the length of trail actually inside the radius --
-# unlike crediting an edge's full length whenever any one of its points
-# qualifies, which lets a parking lot near just the tip of a long trail
-# outscore a lot genuinely surrounded by short ones.
+# Edges are resampled to this spacing (network.py), so in-radius sample count
+# times this approximates trail length inside the radius; crediting a whole
+# edge for one qualifying point would let a lot near the tip of a long trail
+# outscore one surrounded by short ones.
 _TRAIL_SAMPLE_SPACING_M = gpx_parse.RESAMPLE_SPACING_M
 
-# Ranking blend: one minute of extra drive time costs as much as losing this
-# many meters of nearby trail. Arbitrary but fixed, so results are stable.
+# Ranking blend: one extra drive minute costs as much as this much nearby trail.
 DRIVE_MINUTE_TRAIL_TRADEOFF_M = 200.0
 
-# A mapped trailhead is a curated, verified access point; an unlabeled
-# parking lot only qualifies by proximity to trail-class edges, which can
-# include a lot that's adjacent to a trail in name only (a short connector
-# spur, a service road). Worth this much nearby trail in the ranking so a
-# real trailhead isn't edged out by a lot with a marginally larger
-# (but less trustworthy) proximity count.
+# A mapped trailhead is a curated access point; a parking lot only qualifies
+# by proximity to trail-class edges, which may be a spur or service road. The
+# bonus keeps a real trailhead from losing to a marginally better-trailed lot.
 TRAILHEAD_BONUS_M = 400.0
 
-_METERS_PER_DEG_LAT = 111320.0
 
 
 class DriveStart(TypedDict):
@@ -99,8 +81,7 @@ class DriveStart(TypedDict):
     kind: str
     osm_node_id: int | None
     trail_m_nearby: float
-    # True when drive_s is a straight-line estimate because OSRM was
-    # unavailable.
+    # True when drive_s is a straight-line estimate (OSRM unavailable).
     drive_time_estimated: bool
 
 
@@ -126,11 +107,9 @@ def init_drive_schema(conn: sqlite3.Connection) -> None:
 def _load_trail_edges(
     conn: sqlite3.Connection, area_id: int
 ) -> tuple[list[tuple[str | None, float]], routes_spatial.NearestIndex]:
-    """Every trail-class edge in an area as (way_name, length_m), plus an
-    index (keyed by position in that list) over its 20m samples (already
-    stored on the edge) for straight-line proximity and nearby-trail-distance
-    queries -- cheaper than a graph walk and accurate enough at the
-    ~150m/~1km radii those queries use."""
+    """Every trail-class edge as (way_name, length_m), plus an index (keyed by
+    position in that list) over the edges' stored samples, for straight-line
+    proximity queries."""
     rows = conn.execute(
         "SELECT edge_id, way_id, way_name, highway, surface_class, length_m, points_blob FROM net_edges WHERE area_id = ?",
         [area_id],
@@ -142,10 +121,7 @@ def _load_trail_edges(
         if not network.is_trail_class(row["highway"], row["surface_class"]):
             continue
         if row["way_id"] < 0:
-            # A synthetic access spur (network.py splices one in when an
-            # amenity sits off the trail it snapped to) -- real trail
-            # mileage and names for a candidate's own label shouldn't come
-            # from the short unsurveyed line connecting it to the network.
+            # Synthetic access spur: not real trail mileage or a real name.
             continue
         trail_edges.append((row["way_name"], row["length_m"]))
         network.index_edge(index, len(trail_edges) - 1, row["points_blob"])
@@ -156,13 +132,9 @@ def _load_trail_edges(
 def _nearby_trail_info(
     trail_edges: list[tuple[str | None, float]], index: routes_spatial.NearestIndex, lat: float, lng: float
 ) -> tuple[float | None, str | None, float]:
-    """(distance to the nearest trail-class edge, that edge's name,
-    approximate length of trail actually within TRAIL_NEARBY_RADIUS_M) --
-    one index query serves both the parking proximity filter and the
-    trail_m_nearby quality signal. The length is approximated from the
-    count of in-radius sample points per edge rather than an edge's full
-    length whenever it has any qualifying point, since a trail's far end
-    dipping into the radius shouldn't count the whole trail as nearby."""
+    """(distance to the nearest trail-class edge, its name, approximate trail
+    length within TRAIL_NEARBY_RADIUS_M). The length counts in-radius sample
+    points per edge rather than crediting a whole edge for one point."""
     hits = list(index.within(lat, lng, TRAIL_NEARBY_RADIUS_M))
     hits_by_edge = Counter(cast(int, key) for key, _offset, _d in hits)
     trail_m_nearby = sum(
@@ -210,9 +182,7 @@ def _gather_candidates(
 
 
 def _dedupe(candidates: list[dict], radius_m: float) -> list[dict]:
-    """Greedily keep the better-trailed candidate of any pair within
-    radius_m -- two trailhead/parking nodes at the same lot shouldn't both
-    become starts."""
+    """Greedily keep the better-trailed candidate of any pair within radius_m."""
     ordered = sorted(candidates, key=lambda c: c["trail_m_nearby"], reverse=True)
     kept: list[dict] = []
     for c in ordered:
@@ -227,14 +197,12 @@ def _dedupe(candidates: list[dict], radius_m: float) -> list[dict]:
 
 
 def _round_origin(lat: float, lng: float) -> tuple[int, int]:
-    """The grid cell, about ORIGIN_CACHE_GRID_M wide, an origin falls in, as
-    integer (row, column) indices, so repeat searches from "the same place"
-    reuse cached drive times. A column is that many degrees of longitude wide
-    at the cell's own latitude, not the origin's: two origins in one row must
-    agree on the width or they would key different columns."""
-    lat_step = ORIGIN_CACHE_GRID_M / _METERS_PER_DEG_LAT
+    """The ~ORIGIN_CACHE_GRID_M grid cell an origin falls in, as (row, column).
+    Column width is taken at the row's latitude, not the origin's, so origins
+    in one row agree on it."""
+    lat_step = ORIGIN_CACHE_GRID_M / routes_spatial.METERS_PER_DEG_LAT
     row = round(lat / lat_step)
-    lng_step = ORIGIN_CACHE_GRID_M / (_METERS_PER_DEG_LAT * max(math.cos(math.radians(row * lat_step)), 1e-6))
+    lng_step = ORIGIN_CACHE_GRID_M / routes_spatial.meters_per_deg_lng(row * lat_step)
     return (row, round(lng / lng_step))
 
 
@@ -309,9 +277,8 @@ def _osrm_table_url(origin: tuple[float, float], destinations: list[tuple[float,
 
 
 def _fetch_durations(url: str) -> list[float | None] | None:
-    """Per-destination durations (seconds; None where OSRM reports a
-    destination unreachable), in request order -- or None if the whole call
-    failed outright, so the caller can fall back rather than raise."""
+    """Per-destination durations in seconds (None where unreachable), in
+    request order, or None if the whole call failed."""
     try:
         raw = _fetch_with_backoff(url)
     except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.HTTPException):
@@ -345,9 +312,7 @@ def _straight_line_km(origin_lat: float, origin_lng: float, c: dict) -> float:
 
 
 def _fastest_possible_s(origin_lat: float, origin_lng: float, c: dict) -> float:
-    """Drive seconds if the road were straight and driven at
-    MAX_DRIVE_KM_PER_MINUTE: a lower bound on the real time, used for ranking
-    and filtering."""
+    """Lower bound on the drive time: a straight road at MAX_DRIVE_KM_PER_MINUTE."""
     return _straight_line_km(origin_lat, origin_lng, c) / MAX_DRIVE_KM_PER_MINUTE * 60.0
 
 
@@ -364,12 +329,10 @@ class _DriveTime(TypedDict):
 def _resolve_drive_times(
     conn: sqlite3.Connection, origin_lat: float, origin_lng: float, ranked: list[dict], limit: int
 ) -> dict[int, _DriveTime | None]:
-    """Drive time per candidate in `ranked` (best first): None for a
-    destination OSRM calls unreachable. At most `limit` candidates missing
-    from the cache are sent to OSRM, in one request, the best-ranked first;
-    candidates beyond that and not cached are left out of the result. If the
-    request fails (or OSRM was down recently), the ones that would have been
-    sent get straight-line estimates instead."""
+    """Drive time per candidate in `ranked` (best first); None means
+    unreachable. At most `limit` uncached candidates, best first, go to OSRM in
+    one request; the rest are left out. If the request fails (or OSRM was down
+    recently), those that would have been sent get straight-line estimates."""
     origin_key = _round_origin(origin_lat, origin_lng)
     _expire_cache(conn)
     cached = _cache_lookup(conn, origin_key, [c["osm_node_id"] for c in ranked])
@@ -389,14 +352,12 @@ def _resolve_drive_times(
             durations = None
             _note_osrm_failure()
     if durations is None:
-        # An estimate is not an answer: it stays out of the cache so the
-        # next search, once OSRM is back, asks for real times.
+        # Estimates stay out of the cache so a later search asks for real times.
         for c in to_ask:
             result[c["osm_node_id"]] = {"drive_s": _estimated_s(origin_lat, origin_lng, c), "estimated": True}
         return result
 
-    # Only real OSRM answers go in the cache; an unreachable destination
-    # (OSRM's own null) is one.
+    # Only real OSRM answers are cached, including its null for unreachable.
     fresh = {c["osm_node_id"]: d for c, d in zip(to_ask, durations)}
     _cache_store(conn, origin_key, fresh)
     for node_id, d in fresh.items():
@@ -433,8 +394,8 @@ def drive_starts(
     trail_edges, index = _load_trail_edges(conn, area_id)
     candidates = _dedupe(_gather_candidates(conn, area_id, trail_edges, index), DEDUPE_RADIUS_M)
     survivors = [c for c in candidates if _fastest_possible_s(origin_lat, origin_lng, c) <= max_drive_s]
-    # No candidate can score better than it would at its fastest possible
-    # time, so this order decides which ones are worth an OSRM lookup.
+    # No candidate scores better than at its fastest possible time, so this
+    # order picks which are worth an OSRM lookup.
     survivors.sort(key=lambda c: _rank_score(c, _fastest_possible_s(origin_lat, origin_lng, c)), reverse=True)
 
     times = _resolve_drive_times(

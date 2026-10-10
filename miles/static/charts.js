@@ -186,3 +186,64 @@ function makeSortable(tableEl, initial) {
     });
   });
 }
+
+// Terrain/route page helpers.
+
+const MILE_METERS = 1609.344;
+const FT_PER_METER = 3.28084;
+
+function speedToPace(speedMps) {
+  if (speedMps == null || speedMps <= 0) return null;
+  return (MILE_METERS / speedMps) / 60;
+}
+
+// Label for a grade bin {lo_pct, hi_pct}; +/-999 marks an open end.
+function gradeBinLabel(b) {
+  if (b.lo_pct <= -999) return `< ${b.hi_pct.toFixed(0)}%`;
+  if (b.hi_pct >= 999) return `≥ ${b.lo_pct.toFixed(0)}%`;
+  return `${b.lo_pct.toFixed(0)}–${b.hi_pct.toFixed(0)}%`;
+}
+
+function statTile(label, value, sub, note) {
+  return `
+    <div class="stat">
+      <div class="stat-label">${label}</div>
+      <div class="stat-value">${value}${sub ? `<span class="stat-sub">${sub}</span>` : ''}</div>
+      ${note ? `<div class="stat-sub">${note}</div>` : ''}
+    </div>
+  `;
+}
+
+function chartValueAxis(theme, { axisLabel = {}, ...rest } = {}) {
+  return {
+    type: 'value',
+    nameTextStyle: { color: theme.muted, fontSize: 10 },
+    axisLabel: { color: theme.muted, fontSize: 10, ...axisLabel },
+    splitLine: { lineStyle: { color: theme.gridline, opacity: 0.4 } },
+    ...rest,
+  };
+}
+
+function chartCategoryAxis(theme, data, axisLabel = {}) {
+  return {
+    type: 'category',
+    data,
+    axisLabel: { color: theme.muted, fontSize: 10, ...axisLabel },
+    axisLine: { lineStyle: { color: theme.gridline } },
+  };
+}
+
+function chartAxisTooltip(theme, formatter) {
+  return {
+    trigger: 'axis',
+    backgroundColor: theme.surface,
+    borderColor: theme.gridline,
+    textStyle: { fontSize: 12, color: theme.text },
+    formatter,
+  };
+}
+
+// Shared by the terrain page's four charts: bar/line over a category axis.
+function chartGrid(bottom) {
+  return { top: 16, right: 24, bottom, left: 56 };
+}

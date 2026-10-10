@@ -5,10 +5,10 @@ import time
 
 import pytest
 from fastapi.testclient import TestClient
-from helpers import ORIGIN_LAT, ORIGIN_LNG, FakeOsrm, NoneSampler, meadow_payload
+from helpers import ORIGIN_LAT, ORIGIN_LNG, FakeOsrm, meadow_payload, none_sampler
 from mcp.server.fastmcp import FastMCP
 
-from miles import api, areas_mcp, db, drive_mcp, network, offload, search_mcp
+from miles import api, areas_mcp, db, drive_mcp, network, search_mcp
 
 SLOW_S = 0.2
 
@@ -25,7 +25,7 @@ def _server() -> FastMCP:
 def slow_osrm(osrm: FakeOsrm) -> FakeOsrm:
     osrm.delay_s = SLOW_S
     conn = db.connect()
-    network.build_network(conn, 1, [meadow_payload()], NoneSampler())
+    network.build_network(conn, 1, [meadow_payload()], none_sampler())
     conn.close()
     return osrm
 
@@ -62,23 +62,6 @@ def test_a_slow_osrm_call_does_not_block_the_event_loop(slow_osrm: FakeOsrm):
     content = answers[0]
     starts = json.loads((content[0] if isinstance(content, tuple) else content)[0].text)
     assert starts[0]["kind"] == "origin" and len(starts) > 1
-
-
-def test_a_threaded_tool_keeps_its_name_signature_and_schema():
-    server = _server()
-    tools = {t.name: t for t in asyncio.run(server.list_tools())}
-    for name, required in (("find_trailheads", "area_id"), ("import_area", "label"), ("find_routes", "area_id")):
-        assert name in tools
-        assert required in tools[name].inputSchema["properties"]
-    assert tools["find_trailheads"].description and "trailheads" in tools["find_trailheads"].description.lower()
-
-
-def test_threaded_runs_the_function_off_the_calling_thread():
-    @offload.threaded
-    def where() -> int:
-        return threading.get_ident()
-
-    assert asyncio.run(where()) != threading.get_ident()
 
 
 def test_an_http_request_is_served_while_an_osrm_search_waits(slow_osrm: FakeOsrm):

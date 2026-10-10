@@ -2600,15 +2600,13 @@ def run_sql(query: str) -> str:
     _conn().close()  # schema and derived values are brought current before reading
     # The prefix test above cannot see a write nested in a WITH statement, so
     # the query runs on a connection that refuses every write.
-    conn = db.connect()
     try:
-        conn.execute("PRAGMA query_only = ON")
-        rows = conn.execute(query).fetchall()
-        return json.dumps([dict(r) for r in rows])
+        with db.connection() as conn:
+            conn.execute("PRAGMA query_only = ON")
+            rows = conn.execute(query).fetchall()
+            return json.dumps([dict(r) for r in rows])
     except Exception as e:
         return json.dumps({"error": str(e)})
-    finally:
-        conn.close()
 
 
 def _routes_conn() -> sqlite3.Connection:
@@ -2797,11 +2795,8 @@ def redrape_route(route_id: int) -> str:
     get_route's elevation_pending) right now instead of waiting for the
     next derive.
     """
-    conn = _routes_conn()
-    try:
+    with db.connection(routes_service.connect) as conn:
         return json.dumps(routes_service.redrape_route(conn, route_id))
-    finally:
-        conn.close()
 
 
 register_terrain_tools(mcp)

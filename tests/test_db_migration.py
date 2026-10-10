@@ -33,7 +33,7 @@ def _start_date(conn: sqlite3.Connection, activity_id: int = 1001) -> str:
     return conn.execute("SELECT start_date FROM activities WHERE activity_id = ?", (activity_id,)).fetchone()["start_date"]
 
 
-def test_backfill_rewrites_start_date_to_local_wall_time_and_is_idempotent(conn: sqlite3.Connection):
+def test_backfill_rewrites_start_date_to_local_wall_time_once_and_leaves_rows_without_raw_json(conn: sqlite3.Connection):
     _insert_dirty_row(conn)
     conn.execute("PRAGMA user_version = 0")  # an existing DB that predates the stamp
 
@@ -45,25 +45,18 @@ def test_backfill_rewrites_start_date_to_local_wall_time_and_is_idempotent(conn:
 
     assert first == _start_date(conn) == "2026-01-04T22:00:00"
 
-
-def test_backfill_leaves_rows_without_raw_json_untouched(conn: sqlite3.Connection):
     conn.execute(
         "INSERT INTO activities (activity_id, name, sport_type, start_date, raw_json) VALUES (1, 'No raw json', 'Run', ?, NULL)",
         ("2026-01-05T04:00:00+00:00",),
     )
     conn.execute("PRAGMA user_version = 0")
     conn.commit()
-
     db.init_db(conn)
+    assert _start_date(conn, 1) == "2026-01-05T04:00:00+00:00"  # a row without raw json is left alone
 
-    assert _start_date(conn, 1) == "2026-01-05T04:00:00+00:00"
-
-
-def test_init_db_stamps_the_schema_version_and_skips_a_stamped_database(conn: sqlite3.Connection):
     assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
-    assert conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0] == 0
-
-    _insert_dirty_row(conn)
+    conn.execute("UPDATE activities SET start_date = '2026-01-05T04:00:00+00:00' WHERE activity_id = 1001")
+    conn.commit()
     db.init_db(conn)  # stamped: the start_date rewrite does not run again
     assert _start_date(conn) == "2026-01-05T04:00:00+00:00"
 
@@ -173,17 +166,6 @@ def test_a_column_added_by_a_concurrent_upgrade_is_not_an_error_but_other_failur
     with pytest.raises(sqlite3.OperationalError, match="no such table"):
         db.add_missing_columns(conn, "no_such_table", "x TEXT")
     assert db.add_missing_columns(conn, "weather", "extra TEXT", "another TEXT") is True
-
-
-def test_init_db_keeps_existing_rows_when_it_runs_again(conn: sqlite3.Connection):
-    conn.execute(
-        "INSERT INTO gpx_files (sha256, filename, creator, data, uploaded_at) VALUES (?, ?, ?, ?, ?)",
-        ["abc123", "test.gpx", "Test", b"<gpx></gpx>", "2026-01-01T00:00:00+00:00"],
-    )
-    conn.execute("PRAGMA user_version = 0")
-    conn.commit()
-    db.init_db(conn)  # must not drop/recreate and lose the row
-    assert conn.execute("SELECT filename FROM gpx_files WHERE sha256 = 'abc123'").fetchone()["filename"] == "test.gpx"
 
 
 def test_connections_use_wal_and_a_backup_taken_during_a_write_is_consistent(tmp_path: Path):

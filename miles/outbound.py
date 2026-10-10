@@ -1,21 +1,17 @@
 """The one process that makes outbound calls for a database.
 
-Strava and every public service share per-process state: a rate-limit
-reading, per-service throttles, in-process job locks. Two processes spending
-against the same database would each believe they own those limits, so the
-process that downloads, imports, or spends Strava calls (the API server at
-startup, or a CLI doing the same work) first takes an exclusive lock on a file
-beside the database. The operating system releases it when the process exits,
-however it exits, so a crash never leaves a stale claim.
+Rate-limit readings, per-service throttles, and job locks are per-process, so
+two processes spending against one database would each assume they own the
+limits. A process that downloads, imports, or spends Strava calls first takes
+an exclusive lock on a file beside the database; the OS releases it on any
+exit, so a crash leaves no stale claim.
 
-The claim also settles what a restart left behind: the claimant is the only
-process that runs jobs, so any job row still marked running was cut short and
-is marked interrupted.
+The claimant is the only process that runs jobs, so any job row still marked
+running was cut short and is marked interrupted.
 """
 
 import fcntl
 import os
-from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
@@ -24,8 +20,7 @@ import click
 
 from . import db
 
-# Recorded on a job found running at startup; a restart caused it, not a fault
-# the health check should flag.
+# Recorded on a job found running at startup; the health check does not flag these.
 IMPORT_INTERRUPTED_ERROR = "import interrupted; run it again"
 BACKFILL_INTERRUPTED_ERROR = "interrupted; run it again"
 
@@ -71,7 +66,7 @@ def claim() -> None:
     handle.write(str(os.getpid()))
     handle.flush()
     _held[path] = handle
-    with closing(db.connect()) as conn:
+    with db.connection() as conn:
         db.init_db(conn)
         conn.execute(
             "UPDATE areas SET status = 'error', status_error = ? WHERE status = 'importing'",

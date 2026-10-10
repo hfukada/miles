@@ -1,14 +1,13 @@
 import sqlite3
 from pathlib import Path
 
-import click
 import pytest
 from click.testing import CliRunner
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from helpers import FlatSampler, ImmediateThread, write_pbf
+from helpers import ImmediateThread, flat_sampler, write_pbf
 
-from miles import area_import, areas_api, db
+from miles import area_import, area_refresh, areas_api, db, geocode
 
 
 def _write_sample_pbf(path: Path) -> None:
@@ -20,7 +19,7 @@ def app_conn(monkeypatch: pytest.MonkeyPatch) -> sqlite3.Connection:
     monkeypatch.setattr(areas_api.areas_service.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(areas_api.areas_service.elevation, "ensure_tiles", lambda conn, **kwargs: None)
     monkeypatch.setattr(
-        areas_api.areas_service.elevation, "sampler_for", lambda conn, provider=None, **kwargs: FlatSampler()
+        areas_api.areas_service.elevation, "sampler_for", lambda conn, provider=None, **kwargs: flat_sampler()
     )
     return db.connect()
 
@@ -104,28 +103,13 @@ def test_cli_uploads_cut_tiles_through_the_endpoint(
     assert any(a["label"] == "cli-area" for a in areas)
 
 
-def test_cli_requires_center_and_radius_or_bbox(tmp_path: Path):
-    pbf = tmp_path / "sample.osm.pbf"
-    _write_sample_pbf(pbf)
-    runner = CliRunner()
-    result = runner.invoke(area_import.main, ["--pbf", str(pbf)])
-    assert result.exit_code != 0
+def test_cli_geocode_refresh_updates_the_cache(monkeypatch: pytest.MonkeyPatch):
+    asked: list[bool] = []
+    found = {"lat": 1.5, "lng": 2.5, "display_name": "Somewhere, Region", "attribution": geocode.ATTRIBUTION}
+    monkeypatch.setattr(geocode, "lookup", lambda c, q, refresh=False: asked.append(refresh) or found)
 
+    result = CliRunner().invoke(area_refresh.main, ["--geocode", "Somewhere"])
 
-def test_resolve_bbox_and_center_from_center_radius():
-    bbox, lat, lng, radius = area_import._resolve_bbox_and_center("10.0,20.0", 5.0, None)
-    assert (lat, lng, radius) == (10.0, 20.0, 5.0)
-    assert bbox[0] < 10.0 < bbox[2]
-
-
-def test_resolve_bbox_and_center_from_bbox():
-    bbox, lat, lng, radius = area_import._resolve_bbox_and_center(None, None, "0.0,0.0,1.0,1.0")
-    assert bbox == (0.0, 0.0, 1.0, 1.0)
-    assert lat == pytest.approx(0.5)
-    assert lng == pytest.approx(0.5)
-    assert radius > 0
-
-
-def test_resolve_bbox_and_center_rejects_mixing_modes():
-    with pytest.raises(click.UsageError):
-        area_import._resolve_bbox_and_center("1,1", 5.0, "0,0,1,1")
+    assert result.exit_code == 0, result.output
+    assert asked == [True]
+    assert "1.50000, 2.50000" in result.output

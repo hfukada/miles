@@ -1480,15 +1480,13 @@ def _run_sync_in_background(history: bool) -> None:
     it otherwise. Any exception (network down, bad credentials, a real bug)
     is caught here so it can't take the server down or leave the progress state
     stuck at "running" forever."""
-    conn = db.connect()
     try:
-        new_count = sync.run_sync(conn, full=False, history=history, progress=_sync_progress)
+        with db.connection() as conn:
+            new_count = sync.run_sync(conn, full=False, history=history, progress=_sync_progress)
         _sync_progress.finish(new_count)
     except Exception as e:
         _logger.exception("Background sync failed")
         _sync_progress.fail(describe_error(e))
-    finally:
-        conn.close()
 
 
 @app.post("/api/sync")

@@ -48,24 +48,11 @@ def test_interactive_fetches_are_refused_at_the_reserve_and_allowed_above_it(str
         gate.acquire("laps", interactive=True)
 
 
-def test_streams_are_not_fetched_for_a_page_at_the_reserve(monkeypatch: pytest.MonkeyPatch, at_the_reserve):
-    monkeypatch.setattr(strava_client, "get_activity_streams", lambda aid: pytest.fail("spent a call at the reserve"))
-    with pytest.raises(errors.StravaAllowanceLowError):
-        streams.fetch_and_cache_streams(1)
-
-
 @pytest.fixture
 def one_run() -> None:
     conn = db.connect()
     insert_activity(conn, 1, start_date="2026-01-05T08:00:00", strava_url="https://example.test/a/1")
     conn.close()
-
-
-def test_the_activity_page_leaves_the_description_unfetched_at_the_reserve(monkeypatch: pytest.MonkeyPatch, one_run, at_the_reserve):
-    monkeypatch.setattr(strava_client, "get_activity_detail", lambda aid: pytest.fail("spent a call at the reserve"))
-    body = TestClient(api.app).get("/api/activity-detail", params={"id": 1}).json()
-    assert body["description"] is None
-    assert db.connect().execute("SELECT description FROM activities WHERE activity_id = 1").fetchone()[0] is None
 
 
 def test_a_fetched_empty_description_is_cached(monkeypatch: pytest.MonkeyPatch, one_run):
@@ -77,9 +64,18 @@ def test_a_fetched_empty_description_is_cached(monkeypatch: pytest.MonkeyPatch, 
     assert calls == [1]
 
 
-def test_the_streams_endpoint_answers_503_without_spending_a_call_when_the_allowance_is_low(monkeypatch: pytest.MonkeyPatch, one_run, at_the_reserve):
+def test_the_activity_pages_spend_no_call_at_the_reserve(monkeypatch: pytest.MonkeyPatch, one_run, at_the_reserve):
     for name in ("get_activity_laps", "get_activity_detail", "get_activity_streams"):
         monkeypatch.setattr(strava_client, name, lambda aid, name=name: pytest.fail(f"spent {name} at the reserve"))
-    response = TestClient(api.app).get("/api/activity-streams", params={"id": 1})
+    client = TestClient(api.app)
+
+    body = client.get("/api/activity-detail", params={"id": 1}).json()
+    assert body["description"] is None
+    assert db.connect().execute("SELECT description FROM activities WHERE activity_id = 1").fetchone()[0] is None
+
+    response = client.get("/api/activity-streams", params={"id": 1})
     assert response.status_code == 503
     assert "allowance" in response.json()["detail"]
+
+    with pytest.raises(errors.StravaAllowanceLowError):
+        streams.fetch_and_cache_streams(1)

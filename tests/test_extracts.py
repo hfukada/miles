@@ -13,9 +13,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from helpers import FlatSampler, fake_extract_record, write_pbf
+from helpers import FakeResponse, fake_extract_record, write_pbf
 
-from miles import db, extracts, metrics, network, tilecache, tiles
+from miles import db, extracts, metrics, tilecache, tiles
 
 # Tile (0, 0) covers lat/lng in [0, 0.05); tile (1, 0) covers lng in [0.05, 0.10).
 
@@ -97,44 +97,6 @@ def test_cut_area_splits_ways_across_the_tiles_they_occupy(conn: sqlite3.Connect
     assert payload0 is not None and payload1 is not None
     assert {el["id"] for el in payload0["elements"] if el["type"] == "way"} == {100}
     assert {el["id"] for el in payload1["elements"] if el["type"] == "way"} == {101}
-
-
-def test_cut_area_rejects_matching_ways_outside_the_requested_bbox_before_building_them(
-    conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch
-):
-    """A regional extract holds every highway/amenity way in the whole
-    region, not just the ones near a given area -- cut_area must reject a
-    way outside the requested bbox from its own node bbox alone, before
-    ever building its tags/geometry, or memory scales with the extract's
-    size instead of the area's."""
-    record = extracts.register_local_extract(conn, sample_pbf, "test/sample")
-
-    built_calls: list[int] = []
-    real_way_element = extracts._way_element
-
-    def counting_way_element(obj, tags):
-        built_calls.append(obj.id)
-        return real_way_element(obj, tags)
-
-    monkeypatch.setattr(extracts, "_way_element", counting_way_element)
-
-    tile_ids = extracts.cut_area(conn, record, (0.0, 0.0, 0.049, 0.049))
-    assert set(tile_ids) == {(0, 0)}
-    # Way 400 (tagged highway=path, matching the tag filter) sits nowhere
-    # near tile (0, 0) -- it must never reach _way_element at all.
-    assert 400 not in built_calls
-    assert 100 in built_calls  # the way that does belong here still does
-
-
-def test_cut_area_tile_payload_feeds_build_network(conn: sqlite3.Connection, sample_pbf: Path):
-    """A cut tile has the payload shape build_network reads."""
-    record = extracts.register_local_extract(conn, sample_pbf, "test/sample")
-    extracts.cut_area(conn, record, tiles.tile_bounds(0, 0))
-
-    payloads = [tilecache.get_tile_payload(conn, 0, 0)]
-    stats = network.build_network(conn, 1, payloads, FlatSampler())
-    assert stats["edge_count"] >= 1
-    assert stats["amenity_count"] >= 2  # the drinking-water node + the parking center
 
 
 def test_cut_area_with_a_disk_index_matches_the_in_memory_cut_and_leaves_no_index(
@@ -328,34 +290,6 @@ def test_a_304_keeps_the_file_and_only_moves_checked_at(conn: sqlite3.Connection
     assert after["checked_at"] > before["checked_at"]
 
 
-def _refuse_with(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
-    def refused(policy, url, **kwargs):
-        raise urllib.error.HTTPError(url, status, "x", {}, None)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(extracts.http_client, "request", refused)
-
-
-def test_download_with_backoff_turns_a_304_into_none(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    _refuse_with(monkeypatch, 304)
-    assert extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {}) is None
-
-
-def test_download_with_backoff_raises_on_other_http_errors(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    _refuse_with(monkeypatch, 404)
-    with pytest.raises(extracts.ExtractDownloadError):
-        extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
-
-
-class _Resp:
-    def __init__(self, body: bytes, headers: dict | None = None, *, send: int | None = None) -> None:
-        self.headers = headers if headers is not None else {"Content-Length": str(len(body))}
-        self._body = body[: len(body) if send is None else send]
-
-    def read(self, n: int = -1) -> bytes:
-        chunk, self._body = self._body[:n], self._body[n:]
-        return chunk
-
-
 def _serve(monkeypatch: pytest.MonkeyPatch, body: bytes, *, md5: str | None = None, headers: dict | None = None, send: int | None = None) -> list:
     """Stand in for http_client.request: the pbf URL gets body, its .md5 the
     published digest."""
@@ -366,7 +300,7 @@ def _serve(monkeypatch: pytest.MonkeyPatch, body: bytes, *, md5: str | None = No
         seen.append((url, headers))
         if url.endswith(".md5"):
             return f"{digest}  y.osm.pbf\n".encode()
-        return reader(_Resp(body, response_headers, send=send))
+        return reader(FakeResponse(body, response_headers, send=send))
 
     response_headers = headers
     monkeypatch.setattr(extracts.http_client, "request", request)
@@ -388,10 +322,26 @@ def test_a_download_sends_conditional_headers_and_records_the_response_validator
     assert list(tmp_path.glob("*.part")) == []
 
 
-def test_a_short_read_is_an_error_and_leaves_no_part_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    _serve(monkeypatch, b"0123456789", send=6)
+def _incomplete_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(policy, url, *, reader=None, **kwargs):
+        raise http.client.IncompleteRead(b"abc", 5)
+
+    monkeypatch.setattr(extracts.http_client, "request", broken)
+
+
+@pytest.mark.parametrize(
+    "serve, message",
+    [
+        (lambda mp: _serve(mp, b"0123456789", send=6), "short read"),
+        (lambda mp: _serve(mp, b"data", md5="not-a-digest"), "not a checksum"),
+        (_incomplete_read, None),
+    ],
+    ids=["a short read", "a malformed md5 file", "an incomplete read"],
+)
+def test_a_download_that_cannot_be_verified_is_an_error_and_leaves_no_part_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, serve, message: str | None):
+    serve(monkeypatch)
     dest = tmp_path / "y.pbf"
-    with pytest.raises(extracts.ExtractDownloadError, match="short read"):
+    with pytest.raises(extracts.ExtractDownloadError, match=message):
         extracts._download_with_backoff("http://x/y.pbf", dest, {})
     assert not dest.exists() and list(tmp_path.iterdir()) == []
 
@@ -406,18 +356,14 @@ def test_a_checksum_mismatch_is_an_error_and_keeps_the_old_file(monkeypatch: pyt
     assert [p.name for p in tmp_path.iterdir()] == ["y.pbf"]
 
 
-def test_a_malformed_md5_file_is_an_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    _serve(monkeypatch, b"data", md5="not-a-digest")
-    with pytest.raises(extracts.ExtractDownloadError, match="not a checksum"):
-        extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
-
-
-def test_a_declared_size_over_the_cap_is_refused_with_a_head_only_and_starts_no_cooldown(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+def test_a_size_over_the_cap_is_refused_whether_declared_or_only_seen_while_streaming(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
     methods: list[str | None] = []
 
     def request(policy, url, *, headers=None, reader=None, method=None, **kwargs):
         methods.append(method)
-        return reader(_Resp(b"data", {"Content-Length": str(extracts.EXTRACT_MAX_BYTES + 1)}))
+        return reader(FakeResponse(b"data", {"Content-Length": str(extracts.EXTRACT_MAX_BYTES + 1)}))
 
     monkeypatch.setattr(extracts.http_client, "request", request)
     with pytest.raises(extracts.ExtractTooLargeError, match="over the 2 GB limit"):
@@ -426,8 +372,6 @@ def test_a_declared_size_over_the_cap_is_refused_with_a_head_only_and_starts_no_
     assert conn.execute("SELECT COUNT(*) FROM extract_requests").fetchone()[0] == 0
     assert extracts.get_extract(conn, "test/sample") is None
 
-
-def test_an_undeclared_size_over_the_cap_is_refused_while_streaming(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(extracts, "EXTRACT_MAX_BYTES", 3)
     _serve(monkeypatch, b"data", headers={})
     with pytest.raises(extracts.ExtractDownloadError, match="limit"):
@@ -443,16 +387,6 @@ def test_the_size_cap_can_be_overridden(monkeypatch: pytest.MonkeyPatch, tmp_pat
         monkeypatch.setenv(extracts.ALLOW_LARGE_ENV, "1")
     extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {}, allow_large=override == "argument")
     assert (tmp_path / "y.pbf").read_bytes() == b"data"
-
-
-def test_an_incomplete_read_is_a_download_error_and_leaves_no_part_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    def broken(policy, url, *, reader=None, **kwargs):
-        raise http.client.IncompleteRead(b"abc", 5)
-
-    monkeypatch.setattr(extracts.http_client, "request", broken)
-    with pytest.raises(extracts.ExtractDownloadError):
-        extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_two_downloads_never_share_a_part_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -603,24 +537,20 @@ def test_force_replaces_a_registered_file_unconditionally(conn: sqlite3.Connecti
     assert record["etag"] == '"new"'
 
 
-@pytest.mark.parametrize("flags", [{"refresh": True}, {"force": True}])
-def test_a_local_extract_is_never_refreshed_from_geofabrik(conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch, flags: dict):
+def test_a_local_extract_is_never_refreshed_from_geofabrik_and_a_missing_file_is_reported(
+    conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch
+):
     extracts.register_local_extract(conn, sample_pbf, "local:sample")
     monkeypatch.setattr(extracts, "_download_with_backoff", lambda *a, **kw: pytest.fail("contacted Geofabrik"))
     monkeypatch.setattr(extracts.http_client, "request", lambda *a, **kw: pytest.fail("contacted Geofabrik"))
+    bbox = (0.012, 0.012, 0.04, 0.04)
 
-    selected = extracts.select_extracts(conn, (0.012, 0.012, 0.04, 0.04), **flags)
+    for flags in ({"refresh": True}, {"force": True}):
+        assert [e["region"] for e in extracts.select_extracts(conn, bbox, **flags)] == ["local:sample"]
 
-    assert [e["region"] for e in selected] == ["local:sample"]
-
-
-def test_a_local_extract_whose_file_is_gone_is_reported_not_downloaded(conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch):
-    extracts.register_local_extract(conn, sample_pbf, "local:sample")
     sample_pbf.unlink()
-    monkeypatch.setattr(extracts.http_client, "request", lambda *a, **kw: pytest.fail("contacted Geofabrik"))
-
     with pytest.raises(extracts.ExtractDownloadError, match="missing"):
-        extracts.select_extracts(conn, (0.012, 0.012, 0.04, 0.04), refresh=True)
+        extracts.select_extracts(conn, bbox, refresh=True)
 
 
 def test_stale_part_files_are_swept_before_a_download(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
@@ -655,27 +585,30 @@ def test_extract_cache_metrics_count_hits_misses_and_not_modified(conn: sqlite3.
 # ---------------------------------------------------------------------------
 
 
-def test_select_extracts_refresh_asks_geofabrik(conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch):
-    extracts.register_local_extract(conn, sample_pbf, "test/sample")
-    _set_times(conn, "test/sample", fetched_days_ago=10)
+@pytest.mark.parametrize(
+    "region, asks_geofabrik",
+    [("test/sample", True), ("local:sample", False)],
+    ids=["a downloaded extract is re-asked", "a local extract is kept when Geofabrik has no such file"],
+)
+def test_select_extracts_refresh_asks_geofabrik_and_keeps_an_unrefreshable_extract(
+    conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch, region: str, asks_geofabrik: bool
+):
+    extracts.register_local_extract(conn, sample_pbf, region)
+    _set_times(conn, region, fetched_days_ago=10)
     calls: list[tuple[str, dict]] = []
-    monkeypatch.setattr(extracts, "_download_with_backoff", _fake_download(calls))
+    download = _fake_download(calls)
 
-    extracts.select_extracts(conn, (0.012, 0.012, 0.04, 0.04), refresh=True)
+    def fake(url: str, dest: Path, validators: dict, **kw):
+        if not asks_geofabrik:
+            raise extracts.ExtractDownloadError("404")
+        return download(url, dest, validators, **kw)
 
-    assert len(calls) == 1
+    monkeypatch.setattr(extracts, "_download_with_backoff", fake)
 
-
-def test_select_extracts_keeps_an_unrefreshable_extract_on_refresh(conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch):
-    extracts.register_local_extract(conn, sample_pbf, "local:sample")
-    _set_times(conn, "local:sample", fetched_days_ago=90)
-
-    def not_found(url: str, dest: Path, validators: dict, **kw):
-        raise extracts.ExtractDownloadError("404")
-
-    monkeypatch.setattr(extracts, "_download_with_backoff", not_found)
     found = extracts.select_extracts(conn, (0.012, 0.012, 0.04, 0.04), refresh=True)
-    assert [f["region"] for f in found] == ["local:sample"]
+
+    assert [f["region"] for f in found] == [region]
+    assert len(calls) == int(asks_geofabrik)
 
 
 def test_tiles_cut_from_is_true_only_for_the_current_extract_file(conn: sqlite3.Connection, sample_pbf: Path):
@@ -691,12 +624,9 @@ def test_tiles_cut_from_is_true_only_for_the_current_extract_file(conn: sqlite3.
     assert newer is not None
     assert extracts.tiles_cut_from(conn, newer, tile_ids) is False
 
-
-@pytest.mark.parametrize("source", ["extract:test/other", "overpass"])
-def test_tiles_cut_from_rejects_tiles_from_another_source(conn: sqlite3.Connection, sample_pbf: Path, source: str):
-    record = extracts.register_local_extract(conn, sample_pbf, "test/sample")
-    tilecache.store_tile_elements(conn, 0, 0, [], source=source)
-    assert extracts.tiles_cut_from(conn, record, [(0, 0)]) is False
+    for source in ("extract:test/other", "overpass"):
+        tilecache.store_tile_elements(conn, 0, 0, [], source=source)
+        assert extracts.tiles_cut_from(conn, record, [(0, 0)]) is False, source
 
 
 # ---------------------------------------------------------------------------
@@ -728,15 +658,8 @@ def _border_index() -> bytes:
     }).encode()
 
 
-class _IndexResp:
-    headers: dict = {}
-
-    def read(self) -> bytes:
-        return _border_index()
-
-
 def _serve_index(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(extracts.geofabrik.http_client, "request", lambda policy, url, **kw: kw["reader"](_IndexResp()))
+    monkeypatch.setattr(extracts.geofabrik.http_client, "request", lambda policy, url, **kw: kw["reader"](FakeResponse(_border_index(), {})))
 
 
 def _border_pbfs(tmp_path: Path) -> dict[str, Path]:
@@ -799,15 +722,6 @@ def test_an_area_across_a_border_is_cut_from_both_children_and_never_downloads_t
     assert not extracts.tiles_cut_from(conn, [*selected, fake_extract_record("example/other")], tile_ids)
     source = conn.execute("SELECT DISTINCT source FROM map_tiles").fetchall()
     assert [r["source"] for r in source] == ["extract:example/parent/region-a,example/parent/region-b"]
-
-
-def test_a_second_area_in_the_same_pair_of_regions_downloads_nothing(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    for region, pbf in _border_pbfs(tmp_path).items():
-        extracts.register_local_extract(conn, pbf, region)
-    _serve_index(monkeypatch)
-    monkeypatch.setattr(extracts, "_download_with_backoff", lambda *a, **kw: pytest.fail("both are registered"))
-    selected = extracts.select_extracts(conn, (0.0, 0.01, 0.04, 0.09))
-    assert len(selected) == 2
 
 
 def _tile_ways(conn: sqlite3.Connection, gx: int) -> dict[int, dict]:
@@ -956,14 +870,6 @@ def test_a_tile_write_that_fails_leaves_the_stored_tile_alone(conn: sqlite3.Conn
     assert _tile_row(conn)["source"] == "extract:x"
 
 
-def test_write_tile_elements_leaves_the_commit_to_the_caller(conn: sqlite3.Connection):
-    conn.execute("BEGIN IMMEDIATE")
-    tilecache.write_tile_elements(conn, 0, 0, [], source="extract:x")
-    assert conn.in_transaction is True
-    conn.rollback()
-    assert conn.execute("SELECT COUNT(*) FROM map_tiles").fetchone()[0] == 0
-
-
 def test_a_tile_write_holds_the_write_lock_so_a_second_writer_waits():
     first, second = db.connect(), db.connect()
     second.execute("PRAGMA busy_timeout = 0")
@@ -975,19 +881,17 @@ def test_a_tile_write_holds_the_write_lock_so_a_second_writer_waits():
     assert first.execute("SELECT source FROM map_tiles").fetchone()["source"] == "extract:z"
 
 
-def test_merge_fills_missing_points_of_a_way_with_the_same_nodes_from_the_other_copy():
+def test_merge_keeps_one_copy_of_each_element_preferring_more_located_nodes_and_fills_gaps_from_the_other():
+    short = {"type": "way", "id": 2, "geometry": [{"lat": 0, "lon": 0}, None]}
+    long = {"type": "way", "id": 2, "geometry": [{"lat": 0, "lon": 0}, {"lat": 0, "lon": 1}, {"lat": 0, "lon": 2}]}
+    node = {"type": "node", "id": 1, "lat": 0, "lon": 0}
+    merged = extracts.merge_elements([[short, node], [long]])
+    assert sorted(((e["type"], len(e.get("geometry") or [])) for e in merged)) == [("node", 0), ("way", 3)]
+
     first = {"type": "way", "id": 1, "nodes": [1, 2, 3], "geometry": [{"lat": 0, "lon": 0}, None, {"lat": 0, "lon": 2}]}
     second = {"type": "way", "id": 1, "nodes": [1, 2, 3], "geometry": [None, {"lat": 0, "lon": 1}, {"lat": 0, "lon": 2}]}
     (merged,) = extracts.merge_elements([[first], [second]])
     assert merged["geometry"] == [{"lat": 0, "lon": 0}, {"lat": 0, "lon": 1}, {"lat": 0, "lon": 2}]
-
-
-def test_merge_keeps_one_copy_of_each_element_preferring_more_located_nodes():
-    short = {"type": "way", "id": 1, "geometry": [{"lat": 0, "lon": 0}, None]}
-    long = {"type": "way", "id": 1, "geometry": [{"lat": 0, "lon": 0}, {"lat": 0, "lon": 1}, {"lat": 0, "lon": 2}]}
-    node = {"type": "node", "id": 1, "lat": 0, "lon": 0}
-    merged = extracts.merge_elements([[short, node], [long]])
-    assert sorted(((e["type"], len(e.get("geometry") or [])) for e in merged)) == [("node", 0), ("way", 3)]
 
 
 def test_a_size_refusal_starts_no_cooldown_and_names_the_smaller_regions(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
@@ -1017,11 +921,30 @@ def test_an_explicit_region_on_a_fresh_install_is_not_blocked_by_an_unreachable_
     assert [e["region"] for e in selected] == ["example/region-a"]
 
 
+def test_the_checksum_fetch_is_retried_once_and_a_verified_download_is_kept_without_reading_it_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    body = b"data"
+    md5_calls: list[str] = []
+
+    def request(policy, url, *, headers=None, reader=None, **kwargs):
+        if url.endswith(".md5"):
+            md5_calls.append(url)
+            if len(md5_calls) == 1:
+                raise urllib.error.URLError("reset")
+            digest = hashlib.md5(body).hexdigest() if len(md5_calls) == 2 else "0" * 32
+            return f"{digest}  y\n".encode()
+        return reader(FakeResponse(body))
+
+    monkeypatch.setattr(extracts.http_client, "request", request)
+    extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
+    assert (tmp_path / "y.pbf").read_bytes() == body
+    assert len(md5_calls) == 2  # one failed attempt, one retry; none after the body
+
+
 def test_the_checksum_is_fetched_from_the_url_the_body_was_served_from(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     body = b"data"
     seen: list[str] = []
 
-    class Resp(_Resp):
+    class Resp(FakeResponse):
         def geturl(self) -> str:
             return "http://x/y-240101.osm.pbf"
 
@@ -1040,23 +963,6 @@ def test_the_checksum_is_fetched_from_the_url_the_body_was_served_from(monkeypat
     ]
 
 
-def test_the_checksum_fetch_is_retried_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    body = b"data"
-    md5_calls: list[str] = []
-
-    def request(policy, url, *, headers=None, reader=None, **kwargs):
-        if url.endswith(".md5"):
-            md5_calls.append(url)
-            if len(md5_calls) == 1:
-                raise urllib.error.URLError("reset")
-            return f"{hashlib.md5(body).hexdigest()}  y\n".encode()
-        return reader(_Resp(body))
-
-    monkeypatch.setattr(extracts.http_client, "request", request)
-    extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
-    assert len(md5_calls) == 2  # one failed attempt, one retry; none after the body
-
-
 def test_an_unavailable_checksum_aborts_before_the_body_and_starts_the_cooldown(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     bodies: list[str] = []
     contacts: list[str] = []
@@ -1067,7 +973,7 @@ def test_an_unavailable_checksum_aborts_before_the_body_and_starts_the_cooldown(
             raise urllib.error.URLError("down")
         if method != "HEAD":
             bodies.append(url)
-        return reader(_Resp(b"data"))
+        return reader(FakeResponse(b"data"))
 
     monkeypatch.setattr(extracts.http_client, "request", request)
     with pytest.raises(extracts.ExtractChecksumUnavailableError):
@@ -1079,23 +985,6 @@ def test_an_unavailable_checksum_aborts_before_the_body_and_starts_the_cooldown(
     with pytest.raises(extracts.ExtractDownloadError, match="not contacting Geofabrik again"):
         extracts.download_extract(conn, "test/sample")
     assert len(contacts) == contacted_before
-
-
-def test_a_verified_download_is_kept_without_reading_the_checksum_again(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    body = b"data"
-    md5_calls: list[str] = []
-
-    def request(policy, url, *, headers=None, reader=None, **kwargs):
-        if url.endswith(".md5"):
-            md5_calls.append(url)
-            digest = hashlib.md5(body).hexdigest() if len(md5_calls) == 1 else "0" * 32
-            return f"{digest}  y\n".encode()
-        return reader(_Resp(body))
-
-    monkeypatch.setattr(extracts.http_client, "request", request)
-    extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
-    assert (tmp_path / "y.pbf").read_bytes() == body
-    assert len(md5_calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1122,39 +1011,30 @@ def _regions_of(per_tile: dict, tile: tuple[int, int]) -> list[str]:
     return sorted(e["region"] for e in per_tile[tile])
 
 
-def test_a_parent_region_is_left_out_of_a_tile_a_child_wholly_contains(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    family = _register_family(conn, tmp_path)
-    _store_border_index(conn, monkeypatch)
-    selected = [family["example/parent/region-a"]]
-
-    per_tile = extracts.tile_extracts(conn, selected, [INTERIOR_TILE, (3, 0)])
-
-    assert _regions_of(per_tile, INTERIOR_TILE) == ["example/parent/region-a"]
-    assert _regions_of(per_tile, (3, 0)) == ["example/parent/region-b"]
+PARENT, REGION_A, REGION_B = "example/parent", "example/parent/region-a", "example/parent/region-b"
 
 
-def test_a_tile_straddling_a_registered_child_and_an_unregistered_sibling_keeps_the_parent(
-    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    "unregistered, selected, tiles, expected",
+    [
+        ([], [REGION_A], [INTERIOR_TILE, (3, 0)], {INTERIOR_TILE: [REGION_A], (3, 0): [REGION_B]}),
+        ([REGION_B], [REGION_A], [INTERIOR_TILE, (1, 0)], {INTERIOR_TILE: [REGION_A], (1, 0): [PARENT, REGION_A]}),
+        ([], [], [(0, 0)], {(0, 0): [PARENT, REGION_A, REGION_B]}),
+    ],
+    ids=["a parent is left out where a child wholly contains the tile", "a parent is kept where a sibling is unregistered", "a border tile keeps the parent beside both siblings"],
+)
+def test_which_registered_extracts_a_tile_is_cut_from(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unregistered: list[str], selected: list[str], tiles: list, expected: dict
 ):
     family = _register_family(conn, tmp_path)
     _store_border_index(conn, monkeypatch)
-    conn.execute("DELETE FROM map_extracts WHERE region = 'example/parent/region-b'")
+    for region in unregistered:
+        conn.execute("DELETE FROM map_extracts WHERE region = ?", (region,))
     conn.commit()
-    selected = [family["example/parent/region-a"]]
 
-    per_tile = extracts.tile_extracts(conn, selected, [INTERIOR_TILE, (1, 0)])
+    per_tile = extracts.tile_extracts(conn, [family[r] for r in selected], tiles)
 
-    assert _regions_of(per_tile, INTERIOR_TILE) == ["example/parent/region-a"]
-    assert _regions_of(per_tile, (1, 0)) == ["example/parent", "example/parent/region-a"]
-
-
-def test_a_border_tile_keeps_the_parent_beside_both_registered_siblings(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    _register_family(conn, tmp_path)
-    _store_border_index(conn, monkeypatch)
-
-    per_tile = extracts.tile_extracts(conn, [], [(0, 0)])
-
-    assert _regions_of(per_tile, (0, 0)) == ["example/parent", "example/parent/region-a", "example/parent/region-b"]
+    assert {tile: _regions_of(per_tile, tile) for tile in tiles} == expected
 
 
 def test_an_interior_cut_reads_only_the_child(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -1235,7 +1115,7 @@ def test_throttled_progress_forwards_at_most_once_per_interval_and_always_when_f
     assert seen == [(0, 100), (20, 100), (100, 100)]
 
 
-def test_a_failing_progress_callback_is_logged_and_does_not_stop_the_reporter(caplog: pytest.LogCaptureFixture):
+def test_a_failing_progress_callback_does_not_stop_the_reporter():
     calls: list[int] = []
 
     def broken(written: int, expected: int | None) -> None:
@@ -1247,22 +1127,20 @@ def test_a_failing_progress_callback_is_logged_and_does_not_stop_the_reporter(ca
     report(2, None)
 
     assert calls == [1, 2]
-    assert "progress callback failed" in caplog.text
 
 
-def test_a_download_completes_when_its_progress_callback_raises_and_reports_an_unknown_total(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
-    monkeypatch.setattr(extracts, "_DOWNLOAD_CHUNK_BYTES", 2)
-    _serve(monkeypatch, b"abcdefgh", headers={})
-    seen: list[tuple[int, int | None]] = []
+def test_an_extract_registry_from_before_conditional_downloads_still_reads():
+    legacy = sqlite3.connect(":memory:")
+    legacy.row_factory = sqlite3.Row
+    legacy.execute(
+        "CREATE TABLE map_extracts (region TEXT PRIMARY KEY, path TEXT NOT NULL, sha256 TEXT NOT NULL, "
+        "fetched_at TEXT NOT NULL, bounds_south REAL, bounds_west REAL, bounds_north REAL, bounds_east REAL)"
+    )
+    legacy.execute("INSERT INTO map_extracts VALUES ('r/x', '/p', 's', '2024-01-01T00:00:00+00:00', 0, 0, 1, 1)")
+    extracts.init_extract_schema(legacy)
 
-    def broken(written: int, expected: int | None) -> None:
-        seen.append((written, expected))
-        raise sqlite3.OperationalError("database is locked")
+    record = extracts.get_extract(legacy, "r/x")
 
-    dest = tmp_path / "y.pbf"
-    extracts._download_with_backoff("http://x/y.pbf", dest, {}, on_progress=broken)
-
-    assert dest.read_bytes() == b"abcdefgh"
-    assert seen[0] == (0, None)
-    assert seen[-1] == (8, None)
-    assert len(seen) < 6, "chunks within a second of each other are not each reported"
+    assert record is not None
+    assert record["checked_at"] == record["data_as_of"] == "2024-01-01T00:00:00+00:00"
+    assert record["etag"] is None

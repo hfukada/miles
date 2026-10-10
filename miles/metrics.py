@@ -1,13 +1,9 @@
 """A small in-process metrics registry that renders the Prometheus text format.
 
-Counters and gauges live in this process's memory: the API server, the stdio
-MCP server, and each CLI run count separately, and a counter restarts at zero
-with its process. State that must be visible across processes (outbound request
-totals, sync results, backfill queue sizes) is read from the database at scrape time by
-metrics_api.py rather than counted here.
-
-Recording is always on and costs a dict update under a lock; only the
-/metrics endpoint is gated (MILES_METRICS).
+Counters and gauges live in process memory and restart at zero with it.
+State that must span processes (outbound totals, sync results, backfill queue
+sizes) is read from the database at scrape time by health_api.py instead.
+Recording is always on; only the /metrics endpoint is gated (MILES_METRICS).
 """
 
 import math

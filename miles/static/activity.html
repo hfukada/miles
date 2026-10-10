@@ -240,12 +240,12 @@
       <div class="subtitle">${dateStr ?? ''}</div>
       ${d.description ? `<div class="description">${escapeHtml(d.description)}</div>` : ''}
       <div class="stat-strip">
-        ${stat('Distance', d.distance_mi != null ? `${d.distance_mi.toFixed(2)}` : '—', 'mi')}
-        ${stat('Moving Time', fmt.time(d.moving_time_s) ?? '—')}
-        ${stat('Avg Pace', d.pace_min_per_mile != null ? fmt.pace(d.pace_min_per_mile) : '—', '/mi')}
-        ${stat('Min / Median / Max HR', hrTriple(d))}
-        ${stat('Elevation Gain', d.elevation_gain_ft != null ? Math.round(d.elevation_gain_ft) : '—', 'ft')}
-        ${stat('Elevation Loss', d.elevation_loss_ft != null ? Math.round(d.elevation_loss_ft) : '—', 'ft')}
+        ${statTile('Distance', d.distance_mi != null ? `${d.distance_mi.toFixed(2)}` : '—', 'mi')}
+        ${statTile('Moving Time', fmt.time(d.moving_time_s) ?? '—')}
+        ${statTile('Avg Pace', d.pace_min_per_mile != null ? fmt.pace(d.pace_min_per_mile) : '—', '/mi')}
+        ${statTile('Min / Median / Max HR', hrTriple(d))}
+        ${statTile('Elevation Gain', d.elevation_gain_ft != null ? Math.round(d.elevation_gain_ft) : '—', 'ft')}
+        ${statTile('Elevation Loss', d.elevation_loss_ft != null ? Math.round(d.elevation_loss_ft) : '—', 'ft')}
         ${weatherStat(d)}
       </div>
       ${d.weather_attribution ? '<p class="weather-credit">Weather data by <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a></p>' : ''}
@@ -499,16 +499,7 @@
     const bits = [`${Math.round(d.temp_f_avg)}°F`];
     if (d.humidity_avg != null) bits.push(`${Math.round(d.humidity_avg)}% hum`);
     if (d.wind_mph_avg != null) bits.push(`${Math.round(d.wind_mph_avg)} mph wind`);
-    return stat('Weather', bits.join(' · '));
-  }
-
-  function stat(label, value, sub) {
-    return `
-      <div class="stat">
-        <div class="stat-label">${label}</div>
-        <div class="stat-value">${value}${sub ? `<span class="stat-sub">${sub}</span>` : ''}</div>
-      </div>
-    `;
+    return statTile('Weather', bits.join(' · '));
   }
 
   function toggle(key, label, color, checked) {

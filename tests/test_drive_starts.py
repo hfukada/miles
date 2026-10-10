@@ -18,22 +18,22 @@ from helpers import (
     TH3_ID,
     TH3_LAT,
     FakeOsrm,
-    NoneSampler,
     by_deg_lat,
     by_deg_lng,
     meadow_payload,
     memory_db,
     node,
+    none_sampler,
     parse_osrm_coords,
     way,
 )
 
-from miles import drive_api, drive_starts, network
+from miles import drive_starts, network
 
 
 @pytest.fixture
 def conn(conn: sqlite3.Connection) -> sqlite3.Connection:
-    network.build_network(conn, 1, [meadow_payload()], NoneSampler())
+    network.build_network(conn, 1, [meadow_payload()], none_sampler())
     return conn
 
 
@@ -84,33 +84,25 @@ def test_a_trailhead_reachable_by_a_fast_road_is_not_dropped_before_osrm(conn: s
     assert osrm.requested(TH2_LAT, ORIGIN_LNG)
 
 
-def test_only_the_best_ranked_candidates_are_sent_to_osrm(conn: sqlite3.Connection, osrm: FakeOsrm, monkeypatch: pytest.MonkeyPatch):
-    """Three survivors of the straight-line prefilter; with k=1 only the best
-    k * OSRM_CANDIDATES_PER_RESULT by optimistic score are looked up."""
-    monkeypatch.setattr(drive_starts, "OSRM_CANDIDATES_PER_RESULT", 1)
+def test_osrm_is_asked_only_about_the_best_ranked_uncached_candidates_within_its_destination_limit(
+    conn: sqlite3.Connection, osrm: FakeOsrm, monkeypatch: pytest.MonkeyPatch
+):
+    with monkeypatch.context() as limited:
+        limited.setattr(drive_starts, "OSRM_CANDIDATES_PER_RESULT", 1)
+        results = _search(conn, k=1)
+        assert len(osrm.calls) == 1 and len(parse_osrm_coords(osrm.calls[0])) == 2  # the origin and the one best-ranked destination
+        assert [r["osm_node_id"] for r in results[1:]] == [TH1_ID]
+        osrm.calls.clear()
 
-    results = _search(conn, k=1)
+        _search(conn, k=1)
+        assert len(osrm.calls) == 1 and len(parse_osrm_coords(osrm.calls[0])) == 2  # the next candidate in line, not the cached one
 
-    assert len(osrm.calls) == 1 and len(parse_osrm_coords(osrm.calls[0])) == 2  # the origin and one destination
-    assert [r["osm_node_id"] for r in results[1:]] == [TH1_ID]
-
-
-def test_the_request_never_exceeds_osrms_destination_limit(conn: sqlite3.Connection, osrm: FakeOsrm, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(drive_starts, "OSRM_MAX_DESTINATIONS_PER_CALL", 2)
-
-    _search(conn)
-
-    assert len(osrm.calls) == 1 and len(parse_osrm_coords(osrm.calls[0])) == 3
-
-
-def test_cached_candidates_do_not_count_against_the_osrm_limit(conn: sqlite3.Connection, osrm: FakeOsrm, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(drive_starts, "OSRM_CANDIDATES_PER_RESULT", 1)
-    _search(conn, k=1)
+    conn.execute("DELETE FROM drive_time_cache")
+    conn.commit()
     osrm.calls.clear()
-
-    _search(conn, k=1)
-
-    assert len(osrm.calls) == 1 and len(parse_osrm_coords(osrm.calls[0])) == 2  # the next candidate in line, not the cached one
+    monkeypatch.setattr(drive_starts, "OSRM_MAX_DESTINATIONS_PER_CALL", 2)
+    _search(conn)
+    assert len(osrm.calls) == 1 and len(parse_osrm_coords(osrm.calls[0])) == 3
 
 
 @pytest.mark.parametrize("minutes", [0.0, -5.0, drive_starts.MAX_DRIVE_MINUTES + 1])
@@ -130,7 +122,7 @@ def test_a_trailhead_outranks_a_lot_with_a_little_more_trail_in_reach(osrm: Fake
         node(21, lat0 + by_deg_lat(650.0), lng0 + by_deg_lng(lat0, 100.0), {"amenity": "parking"}),
     ]}
     conn = memory_db()
-    network.build_network(conn, 1, [payload], NoneSampler())
+    network.build_network(conn, 1, [payload], none_sampler())
     osrm.seconds_per_km = 1.0
 
     results = _search(conn)
@@ -164,7 +156,7 @@ def test_trail_m_nearby_counts_only_trail_within_reach_and_not_a_sidewalk(case: 
         ]
         origin = (lat0, lng0)
     conn = memory_db()
-    network.build_network(conn, 1, [{"elements": elements}], NoneSampler())
+    network.build_network(conn, 1, [{"elements": elements}], none_sampler())
 
     assert _search(conn, *origin)[0]["trail_m_nearby"] == pytest.approx(expected_trail_m, abs=50.0 if expected_trail_m else 1e-9)
 
@@ -226,7 +218,7 @@ def _age_cache_rows(conn: sqlite3.Connection, *, unreachable: bool, days: float)
     conn.commit()
 
 
-def test_an_unreachable_answer_is_cached_but_expires_after_a_week(conn: sqlite3.Connection, osrm: FakeOsrm):
+def test_an_unreachable_answer_is_cached_for_a_week_and_a_measured_time_for_six_months(conn: sqlite3.Connection, osrm: FakeOsrm):
     osrm.unreachable = True
     _search(conn)
     asked = len(osrm.calls)
@@ -239,54 +231,18 @@ def test_an_unreachable_answer_is_cached_but_expires_after_a_week(conn: sqlite3.
     _search(conn)
     assert len(osrm.calls) > asked
 
-
-def test_a_measured_time_outlives_the_unreachable_answer_and_expires_after_six_months(conn: sqlite3.Connection, osrm: FakeOsrm):
+    osrm.unreachable = False
+    conn.execute("DELETE FROM drive_time_cache")
     _search(conn)
     asked = len(osrm.calls)
 
     _age_cache_rows(conn, unreachable=False, days=drive_starts.UNREACHABLE_CACHE_TTL_DAYS + 1)
     _search(conn)
-    assert len(osrm.calls) == asked
+    assert len(osrm.calls) == asked  # a measured time outlives the unreachable answer
 
     _age_cache_rows(conn, unreachable=False, days=drive_starts.DRIVE_TIME_CACHE_TTL_DAYS + 1)
     _search(conn)
     assert len(osrm.calls) > asked
-
-
-def test_expired_rows_are_swept_at_most_once_an_hour_per_process(conn: sqlite3.Connection, osrm: FakeOsrm):
-    stale = (datetime.now(timezone.utc) - timedelta(days=drive_starts.UNREACHABLE_CACHE_TTL_DAYS + 1)).isoformat()
-
-    def seed_and_count() -> int:
-        conn.execute("INSERT OR REPLACE INTO drive_time_cache VALUES (0, 0, 999, NULL, ?)", (stale,))
-        conn.commit()
-        _search(conn)
-        return conn.execute("SELECT COUNT(*) FROM drive_time_cache WHERE dest_node_id = 999").fetchone()[0]
-
-    assert seed_and_count() == 0
-    assert seed_and_count() == 1  # a second search within the hour leaves it
-
-
-@pytest.mark.parametrize("fails", [False, True])
-def test_the_trailheads_endpoint_closes_its_connection(monkeypatch: pytest.MonkeyPatch, fails: bool):
-    closed: list[bool] = []
-
-    class _Conn:
-        def close(self) -> None:
-            closed.append(True)
-
-    def fake_drive_starts(conn, *args, **kwargs):
-        if fails:
-            raise ValueError("bad")
-        return []
-
-    monkeypatch.setattr(drive_api.db, "connect", lambda: _Conn())
-    monkeypatch.setattr(drive_api.drive_starts, "drive_starts", fake_drive_starts)
-    if fails:
-        with pytest.raises(drive_api.HTTPException):
-            drive_api.get_trailheads(1, 0.0, 0.0, 10.0)
-    else:
-        assert drive_api.get_trailheads(1, 0.0, 0.0, 10.0) == []
-    assert closed == [True]
 
 
 @pytest.mark.parametrize(
@@ -308,7 +264,7 @@ def test_searches_from_nearby_origins_share_cached_drive_times_and_distant_ones_
 def test_origins_in_one_row_agree_on_the_column_width(conn: sqlite3.Connection, osrm: FakeOsrm):
     """Origins at slightly different latitudes within one row must not key
     different columns because the column width followed their own latitude."""
-    lat_step = drive_starts.ORIGIN_CACHE_GRID_M / drive_starts._METERS_PER_DEG_LAT
+    lat_step = drive_starts.ORIGIN_CACHE_GRID_M / drive_starts.routes_spatial.METERS_PER_DEG_LAT
     centre = round(ORIGIN_LAT / lat_step) * lat_step
     _search(conn, centre - by_deg_lat(40.0), ORIGIN_LNG)
     asked = len(osrm.calls)

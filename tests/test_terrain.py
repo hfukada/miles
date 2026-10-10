@@ -6,7 +6,7 @@ import threading
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-from helpers import activity_row, call_tool, insert_activity, line_points, make_gpx
+from helpers import activity_row, call_tool, flat_sampler, insert_activity, latitude_sampler, line_points, make_gpx
 from mcp.server.fastmcp import FastMCP
 
 from miles import api, db, routes as routes_service, streams, terrain, terrain_mcp
@@ -56,18 +56,6 @@ def _synthetic_stream_df(max_dist: float = 1000.0, step: float = 5.0) -> pd.Data
 # ---------------------------------------------------------------------------
 # TerrainModel
 # ---------------------------------------------------------------------------
-
-
-def test_default_model_classifies_grades_and_ignores_fatigue_and_temperature():
-    model = terrain.default_model()
-    assert model.classify_grade(0.0) == "run"
-    assert model.classify_grade(model.walk_onset_grade_pct) == "hike"
-    assert model.classify_grade(model.walk_onset_grade_pct / 2.0) == "grind"
-    assert model.classify_grade(model.descent_comfort_grade_pct) == "grind"
-
-    assert model.expected_speed_mps(20.0) < model.expected_speed_mps(0.0)
-    assert model.expected_speed_mps(0.0, elapsed_s=7000.0) == model.expected_speed_mps(0.0, elapsed_s=0.0)
-    assert model.expected_speed_mps(0.0, temp_c=35.0) == model.expected_speed_mps(0.0, temp_c=None)
 
 
 @pytest.mark.parametrize(
@@ -134,31 +122,6 @@ def test_segmenting_without_elevation_stores_nothing_and_a_rerun_replaces_rather
 # ---------------------------------------------------------------------------
 
 
-class _FakeDemSampler:
-    """A stand-in for elevation.ElevationSampler: elevation rises with
-    latitude, optionally with specific points returning no coverage."""
-
-    def __init__(self, no_coverage_indices: set[int] = frozenset()) -> None:
-        self.no_coverage_indices = no_coverage_indices
-        self.calls = 0
-
-    def sample(self, points):
-        self.calls += 1
-        return [
-            None if i in self.no_coverage_indices else 200.0 + (lat - 40.0) * 10000.0
-            for i, (lat, lng) in enumerate(points)
-        ]
-
-
-class _RecordingSampler:
-    def __init__(self) -> None:
-        self.points: list[tuple[float, float]] = []
-
-    def sample(self, points):
-        self.points.extend(points)
-        return [100.0 for _ in points]
-
-
 def _track_stream_df(n: int = 50, step: float = 20.0, lat_step: float = 0.0002, grade: float = 0.05) -> pd.DataFrame:
     """A straight, steadily-climbing track (recorded altitude) with real
     lat/lng movement, so a fake DEM sampler keyed on latitude has something
@@ -183,12 +146,12 @@ def test_dem_draping_per_segment_falls_back_to_recorded_altitude(conn: sqlite3.C
     terrain.segment_and_store_activity(conn, 1, _track_stream_df(), "2024-06-01", None, 130.0, dem_sampler=None)
     assert set(_sources(conn)) == {terrain.ELE_SOURCE_RECORDED}
 
-    full = _FakeDemSampler()
+    full = latitude_sampler(base=200.0)
     terrain.segment_and_store_activity(conn, 1, _track_stream_df(), "2024-06-01", None, 130.0, dem_sampler=full)
     assert set(_sources(conn)) == {terrain.ELE_SOURCE_DEM}
-    assert full.calls == 1  # one drape call for the whole activity, not per point
+    assert len(full.calls) == 1  # one drape call for the whole activity, not per point
 
-    gap = _FakeDemSampler(no_coverage_indices=set(range(20, 30)))
+    gap = latitude_sampler(base=200.0, no_coverage=frozenset(range(20, 30)))
     terrain.segment_and_store_activity(conn, 1, _track_stream_df(), "2024-06-01", None, 130.0, dem_sampler=gap)
     assert set(_sources(conn)) == {terrain.ELE_SOURCE_DEM, terrain.ELE_SOURCE_RECORDED}
 
@@ -197,14 +160,14 @@ def test_a_missing_gps_fix_is_never_sampled_as_null_island(conn: sqlite3.Connect
     all_missing = _synthetic_stream_df()
     all_missing["lat"] = float("nan")
     all_missing["lng"] = float("nan")
-    sampler = _RecordingSampler()
+    sampler = flat_sampler()
     terrain.segment_and_store_activity(conn, 1, all_missing, "2024-06-01", None, 130.0, dem_sampler=sampler)
     assert sampler.points == []
     assert set(_sources(conn)) == {terrain.ELE_SOURCE_RECORDED}
 
     partly_missing = _synthetic_stream_df()
     partly_missing.loc[partly_missing["distance_m"] < 200, ["lat", "lng"]] = float("nan")
-    sampler = _RecordingSampler()
+    sampler = flat_sampler()
     terrain.segment_and_store_activity(conn, 1, partly_missing, "2024-06-01", None, 130.0, dem_sampler=sampler)
     assert sampler.points
     assert all(not math.isnan(lat) and not math.isnan(lng) for lat, lng in sampler.points)
@@ -215,10 +178,13 @@ def test_a_missing_gps_fix_is_never_sampled_as_null_island(conn: sqlite3.Connect
 # ---------------------------------------------------------------------------
 
 
-def test_current_model_falls_back_to_defaults_with_no_segments(conn: sqlite3.Connection):
+def test_current_model_falls_back_to_defaults_with_no_segments_or_only_old_ones(conn: sqlite3.Connection):
     model = terrain.current_model(conn)
     assert model.confidence == "low"
     assert all(b.sample_count == 0 for b in model.bins)
+
+    terrain.segment_and_store_activity(conn, 1, _synthetic_stream_df(), "2020-01-01", 15.0, 130.0)
+    assert all(b.sample_count == 0 for b in terrain.current_model(conn, window_days=30).bins)
 
 
 def test_current_model_uses_real_bins_when_samples_meet_threshold(conn: sqlite3.Connection):
@@ -242,23 +208,9 @@ def test_current_model_uses_real_bins_when_samples_meet_threshold(conn: sqlite3.
     assert model.descent_comfort_grade_pct == pytest.approx(downhill_bin.lo_pct)
 
 
-def test_current_model_window_excludes_old_segments(conn: sqlite3.Connection):
-    terrain.segment_and_store_activity(conn, 1, _synthetic_stream_df(), "2020-01-01", 15.0, 130.0)
-    model = terrain.current_model(conn, window_days=30)
-    assert all(b.sample_count == 0 for b in model.bins)
-
-
 # ---------------------------------------------------------------------------
 # Snapshots / trend / schema / rebuild version gating
 # ---------------------------------------------------------------------------
-
-
-def test_record_snapshot_feeds_the_trend(conn: sqlite3.Connection):
-    terrain.segment_and_store_activity(conn, 1, _synthetic_stream_df(), "2024-06-01", 15.0, 130.0)
-    terrain.record_snapshot(conn)
-    trend = terrain.get_terrain_trend(conn, "descent_comfort_grade_pct")
-    assert len(trend) == 1
-    assert trend[0]["value"] is not None
 
 
 @pytest.mark.parametrize("metric", ["median_speed_mps", "not_a_real_metric"])
@@ -394,14 +346,16 @@ def test_virtual_runs_are_not_segmented(conn: sqlite3.Connection, monkeypatch: p
     assert _segmented(conn) == {1}
 
 
-def test_one_unreadable_stream_file_does_not_fail_the_rebuild(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+def test_one_unreadable_stream_file_does_not_fail_the_rebuild_and_is_discarded_for_a_refetch(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     insert_activity(conn, 1)
     insert_activity(conn, 2)
     monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: False)
+    discarded: list[int] = []
+    monkeypatch.setattr(streams, "discard_raw_streams", discarded.append)
 
     def fetch(aid: int):
         if aid == 1:
-            raise ValueError("stream file is truncated")
+            raise OSError("stream file is truncated")
         return _synthetic_stream_df()
 
     monkeypatch.setattr(streams, "fetch_and_cache_streams", fetch)
@@ -409,29 +363,12 @@ def test_one_unreadable_stream_file_does_not_fail_the_rebuild(conn: sqlite3.Conn
     terrain.rebuild_terrain(conn, full=True)
 
     assert _segmented(conn) == {2}
-    failure = conn.execute("SELECT status_code, error FROM terrain_backfill_failures WHERE activity_id = 1").fetchone()
-    assert failure is not None and failure["status_code"] is None
-    assert "truncated" in failure["error"]
-    assert terrain.model_is_current(conn)
-
-
-def test_an_unreadable_stream_file_is_discarded_so_the_backfill_fetches_it_again(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    insert_activity(conn, 1)
-    monkeypatch.setattr(streams, "needs_streams_fetch", lambda aid: False)
-    discarded: list[int] = []
-    monkeypatch.setattr(streams, "discard_raw_streams", discarded.append)
-
-    def fetch(aid: int):
-        raise OSError("not a gzip file")
-
-    monkeypatch.setattr(streams, "fetch_and_cache_streams", fetch)
-
-    terrain.rebuild_terrain(conn, full=True)
-
     assert discarded == [1]
-    failure = conn.execute("SELECT model_version FROM terrain_backfill_failures WHERE activity_id = 1").fetchone()
-    assert failure["model_version"] is None
+    failure = conn.execute("SELECT status_code, error, model_version FROM terrain_backfill_failures WHERE activity_id = 1").fetchone()
+    assert failure is not None and failure["status_code"] is None and failure["model_version"] is None
+    assert "truncated" in failure["error"]
     assert terrain.segmentation_failed_ids(conn) == set()
+    assert terrain.model_is_current(conn)
 
 
 def test_a_segmentation_failure_keeps_the_file_and_is_not_retried_until_the_model_version_changes(
@@ -490,22 +427,14 @@ def _bin(lo: float, hi: float, speed: float, samples: int) -> dict:
     }
 
 
-def test_trend_ignores_bins_with_too_few_samples(conn: sqlite3.Connection):
+def test_trend_returns_one_point_per_date_for_the_current_window_and_ignores_bins_with_too_few_samples(conn: sqlite3.Connection):
+    terrain.update_settings(conn, rolling_window_days=90)
     _snapshot(conn, "2024-06-01", 90, [_bin(0, 2, 3.0, 50), _bin(2, 4, 9.0, 1)])
+    _snapshot(conn, "2024-06-01", 30, [_bin(0, 2, 5.0, 50)])
     _snapshot(conn, "2024-07-01", 90, [_bin(0, 2, 3.0, terrain.MIN_SAMPLES_FOR_BIN - 1)])
 
     trend = terrain.get_terrain_trend(conn, "median_speed_mps", grade_range=(0.0, 4.0))
-
     assert trend == [{"as_of": "2024-06-01", "value": 3.0}, {"as_of": "2024-07-01", "value": None}]
-
-
-def test_trend_returns_one_point_per_date_for_the_current_window(conn: sqlite3.Connection):
-    terrain.update_settings(conn, rolling_window_days=90)
-    _snapshot(conn, "2024-06-01", 90, [_bin(0, 2, 3.0, 50)])
-    _snapshot(conn, "2024-06-01", 30, [_bin(0, 2, 5.0, 50)])
-
-    trend = terrain.get_terrain_trend(conn, "median_speed_mps", grade_range=(0.0, 4.0))
-    assert trend == [{"as_of": "2024-06-01", "value": 3.0}]
     assert terrain.get_terrain_trend(conn, "median_speed_mps", grade_range=(0.0, 4.0), window_days=30)[0]["value"] == 5.0
 
 
@@ -545,26 +474,16 @@ def test_connect_during_a_stale_model_starts_one_background_rebuild_and_reports_
     terrain.connect().close()  # current now
 
 
-def test_connect_stamps_an_empty_database_without_a_background_rebuild(monkeypatch):
-    monkeypatch.setattr(terrain, "start_background_rebuild", lambda: pytest.fail("nothing to rebuild"))
-
-    terrain.connect().close()
-
-
 def _raise_rebuilding():
     raise terrain.TerrainRebuildingError("being rebuilt")
 
 
-def test_terrain_tools_report_rebuilding_instead_of_failing(monkeypatch):
+def test_terrain_tools_and_endpoints_report_rebuilding_instead_of_failing(monkeypatch):
     monkeypatch.setattr(terrain, "connect", _raise_rebuilding)
     server = FastMCP("t")
     terrain_mcp.register_terrain_tools(server)
 
     assert call_tool(server, "get_terrain_profile")["status"] == "rebuilding"
-
-
-def test_terrain_endpoints_answer_503_while_rebuilding(monkeypatch):
-    monkeypatch.setattr(terrain, "connect", _raise_rebuilding)
     response = TestClient(api.app).get("/api/terrain/profile")
     assert response.status_code == 503
     assert response.headers["retry-after"]

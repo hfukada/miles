@@ -1,13 +1,7 @@
-"""Nominatim geocoding, cached by query text so a repeated "I'm staying at
-X" never re-hits the endpoint. A cached answer never expires: a place's
-coordinates do not change, and every lookup the cache absorbs is one request
-fewer to a volunteer-run service. "No match" is cached too, and stays cached
-until someone asks again. A caller who suspects a wrong or outdated answer
-passes refresh=True to look it up again, at most once a day per place.
-Requests go through http_client, which holds Nominatim's one-request-per-
-second cap process-wide and sends the identifying User-Agent its usage policy
-requires; the public instance is refused until MILES_CONTACT says who is
-asking.
+"""Nominatim geocoding, cached by normalized query text. Answers, and "no
+match", never expire; refresh=True looks a place up again, at most once a day.
+Requests go through http_client (rate cap and User-Agent); the public instance
+is refused until MILES_CONTACT is set. See docs/external-services.md.
 """
 
 import json
@@ -27,8 +21,7 @@ PUBLIC_HOST = "nominatim.openstreetmap.org"
 
 ATTRIBUTION = "© OpenStreetMap contributors, ODbL"
 
-# A place already looked up this recently is not asked about again, even on
-# refresh.
+# A place looked up this recently is not asked again, even on refresh.
 REFRESH_MIN_INTERVAL = timedelta(days=1)
 
 
@@ -102,9 +95,8 @@ def _recent(fetched_at: str) -> bool:
 
 
 def _cached_answer(conn: sqlite3.Connection, key: str, query: str, refresh: bool) -> GeocodeResult | None:
-    """The answer to give from the cache, or None when Nominatim has to be
-    asked. Raises for a cached "no match". Rows written before keys were
-    normalized sit under the raw query text and are found by it."""
+    """The cached answer, or None when Nominatim has to be asked. Raises for a
+    cached "no match". Rows keyed by raw query text (older) are also found."""
     hit = conn.execute(
         "SELECT lat, lng, display_name, fetched_at FROM geocode_cache WHERE query IN (?, ?) "
         "ORDER BY query = ? DESC LIMIT 1",
@@ -129,13 +121,10 @@ def _cached_answer(conn: sqlite3.Connection, key: str, query: str, refresh: bool
 
 
 def lookup(conn: sqlite3.Connection, query: str, *, refresh: bool = False) -> GeocodeResult:
-    """Coordinates, a display name, and the required attribution for a
-    free-text place, from cache when there is an entry. refresh=True asks
-    Nominatim again and overwrites the entry, unless the place was looked up
-    within the last day; if that request fails the cached answer is returned
-    with a note rather than an error, since a network hiccup shouldn't break
-    an otherwise-cached lookup. Identical lookups running at once ask
-    Nominatim once."""
+    """Coordinates, display name, and attribution for a free-text place, from
+    cache when present. refresh=True asks again and overwrites the entry
+    unless looked up within the last day; if that request fails the cached
+    answer is returned with a note. Concurrent identical lookups ask once."""
     query = " ".join(query.split())
     key = normalize_query(query)
     if not key:

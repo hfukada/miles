@@ -1,16 +1,12 @@
 """The athlete's own per-grade running performance, built from raw run
-streams -- independent of any map data. Segments (terrain_segments) are
-rebuildable from those raw stream files alone, gated by model_version_tag()
-exactly like ROUTE_DERIVE_VERSION gates routes.py: a threshold, parsing, or
-segmentation change bumps the version and rebuild_terrain(full=True)
-recomputes everything without needing to refetch anything from Strava.
+streams, independent of any map data. Segments (terrain_segments) are
+rebuildable from the raw stream files alone, gated by model_version_tag()
+like ROUTE_DERIVE_VERSION gates routes.py.
 
-Grade is taken from the terrain model draped on each segment's lat/lng
-wherever tiles cover it, falling back to the activity's recorded altitude
-elsewhere; ele_source per row records which one a segment actually used.
-Tile fetching for history happens only in the terrain backfill job
-(terrain_backfill.py), never on a request or startup path -- see
-segment_and_store_activity.
+Grade comes from elevation tiles draped on each segment's lat/lng where they
+cover it, else from the activity's recorded altitude; ele_source records
+which. Tile fetching for history happens only in the terrain backfill job,
+never on a request or startup path.
 """
 
 import bisect
@@ -34,60 +30,49 @@ from . import routes as routes_service
 _logger = logging.getLogger(__name__)
 
 # Bump whenever a change alters what rebuild_terrain computes from the same
-# cached streams (DEM draping, smoothing, which activities count); it gates a
-# full resegmentation, as routes.ROUTE_DERIVE_VERSION does for routes.
+# cached streams; it gates a full resegmentation.
 TERRAIN_MODEL_VERSION = 5
 
 
 def model_version_tag() -> str:
     """Version stamp written to meta.terrain_model_version. Folds in
-    streams.STREAM_DERIVE_VERSION so a change to how streams are parsed into
-    a DataFrame forces the same full resegmentation as a terrain-model
-    version bump -- from the raw files already on disk, never a Strava
-    refetch."""
+    streams.STREAM_DERIVE_VERSION so a stream-parsing change also forces a
+    full resegmentation from the raw files on disk."""
     return f"{TERRAIN_MODEL_VERSION}.{streams.STREAM_DERIVE_VERSION}"
 
 # A virtual run's "terrain" is whatever the app simulated, not ground the
 # athlete ran on.
 TERRAIN_SPORT_TYPES = tuple(t for t in races.RUN_SPORT_TYPES if t != "VirtualRun")
 
-# Stored as a small int (see terrain_segments schema), not a string --
-# at the row counts a multi-year history reaches the difference is real.
+# Stored as a small int: the row count of a multi-year history makes a string costly.
 ELE_SOURCE_RECORDED = 0
 ELE_SOURCE_DEM = 1
 
 WALK_THRESHOLD_SPM_DEFAULT = 130.0
-# Used only when the cadence stream is missing outright -- a walking pace
-# for most adults, well below any recreational running speed.
+# Used only when the cadence stream is missing outright.
 WALK_SPEED_FALLBACK_MPS = 2.2
 ROLLING_WINDOW_DAYS_DEFAULT = 90
 
 GRADE_BIN_WIDTH_PCT = 2.0
 GRADE_BIN_MIN_PCT = -30.0
 GRADE_BIN_MAX_PCT = 30.0
-# Sentinel bounds for the two open-ended overflow bins, in place of +/-inf --
-# SQLite parameter binding and JSON serialization both handle a large finite
-# number more predictably than an infinity.
+# Sentinel bounds for the open-ended overflow bins, in place of +/-inf, which
+# SQLite binding and JSON serialization handle poorly.
 _UNDERFLOW_LO = -999.0
 _OVERFLOW_HI = 999.0
 
-# A grade bin needs at least this many samples in the window before its
-# stats are trusted over the generic default for that bin.
+# Minimum samples before a grade bin's stats are trusted over the default.
 MIN_SAMPLES_FOR_BIN = 5
-# Same idea for a fatigue/temperature band: below this, no adjustment is
-# applied (multiplier stays 1.0) rather than fitting noise.
+# Below this a fatigue/temperature band applies no adjustment (multiplier 1.0).
 MIN_SAMPLES_FOR_BAND = 20
-# Tolerance, in m/s, absorbed when walking the descent-comfort scan so a
-# statistically-flat run of bins doesn't stop on sample noise.
+# Tolerance, in m/s, so the descent-comfort scan doesn't stop on sample noise.
 _DESCENT_NOISE_MPS = 0.05
 
 # Elapsed-time fatigue bands, in seconds: 0-30/30-60/60-90/90-120/120min+.
 FATIGUE_BAND_EDGES_S = [0.0, 1800.0, 3600.0, 5400.0, 7200.0, 86400.0]
-# Temperature bands, in Celsius, spanning well outside any real run.
+# Temperature bands, in Celsius.
 TEMP_BAND_EDGES_C = [-20.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 60.0]
-# Reference point for the temperature adjustment: a commonly cited
-# comfortable-for-distance-running temperature, used as the "no adjustment"
-# baseline the way the first fatigue band (a fresh runner) is.
+# The "no adjustment" temperature, as the first fatigue band is for fatigue.
 REFERENCE_TEMP_C = 12.0
 
 # Generic defaults, used until the athlete has enough of their own data.
@@ -109,13 +94,9 @@ class TerrainDataError(ValueError):
 
 
 def _drop_legacy_terrain_segments(conn: sqlite3.Connection) -> None:
-    """terrain_segments is entirely derived (never ground truth), so a
-    layout change drops and recreates it rather than migrating rows in
-    place -- rebuild_terrain repopulates it from the raw stream files once
-    model_version_tag() no longer matches meta.terrain_model_version. Only
-    fires against a table built before the compact-int/WITHOUT ROWID layout
-    (recognizable by its old grade_pct column, since the new one is
-    grade_dpct)."""
+    """terrain_segments is derived, so a layout change drops it for
+    rebuild_terrain to repopulate rather than migrating rows. Fires only for a
+    table with the old grade_pct column (the current one has grade_dpct)."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(terrain_segments)").fetchall()}
     if cols and "grade_dpct" not in cols:
         conn.execute("DROP TABLE terrain_segments")
@@ -134,14 +115,10 @@ def init_terrain_schema(conn: sqlite3.Connection) -> None:
         "INSERT OR IGNORE INTO terrain_settings (id, walk_threshold_spm, rolling_window_days) VALUES (1, ?, ?)",
         [WALK_THRESHOLD_SPM_DEFAULT, ROLLING_WINDOW_DAYS_DEFAULT],
     )
-    # Rebuilt wholesale from raw streams whenever model_version_tag()
-    # changes -- nothing here is ground truth. Values are stored as compact
-    # integers (tenths of a percent/degree, cm/s, whole seconds) rather than
-    # REAL: at the row counts a multi-year history reaches, SQLite's variable-length
-    # integer encoding costs noticeably less per row than an 8-byte float,
-    # and grade/speed/temp don't need more than that precision. WITHOUT
-    # ROWID drops the hidden rowid column since (activity_id, idx) is
-    # already a unique, storage-clustering key.
+    # Values are compact integers (tenths of a percent/degree, cm/s, whole
+    # seconds) rather than REAL: far smaller per row at multi-year row counts,
+    # and precise enough. WITHOUT ROWID because (activity_id, idx) is already
+    # a unique clustering key.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS terrain_segments (
             activity_id INTEGER NOT NULL REFERENCES activities(activity_id) ON DELETE CASCADE,
@@ -159,14 +136,12 @@ def init_terrain_schema(conn: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_terrain_segments_grade ON terrain_segments(grade_dpct)")
-    # One row per processed activity (not per segment) -- the date a
-    # date-window query filters on, kept off terrain_segments so it isn't
-    # repeated ~150-250 times per activity. An activity whose streams yield no
-    # segments (no altitude, an indoor run) still gets a row with
-    # segment_count 0, so it is processed once per model version rather than on
-    # every pass. needs_dem marks a segmentation done without fetching DEM
-    # tiles in which some segments fell back to recorded altitude: the
-    # backfill re-segments those with fetching on.
+    # One row per processed activity, holding the date window queries filter
+    # on so it isn't repeated per segment. An activity with no segments still
+    # gets a row (segment_count 0) so it is processed once per model version.
+    # needs_dem marks a segmentation done without fetching elevation tiles in
+    # which some segments fell back to recorded altitude; the backfill
+    # re-segments those with fetching on.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS terrain_segment_dates (
             activity_id   INTEGER PRIMARY KEY REFERENCES activities(activity_id) ON DELETE CASCADE,
@@ -195,9 +170,7 @@ def init_terrain_schema(conn: sqlite3.Connection) -> None:
             UNIQUE (as_of, window_days)
         )
     """)
-    # The resumable backfill job's own state: activity_ids still needing a
-    # streams fetch (the queue itself is the resume point) and a status row
-    # polled the way sync.SyncProgress is.
+    # The resumable backfill's state: the queue is the resume point.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS terrain_backfill_queue (
             activity_id INTEGER PRIMARY KEY REFERENCES activities(activity_id) ON DELETE CASCADE,
@@ -205,11 +178,10 @@ def init_terrain_schema(conn: sqlite3.Connection) -> None:
             queued_at   TEXT NOT NULL
         )
     """)
-    # An activity the backfill couldn't fetch or segment. A 404 (deleted or
-    # private on Strava) is permanent and keeps it out of the queue; any other
-    # failure is only a record of why the last attempt failed. model_version
-    # is set only when segmenting a readable stream file failed: that
-    # activity is not attempted again until model_version_tag() changes.
+    # An activity the backfill couldn't fetch or segment. A 404 is permanent
+    # and keeps it out of the queue; any other failure only records why the
+    # last attempt failed. model_version is set only when segmenting a
+    # readable stream file failed: not retried until model_version_tag() changes.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS terrain_backfill_failures (
             activity_id   INTEGER PRIMARY KEY REFERENCES activities(activity_id) ON DELETE CASCADE,
@@ -243,10 +215,9 @@ class TerrainRebuildingError(RuntimeError):
 
 def connect() -> sqlite3.Connection:
     """Connection for terrain endpoints/tools. When the stored model version is
-    behind, the full rebuild is started on a background thread and this raises
-    TerrainRebuildingError rather than making the caller wait for it. A
-    database with no terrain-model activities has nothing to rebuild, so the
-    version is simply stamped."""
+    behind, starts the rebuild on a background thread and raises
+    TerrainRebuildingError rather than making the caller wait. A database with
+    nothing to rebuild is simply stamped."""
     conn = db.connect()
     if model_is_current(conn):
         return conn
@@ -278,9 +249,8 @@ def update_settings(
     walk_threshold_spm: float | None = None,
     rolling_window_days: int | None = None,
 ) -> TerrainSettings:
-    """Changing walk_threshold_spm changes how every existing segment
-    classifies as walking, so it forces a full resegmentation -- the same
-    way a changed long_run_floor_miles forces derive_all(full=True)."""
+    """Changing walk_threshold_spm reclassifies every segment, so it forces a
+    full resegmentation."""
     current = get_settings(conn)
     new_walk = walk_threshold_spm if walk_threshold_spm is not None else current["walk_threshold_spm"]
     new_window = rolling_window_days if rolling_window_days is not None else current["rolling_window_days"]
@@ -368,8 +338,7 @@ class TerrainModel:
     descent_comfort_grade_pct: float  # negative
     confidence: Confidence
     bins: list[GradeBinStats] = field(default_factory=list)
-    # (lo, hi, multiplier) bands; multiplier is relative to the reference
-    # band (fresh / REFERENCE_TEMP_C), applied multiplicatively.
+    # (lo, hi, multiplier) bands, relative to the reference band.
     fatigue_bands: list[tuple[float, float, float]] = field(default_factory=list)
     temp_bands: list[tuple[float, float, float]] = field(default_factory=list)
 
@@ -427,9 +396,8 @@ class TerrainModel:
 
 
 def default_model() -> TerrainModel:
-    """Sane generic defaults for an athlete with no terrain history yet:
-    expected speed per grade follows the same Minetti cost curve GAP uses,
-    holding effort constant from a ~9:00/mi flat pace."""
+    """Generic defaults for an athlete with no terrain history: speed per grade
+    follows the Minetti cost curve from a ~9:00/mi flat pace."""
     bins: list[GradeBinStats] = []
     for lo, hi in _all_bin_bounds():
         center = _bin_center(lo, hi)
@@ -462,9 +430,8 @@ def _derive_walk_onset(bins: list[GradeBinStats], fallback: float) -> float:
 
 
 def _derive_descent_comfort(bins: list[GradeBinStats], fallback: float) -> float:
-    """Walk from flat toward steeper descents; the comfortable grade is the
-    steepest one reached before median speed stops rising (within
-    _DESCENT_NOISE_MPS of the best seen so far)."""
+    """Scan from flat toward steeper descents; the comfortable grade is the
+    steepest reached before median speed stops rising."""
     candidates = sorted(
         (b for b in bins if b.hi_pct <= 0 and b.sample_count > 0 and b.median_speed_mps is not None),
         key=lambda b: -b.lo_pct,
@@ -491,11 +458,9 @@ def _confidence_for(total_real_samples: int) -> Confidence:
 def _derive_bands(
     df: pd.DataFrame, key_col: str, edges: list[float], reference_value: float
 ) -> list[tuple[float, float, float]]:
-    """Relative pace-fade curve: median GAP-adjusted speed in each band of
-    key_col, relative to the band containing reference_value. Grade is
-    already normalized out via gap_speed_mps, so a lower multiplier means a
-    real fatigue/temperature effect rather than just more hills late in a
-    run or on a hot day."""
+    """Median grade-adjusted speed in each band of key_col relative to the band
+    containing reference_value, so a low multiplier is a fatigue/temperature
+    effect, not hills."""
     bands = list(zip(edges, edges[1:]))
     neutral = [(lo, hi, 1.0) for lo, hi in bands]
     if df.empty:
@@ -521,9 +486,8 @@ def _derive_bands(
 def current_model(
     conn: sqlite3.Connection, window_days: int | None = None, as_of: date | None = None
 ) -> TerrainModel:
-    """The athlete's model over a trailing window, falling back to
-    default_model()'s bin for any bin with fewer than MIN_SAMPLES_FOR_BIN
-    real samples."""
+    """The athlete's model over a trailing window; bins with fewer than
+    MIN_SAMPLES_FOR_BIN samples use default_model()'s."""
     settings = get_settings(conn)
     window_days = window_days if window_days is not None else settings["rolling_window_days"]
     as_of = as_of or date.today()
@@ -604,9 +568,8 @@ def current_model(
 
 
 def _present(x: object) -> bool:
-    """True unless x is None or a float NaN. A scalar pulled from a Series
-    via .iloc is typed as plain `object`, which pandas's own notna()
-    overloads can't narrow -- this replaces it for that case."""
+    """True unless x is None or a float NaN; narrows a Series scalar that
+    pandas's notna() overloads can't."""
     if x is None:
         return False
     return not (isinstance(x, float) and math.isnan(x))
@@ -617,9 +580,8 @@ def _flt(x: object) -> float | None:
 
 
 def _nearest(raw_dist: list[float], raw_series: pd.Series, targets: list[float]) -> list[object]:
-    """Value of raw_series at the raw sample closest in distance to each
-    target -- a nearest-neighbor join rather than interpolation, so speed/HR/
-    cadence keep their real recorded values instead of a smoothed blend."""
+    """Value of raw_series at the sample nearest each target distance, so
+    speed/HR/cadence keep recorded values instead of an interpolated blend."""
     n = len(raw_dist)
     out: list[object] = []
     for t in targets:
@@ -642,11 +604,9 @@ class _AltitudeResample(TypedDict):
 
 
 def _resample_altitude(df: pd.DataFrame) -> _AltitudeResample | None:
-    """Resample distance/altitude/position onto the 20 m grid routes use,
-    smoothing recorded altitude over the same +/-50 m window
-    (gpx_parse.resample_points calls gpx_parse.smoothed_elevations
-    internally). Returns None when there's no usable distance/altitude
-    series to resample."""
+    """Resample distance/altitude/position onto the 20 m grid routes use
+    (gpx_parse.resample_points also smooths altitude). None when there is no
+    usable distance/altitude series."""
     sub = df.dropna(subset=["distance_m", "altitude_m"])
     if len(sub) < 2:
         return None
@@ -674,13 +634,10 @@ def _resample_altitude(df: pd.DataFrame) -> _AltitudeResample | None:
 def _drape_activity_dem(
     dem_sampler: elevation.ElevationSampler | None, dist_m: list[float], lat: list[float], lng: list[float]
 ) -> list[float | None]:
-    """Terrain-model elevation at every resampled point, or all-None when no
-    sampler was given (segmenting on a request/startup path -- see
-    segment_and_store_activity). When the model covers every point, the
-    result is roughness-smoothed like any other terrain-model-sourced
-    profile; a partial drape is returned raw, per point, and
-    _segment_activity falls back to recorded altitude wherever a point
-    comes back None. Points without a GPS fix are never sampled."""
+    """Tile elevation at every resampled point, or all-None with no sampler.
+    A fully covered drape is roughness-smoothed; a partial one is returned
+    raw, and _segment_activity falls back to recorded altitude where a point
+    is None. Points without a GPS fix are never sampled."""
     if dem_sampler is None:
         return [None] * len(dist_m)
     located = [i for i, (la, ln) in enumerate(zip(lat, lng)) if math.isfinite(la) and math.isfinite(ln)]
@@ -737,9 +694,8 @@ def _segment_activity(
         seg_len = dist_out[i + 1] - dist_out[i]
         if seg_len <= 0:
             continue
-        # A segment only trusts the terrain model when it covers both of its
-        # endpoints -- mixing a modeled and a recorded endpoint would invent
-        # a grade neither source actually measured.
+        # Mixing a modeled and a recorded endpoint would invent a grade
+        # neither source measured, so tiles must cover both.
         dem_a, dem_b = dem_out[i], dem_out[i + 1]
         if dem_a is not None and dem_b is not None:
             rise_m, ele_source = dem_b - dem_a, ELE_SOURCE_DEM
@@ -785,15 +741,12 @@ def segment_and_store_activity(
     dem_sampler: elevation.ElevationSampler | None = None,
     dem_fetch: bool = False,
 ) -> int:
-    """(Re)segment one activity's stream DataFrame and replace its
-    terrain_segments rows and its single terrain_segment_dates row.
-    Returns the number of segments stored; 0 when the activity has no usable
-    elevation, in which case the dates row still records that it was
-    processed.
-    The sampler is cache-only. Rebuilds leave dem_fetch False, so any segment
-    that fell back to recorded altitude flags the activity needs_dem; the
-    terrain backfill job fetches the tiles first and passes dem_fetch=True,
-    since a fallback after that is final."""
+    """(Re)segment one activity's streams, replacing its terrain_segments rows
+    and terrain_segment_dates row. Returns the segments stored (0 without
+    usable elevation; the dates row still records the attempt).
+    The sampler is cache-only. With dem_fetch False, a segment that fell back
+    to recorded altitude flags the activity needs_dem; the backfill fetches
+    tiles first and passes dem_fetch=True, after which a fallback is final."""
     segments = _segment_activity(df, walk_threshold_spm, dem_sampler=dem_sampler)
     conn.execute("DELETE FROM terrain_segments WHERE activity_id = ?", [activity_id])
     conn.execute("DELETE FROM terrain_segment_dates WHERE activity_id = ?", [activity_id])
@@ -825,11 +778,8 @@ def segment_and_store_activity(
 
 
 def activity_temp_c(conn: sqlite3.Connection, activity_id: int, stream_df: pd.DataFrame | None = None) -> float | None:
-    """Weather-station temperature for the activity when known; falling
-    back to the device's own temp stream (mean of its recorded samples)
-    only when the weather table has nothing -- the station reading is a
-    fixed point for the whole run, while a device sensor can drift with
-    body heat and direct sun."""
+    """Weather temperature for the activity, else the mean of the device's temp
+    stream, which drifts with body heat and sun."""
     row = conn.execute(
         "SELECT temp_c_avg, temp_c_start, temp_c_end FROM weather WHERE activity_id = ?", [activity_id]
     ).fetchone()
@@ -860,13 +810,11 @@ def segment_cached_activity(
     *,
     fetch_dem: bool = False,
 ) -> int:
-    """Segment one run activity from its cached raw streams (df, when the
-    caller already holds the DataFrame) and store the result. Returns the
-    number of segments stored; 0 for an activity that isn't a terrain-model
-    sport, isn't synced, or has no usable elevation. fetch_dem downloads the
-    DEM tiles the track crosses before draping it (the backfill job's call
-    to make); otherwise the activity keeps its recorded altitude and is
-    flagged for a later pass."""
+    """Segment one run from its cached streams (df, if already loaded) and
+    store the result. Returns the segments stored; 0 for a non-terrain sport,
+    an unsynced activity, or no usable elevation. fetch_dem downloads the
+    tiles the track crosses (the backfill's call to make); otherwise the
+    activity keeps recorded altitude and is flagged for a later pass."""
     row = conn.execute(
         "SELECT sport_type, start_date FROM activities WHERE activity_id = ?", [activity_id]
     ).fetchone()
@@ -892,12 +840,9 @@ def segment_cached_activity(
 
 
 def activities_to_segment(conn: sqlite3.Connection) -> list[int]:
-    """Terrain-model activities whose raw streams are on disk but that have
-    not been processed yet (their streams were stored by something other than
-    the backfill, such as opening the activity page), or that were segmented
-    without full DEM coverage while tile fetching was off. Newest first.
-    Activities whose segmentation already failed at this model version are
-    left out."""
+    """Terrain-model activities with streams on disk that are unprocessed or
+    were segmented without full tile coverage, newest first. Activities whose
+    segmentation failed at this model version are left out."""
     failed = segmentation_failed_ids(conn)
     placeholders = ",".join("?" * len(TERRAIN_SPORT_TYPES))
     rows = conn.execute(
@@ -933,8 +878,7 @@ def _has_terrain_activities(conn: sqlite3.Connection) -> bool:
 
 def ensure_terrain_derived(conn: sqlite3.Connection) -> None:
     """Run the full rebuild if the stored model version is behind. Raises
-    TerrainRebuildingError when another thread of this process is already
-    rebuilding."""
+    TerrainRebuildingError if another thread is already rebuilding."""
     if model_is_current(conn):
         return
     if not _rebuild_lock.acquire(blocking=False):
@@ -955,27 +899,22 @@ REBUILD_ERROR_META = "terrain_rebuild_error"
 
 
 def _rebuild_in_background() -> None:
-    conn = db.connect()
-    try:
-        ensure_terrain_derived(conn)
-        conn.execute("DELETE FROM meta WHERE key = ?", (REBUILD_ERROR_META,))
-        conn.commit()
-    except TerrainRebuildingError:
-        pass  # another thread is already on it
-    except Exception as e:
-        _logger.exception("terrain model rebuild failed")
-        db.set_meta(conn, REBUILD_ERROR_META, describe_error(e))
-        conn.commit()
-    finally:
-        conn.close()
+    with db.connection() as conn:
+        try:
+            ensure_terrain_derived(conn)
+            conn.execute("DELETE FROM meta WHERE key = ?", (REBUILD_ERROR_META,))
+            conn.commit()
+        except TerrainRebuildingError:
+            pass  # another thread is already on it
+        except Exception as e:
+            _logger.exception("terrain model rebuild failed")
+            db.set_meta(conn, REBUILD_ERROR_META, describe_error(e))
+            conn.commit()
 
 
 def start_background_rebuild_if_stale() -> None:
-    conn = db.connect()
-    try:
+    with db.connection() as conn:
         stale = not model_is_current(conn) and _has_terrain_activities(conn)
-    finally:
-        conn.close()
     if stale:
         start_background_rebuild()
 
@@ -992,9 +931,8 @@ def start_background_rebuild() -> None:
 
 
 # A rebuild commits every this many activities rather than holding one write
-# transaction for the whole history, which would block every other writer. The
-# stored model version is stamped last, so a rebuild cut short reads as stale
-# and is redone.
+# transaction that would block other writers. The model version is stamped
+# last, so a rebuild cut short reads as stale.
 REBUILD_COMMIT_EVERY = 25
 
 
@@ -1003,8 +941,8 @@ class StreamFileError(Exception):
 
 
 def load_stream_file(activity_id: int, loader: Callable[[int], pd.DataFrame]) -> pd.DataFrame:
-    """Read an activity's cached streams. An unreadable raw file is discarded,
-    so the backfill fetches it again."""
+    """Read an activity's cached streams; an unreadable file is discarded for
+    the backfill to refetch."""
     try:
         return loader(activity_id)
     except Exception as e:
@@ -1019,8 +957,7 @@ def record_failure(
     error: str,
     model_version: str | None = None,
 ) -> None:
-    """Note why an activity could not be fetched or segmented; the latest
-    attempt's reason replaces the earlier one."""
+    """Note why an activity could not be fetched or segmented (latest wins)."""
     conn.execute(
         """
         INSERT INTO terrain_backfill_failures (activity_id, status_code, error, failed_at, model_version)
@@ -1035,10 +972,8 @@ def record_failure(
 
 
 def record_segmentation_failure(conn: sqlite3.Connection, activity_id: int, error: Exception) -> None:
-    """Record a failure to turn an activity's streams into terrain segments.
-    A stream file that could not be read was discarded and is refetched; any
-    other failure keeps the file and blocks further attempts at this model
-    version."""
+    """Record a segmentation failure. An unreadable stream file is refetched;
+    any other failure blocks retries until the model version changes."""
     versioned = None if isinstance(error, StreamFileError) else model_version_tag()
     record_failure(conn, activity_id, None, describe_error(error, None), versioned)
 
@@ -1052,11 +987,9 @@ def segmentation_failed_ids(conn: sqlite3.Connection) -> set[int]:
 
 
 def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str, int]:
-    """Segment every run activity whose streams are cached and current
-    (never touches Strava itself -- that's the backfill job's job), then
-    refresh the terrain snapshot(s). full=True also forces every activity to
-    be resegmented from its raw stream file, the only path guaranteed
-    correct after a model_version_tag() bump."""
+    """Segment every run whose streams are cached and current (never touches
+    Strava), then refresh the snapshots. full=True resegments every activity,
+    required after a model_version_tag() bump."""
     full = full or not model_is_current(conn)
 
     settings = get_settings(conn)
@@ -1077,9 +1010,7 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
         list(TERRAIN_SPORT_TYPES),
     ).fetchall()
 
-    # rebuild_terrain runs on request/startup paths (ensure_terrain_derived),
-    # so it must never wait on a DEM fetch. The backfill job is where tile
-    # fetching for history actually happens.
+    # Runs on request/startup paths, so it must never wait on a tile fetch.
     dem_sampler = elevation.sampler_for(conn)
 
     segmented = 0
@@ -1100,10 +1031,7 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
         except sqlite3.Error:
             raise
         except Exception as e:
-            # One failing activity must not keep the model stale for every
-            # other. It loses its rows; an unreadable stream file was
-            # discarded for the backfill to fetch again, and any other
-            # failure is not retried until the model version changes.
+            # One failing activity must not keep the model stale for the rest.
             _logger.warning("terrain segmentation failed for activity %s", activity_id, exc_info=True)
             for table in ("terrain_segments", "terrain_segment_dates"):
                 conn.execute(f"DELETE FROM {table} WHERE activity_id = ?", [activity_id])
@@ -1158,10 +1086,10 @@ def record_snapshot(conn: sqlite3.Connection, as_of: date | None = None, window_
 
 
 def backfill_snapshots(conn: sqlite3.Connection, window_days: int, since: date | None = None) -> int:
-    """Weekly snapshots from the earliest segmented activity to today --
-    the expensive path, since it walks every past week's window (see
-    rebuild_terrain). since skips the weeks before it: a snapshot only
-    changes when an activity dated on or before its as_of is added."""
+    """Weekly snapshots from the earliest segmented activity to today; costly,
+    since it walks every past week's window. since skips earlier weeks: a
+    snapshot changes only when an activity dated on or before its as_of is
+    added."""
     earliest = conn.execute("SELECT MIN(start_date) AS d FROM terrain_segment_dates WHERE segment_count > 0").fetchone()
     if earliest is None or earliest["d"] is None:
         return 0
@@ -1232,10 +1160,8 @@ def get_terrain_trend(
     window_days: int | None = None,
 ) -> list[TerrainTrendPoint]:
     """One point per snapshot date, from snapshots taken with window_days
-    (the current setting when not given) so a changed window never yields
-    two points for one date. A grade bin averaged into a bin-based metric
-    needs MIN_SAMPLES_FOR_BIN samples, the same bar current_model applies
-    before trusting a bin's own stats."""
+    (default: the current setting). Bins averaged into a bin-based metric
+    need MIN_SAMPLES_FOR_BIN samples."""
     if metric not in _SCALAR_TREND_METRICS and metric not in _BIN_TREND_METRICS:
         raise ValueError(f"Unknown terrain trend metric: {metric!r}")
     if metric in _BIN_TREND_METRICS and grade_range is None:
@@ -1316,11 +1242,9 @@ def _route_grades_pct(conn: sqlite3.Connection, route_id: int) -> list[float] | 
 
 
 def _gap_analysis(model: TerrainModel, grades_pct: Sequence[float]) -> RouteGapAnalysis:
-    """Course grade histogram weighted by the athlete's own per-bin
-    efficiency deficit -- how far each bin's grade-adjusted efficiency falls
-    below the athlete's best bin. A grade being physically slower than flat
-    isn't itself a deficit; falling further behind at that grade than at
-    others is."""
+    """Course grade histogram weighted by the athlete's per-bin efficiency
+    deficit: how far a bin's grade-adjusted efficiency falls below their best
+    bin."""
     total = len(grades_pct)
     histogram: dict[tuple[float, float], int] = {}
     for g in grades_pct:
@@ -1347,9 +1271,8 @@ def _gap_analysis(model: TerrainModel, grades_pct: Sequence[float]) -> RouteGapA
 
 
 def score_route(conn: sqlite3.Connection, route_id: int) -> RouteTerrainScore:
-    """Runnability breakdown of a stored route's 20 m grade profile, read
-    through the athlete's current terrain model. Raises
-    routes.RouteNotFoundError for an unknown route_id."""
+    """Runnability breakdown of a stored route's grade profile under the
+    current model. Raises routes.RouteNotFoundError for an unknown route_id."""
     grades = _route_grades_pct(conn, route_id)
     if grades is None:
         return {"route_id": route_id, "has_elevation": False, "runnability": None, "gap_analysis": None}
@@ -1373,11 +1296,9 @@ class RoutePointClass(TypedDict):
 
 
 def route_point_classes(conn: sqlite3.Connection, route_id: int) -> list[RoutePointClass]:
-    """Per-point runnability class for map/profile coloring, read through the
-    athlete's current terrain model. Each point's grade is that of the
-    segment running from it to the next point; the last point repeats the
-    prior segment's grade so the array stays one-to-one with the profile.
-    Raises routes.RouteNotFoundError for an unknown route_id."""
+    """Per-point runnability class for coloring. A point takes the grade of the
+    segment to the next point; the last repeats the prior one to stay
+    one-to-one with the profile. Raises routes.RouteNotFoundError."""
     profile = routes_service.get_route_profile(conn, route_id)
     if not profile:
         return []
@@ -1442,11 +1363,9 @@ def _percentile_at_grade(conn: sqlite3.Connection, grade_pct: float, speed_mps: 
 
 
 def analyze_activity_terrain(conn: sqlite3.Connection, activity_id: int) -> ActivityTerrainAnalysis:
-    """Each of the activity's climbs/descents (gpx_parse's existing
-    segmentation, on the activity's own resampled elevation) against the
-    athlete's current terrain model: expected speed for that grade, fatigue
-    band, and temperature, as a residual and a percentile of the athlete's
-    own history at that grade."""
+    """Each climb/descent of the activity against the current model: residual
+    from expected speed for that grade, fatigue, and temperature, and a
+    percentile of the athlete's own history at that grade."""
     if streams.needs_streams_fetch(activity_id):
         raise TerrainDataError(f"No current cached streams for activity {activity_id}")
     stream_df = streams.fetch_and_cache_streams(activity_id)

@@ -23,5 +23,9 @@ def test_names_that_merely_end_in_a_credential_word_are_left_alone(text: str):
     assert errors.redact(text) == text
 
 
-def test_describe_error_names_the_class_and_redacts():
+def test_describe_error_names_the_class_redacts_and_cuts_only_after_redacting():
     assert errors.describe_error(ValueError("bad access_token=abc123")) == "ValueError: bad access_token=[redacted]"
+
+    text = errors.describe_error(RuntimeError("x" * 190 + " access_token=abcdefghijklmnop"))
+    assert len(text) <= errors.MAX_LENGTH
+    assert "abcdefghi" not in text

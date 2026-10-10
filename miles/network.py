@@ -2,23 +2,16 @@
 preference profile, way overrides, and path scoring that read it.
 
 Nodes are OSM nodes shared by two or more routable ways, way endpoints, and
-trailhead/amenity nodes snapped onto their nearest edge by splitting that
-edge at the snap point -- an amenity is a real, traversable graph node, not
-a sidecar annotation on an edge it sits beside. Edges are way pieces between
-nodes, resampled to gpx_parse's 20m spacing and draped with an injected
-elevation sampler -- the same resample/smooth/climb math gpx_parse already
-applies to uploaded GPX, reused here instead of duplicated.
+amenity nodes snapped onto their nearest edge by splitting it, so an amenity
+is a real traversable node. Edges are way pieces between nodes, resampled to
+gpx_parse's 20m spacing and draped with an injected elevation sampler.
 
-Road comfort is deliberately NOT baked into an edge: only the static inputs
-(class, maxspeed, lanes, separation) are stored, and the tier itself is
-computed from the current preference profile at score time, exactly as
-runnability is computed from the current terrain model rather than stored.
-A preference edit changes future scores immediately, with no graph rebuild.
+Road comfort is not stored on an edge: only its static inputs are, and the
+tier is computed from the current preference profile at score time, so a
+preference edit changes future scores with no graph rebuild.
 
-Rebuilt wholesale per area, gated by NETWORK_DERIVE_VERSION the same way
-ROUTE_DERIVE_VERSION gates routes.py (areas.rebuild_stale_network starts the
-rebuild) -- ground truth is the raw tile payloads (owned by area import), not
-this module's tables.
+Rebuilt wholesale per area, gated by NETWORK_DERIVE_VERSION; the raw tile
+payloads (owned by area import) are the ground truth, not these tables.
 """
 
 import copy
@@ -38,18 +31,18 @@ from .elevation import ElevationSampler
 
 NETWORK_DERIVE_VERSION = 6
 
-# Trails/paths a runner can be on but that carry no vehicle traffic -- no
-# road-comfort tier applies, only proximity to a major road alongside them.
+# Paths with no vehicle traffic: no road-comfort tier, only proximity to a
+# major road alongside.
 TRAIL_HIGHWAYS = frozenset({"path", "footway", "bridleway", "steps", "cycleway"})
 
-# Drivable classes that stay in the routing graph and get a road-comfort tier.
+# Drivable classes kept in the routing graph, each with a road-comfort tier.
 ROAD_LIKE_HIGHWAYS = frozenset(
     {"secondary", "secondary_link", "tertiary", "tertiary_link", "unclassified",
      "residential", "living_street", "service", "road", "track"}
 )
 
-# Classes fast/major enough that a runner shouldn't be routed onto them at
-# all; kept only as geometry for the proximity-to-a-major-road edge attribute.
+# Too fast to route a runner onto; kept only as geometry for the
+# proximity-to-a-major-road attribute.
 EXCLUDED_ROUTING_HIGHWAY_CLASSES = frozenset(
     {"motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"}
 )
@@ -83,20 +76,15 @@ DEFAULT_MAXSPEED_MPH_BY_CLASS: dict[str, float] = {
     "service": 15.0, "track": 15.0, "road": 25.0,
 }
 
-# A trail counts as "alongside" a major road, and water/toilets count as
-# "nearby" an edge, only within these fixed search radii -- generous enough
-# to catch a parallel frontage path or a trailhead privy without matching
-# every amenity in the tile.
+# Search radii for "alongside a major road" and "amenity nearby an edge".
 MAJOR_ROAD_PROXIMITY_RADIUS_M = 500.0
 NEARBY_AMENITY_RADIUS_M = 400.0
 AMENITY_SNAP_RADIUS_M = 300.0
 
 _SEGMENT_LEN_M = gpx_parse.RESAMPLE_SPACING_M
 
-# Grade thresholds (percent) for the default runnability scorer. An
-# athlete-calibrated scorer (the terrain model, injected the same way) is
-# expected to replace this for real use; these fixed bands only need to be
-# reasonable enough for tests and standalone scoring.
+# Grade thresholds (percent) for the default runnability scorer; the
+# terrain model's athlete-calibrated scorer replaces it in real use.
 HIKE_ONSET_PCT = 15.0
 GRIND_ONSET_PCT = 8.0
 STEEP_DESCENT_PCT = -15.0
@@ -205,11 +193,7 @@ def init_network_schema(conn: sqlite3.Connection) -> None:
         )
     """)
     # kind: 'junction' | 'endpoint' | 'trailhead' | 'parking' | 'drinking_water' |
-    # 'toilets' | 'start' (a route search's own query-time start point --
-    # never persisted, only used in an in-memory graph). An amenity is
-    # spliced into the edge it's nearest to (splitting that edge, see
-    # split_edge_row) rather than annotated onto it, so it's a normal,
-    # traversable node like any junction.
+    # 'toilets' | 'start' (a search's query-time start; in-memory graphs only).
     conn.execute("""
         CREATE TABLE IF NOT EXISTS net_nodes (
             node_id         INTEGER PRIMARY KEY,
@@ -224,10 +208,8 @@ def init_network_schema(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_net_nodes_area ON net_nodes(area_id)")
     # points_blob: packed (lat, lng, dist_m, ele_m) doubles at 20m spacing,
-    # forward direction only (from_node -> to_node); ele_m is NaN when the
-    # edge has no elevation. The backward profile is the same points in
-    # reverse with distance re-based and grade sign flipped -- scoring
-    # derives it on the fly rather than storing a mirrored copy.
+    # from_node -> to_node only; ele_m is NaN without elevation. The backward
+    # profile is derived at scoring time.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS net_edges (
             edge_id                 INTEGER PRIMARY KEY,
@@ -263,8 +245,7 @@ def init_network_schema(conn: sqlite3.Connection) -> None:
             updated_at   TEXT NOT NULL
         )
     """)
-    # Athlete judgment on a specific OSM way, never derived -- survives a
-    # network rebuild (keyed by way_id, not edge_id, which is rebuilt).
+    # Athlete judgment, never derived; keyed by way_id so it survives a rebuild.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS net_way_overrides (
             way_id     INTEGER PRIMARY KEY,
@@ -387,9 +368,7 @@ def avoided_way_ids(conn: sqlite3.Connection) -> set[int]:
 
 
 def default_runnability_scorer(grades_pct: Sequence[float]) -> RunnabilityResult:
-    """Fixed-threshold runnability, for tests and standalone use. Real
-    scoring is expected to inject the athlete's own terrain-model thresholds
-    through the same callable shape."""
+    """Fixed-threshold runnability, for tests and standalone use."""
     n = len(grades_pct)
     if n == 0:
         return {"run_pct": 0.0, "grind_pct": 0.0, "hike_pct": 0.0, "longest_hike_m": 0.0, "steep_descent_m": 0.0}
@@ -465,26 +444,21 @@ def _surface_class(highway: str, tags: dict) -> str:
     if highway in TRAIL_HIGHWAYS:
         return "paved" if surface in PAVED_SURFACE_VALUES else "trail"
     if highway == "track":
-        # tracktype grades a track's condition (grade1 solid .. grade5 soft)
-        # but OSM has no tracktype value that implies a hard surface, so it
-        # never upgrades a track past "unpaved road" on its own.
+        # No tracktype value implies a hard surface, so it never upgrades a
+        # track past "unpaved road".
         return "paved" if surface in PAVED_SURFACE_VALUES else "unpaved_road"
     return "unpaved_road" if surface in UNPAVED_SURFACE_VALUES else "paved"
 
 
-# footway is OSM's catch-all for both a genuine natural-surface trail and a
-# street's sidewalk or crossing -- these tag values, on the footway itself,
-# say outright which one it is.
+# footway covers both trails and street sidewalks/crossings; these values
+# on the footway say which.
 _SIDEWALK_FOOTWAY_SUBTAGS = frozenset({"sidewalk", "crossing", "traffic_island"})
 
-# A sidewalk running alongside a street sits within about this many meters
-# of the road's own centerline -- comfortably wider than a typical
-# curb-to-centerline offset, tight enough that a trail crossing a road
-# briefly, rather than paralleling it, doesn't get swept in.
+# A sidewalk sits within about this many meters of its road's centerline:
+# wider than a curb offset, too tight to sweep in a trail that merely crosses.
 SIDEWALK_ROAD_PROXIMITY_M = 25.0
-# Share of an untagged footway's own points that must sit within
-# SIDEWALK_ROAD_PROXIMITY_M of a road-like way before it's treated as that
-# road's sidewalk rather than a genuine trail.
+# Share of an untagged footway's points within SIDEWALK_ROAD_PROXIMITY_M of a
+# road-like way for it to count as that road's sidewalk.
 SIDEWALK_ROAD_COVERAGE = 0.8
 
 
@@ -497,12 +471,9 @@ def _is_tagged_sidewalk(tags: dict) -> bool:
 
 
 def _is_geometric_sidewalk(points: list[tuple[float, float]], road_index: routes_spatial.NearestIndex) -> bool:
-    """Fallback for an untagged footway: alongside a road-like way closely
-    and consistently enough (most of its own points within
-    SIDEWALK_ROAD_PROXIMITY_M) to be that road's sidewalk rather than a
-    standalone trail. Resamples its own raw points first -- OSM nodes on a
-    straight stretch can be far enough apart that checking only those would
-    miss the road running the whole way between them."""
+    """Fallback for an untagged footway: close to a road-like way along most of
+    its length. Resamples first, since OSM nodes on a straight stretch can be
+    far enough apart to miss a road running between them."""
     if len(points) < 2:
         return False
     sample_points = _resample([(lat, lng, None) for lat, lng in points])[0]
@@ -510,11 +481,9 @@ def _is_geometric_sidewalk(points: list[tuple[float, float]], road_index: routes
     return close / len(sample_points) >= SIDEWALK_ROAD_COVERAGE
 
 
-# highway classes a drive-to start candidate counts as "on a trail" for --
-# narrower than TRAIL_HIGHWAYS (drops cycleway/steps, adds track, which
-# surface_class only reports as unpaved_road) since a runner reaching a
-# candidate on foot cares about the tread, not the road-comfort graph. A
-# footway classified as a sidewalk is excluded either way.
+# Classes a drive-to start counts as "on a trail": narrower than
+# TRAIL_HIGHWAYS (no cycleway/steps; track, which surface_class reports as
+# unpaved_road). A sidewalk footway is excluded either way.
 TRAIL_CLASS_HIGHWAYS = frozenset({"path", "footway", "track", "bridleway"})
 
 
@@ -678,47 +647,36 @@ def _nearest_within(index: routes_spatial.NearestIndex, seg_points: list[tuple[f
 
 
 # ---------------------------------------------------------------------------
-# Edge splitting -- amenity nodes at build time, a search's own start point
-# at query time
+# Edge splitting
 # ---------------------------------------------------------------------------
 
-# A snap point closer than this to either end of its edge reuses that end's
-# existing node rather than cutting a near-zero-length edge for it.
+# A snap point this close to an edge end reuses that end's node.
 MIN_SPLIT_CLEARANCE_M = 1.0
 
-# An amenity closer than this to the point it snapped onto is treated as
-# sitting directly on the network. Farther than that, moving it onto the
-# snap point would silently absorb a real, walkable gap (a parking lot set
-# back from the trail) into nothing -- instead a plain junction goes at the
-# snap point and the amenity keeps its own surveyed position, joined by a
-# straight-line access edge, so that distance is still counted by anything
-# that scores or measures a path through it.
+# An amenity closer than this to its snap point sits on the network. Farther
+# out, a junction goes at the snap point and the amenity keeps its surveyed
+# position behind a straight-line access edge, so the walkable gap still
+# counts in any path measure.
 ACCESS_SPUR_MIN_M = 5.0
 ACCESS_EDGE_HIGHWAY = "footway"
 # Surface class of an access spur: a connector, not trail mileage.
 ACCESS_EDGE_SURFACE_CLASS = "connector"
 
-# An amenity's id is its OSM node id, or the negated way id for one mapped as
-# an outline, so both signs are in use and a plain negation can land on a
-# real node or on another amenity. The synthetic junction an access spur
-# hangs from, and the spur's own way id, sit this far below that range: far
-# beyond any OSM id, and unique per amenity.
+# Amenity ids are OSM node ids or negated way ids, so both signs are in use.
+# Synthetic junction and spur way ids sit this far below that range.
 SYNTHETIC_ID_BASE = -(1 << 62)
 
 
 def synthetic_id_for(amenity_osm_id: int) -> int:
     """The osm_node_id of the junction an amenity's access spur attaches to,
-    also used as that spur's way_id. Always negative, and disjoint from every
-    real node id and every amenity id."""
+    also used as that spur's way_id."""
     return SYNTHETIC_ID_BASE + amenity_osm_id
 
 
 class EdgeSplit(TypedDict):
-    """The two edge-row-shaped pieces produced by cutting an edge at
-    offset_m, plus the new node's position. Proximity/nearby-amenity fields
-    carry over from the parent edge unchanged rather than being re-derived
-    per piece -- those are already approximate, and a tile refresh rebuilds
-    the whole area's graph regardless."""
+    """The two edge-row-shaped pieces from cutting an edge at offset_m, plus the
+    new node's position. Proximity/nearby-amenity fields carry over from the
+    parent edge; they are approximate and a rebuild recomputes them."""
     before: dict
     after: dict
     node_lat: float
@@ -726,16 +684,11 @@ class EdgeSplit(TypedDict):
 
 
 def split_edge_row(row: dict, offset_m: float) -> EdgeSplit | None:
-    """Cut an edge-row-shaped mapping (anything answering row["field"] for
-    the net_edges columns) into two pieces at offset_m along its forward
-    direction, re-deriving gain/loss for each piece from
-    its own slice of the parent's draped points. Returns None when offset_m
-    doesn't leave both pieces at least MIN_SPLIT_CLEARANCE_M long.
-
-    Used both to splice a trailhead/parking node into the graph build_network
-    writes and, unpersisted, to splice a route search's own start point into
-    an in-memory graph at query time.
-    """
+    """Cut an edge-row-shaped mapping (anything answering row["field"] for the
+    net_edges columns) at offset_m along its forward direction, re-deriving
+    gain/loss per piece. None when either piece would be under
+    MIN_SPLIT_CLEARANCE_M. Used at build time for amenities and, unpersisted,
+    for a search's own start point."""
     length_m = row["length_m"]
     if offset_m < MIN_SPLIT_CLEARANCE_M or offset_m > length_m - MIN_SPLIT_CLEARANCE_M:
         return None
@@ -790,9 +743,9 @@ def split_edge_row(row: dict, offset_m: float) -> EdgeSplit | None:
 
 @dataclass(frozen=True)
 class EdgeCut:
-    """Where splice_at snapped a point. split is None when the snap offset
-    leaves a piece shorter than MIN_SPLIT_CLEARANCE_M (nothing was changed
-    then); otherwise the pieces are in rows under before_key and after_key."""
+    """Where splice_at snapped a point. split is None when a piece would be too
+    short (nothing changed); otherwise the pieces are in rows under before_key
+    and after_key."""
     edge_key: int
     row: dict
     offset_m: float
@@ -811,13 +764,11 @@ def splice_at(
     *,
     clamp: bool = False,
 ) -> EdgeCut | None:
-    """Snap (lat, lng) onto the nearest edge of index within radius_m and cut
-    that edge there. The two pieces are added to rows under fresh ids drawn
-    from ids and replace the original in index, so a later point on the same
-    edge snaps onto the right piece; the original row stays in rows for the
-    caller to drop. clamp moves the cut off an edge's ends and so keeps
-    every piece at least MIN_SPLIT_CLEARANCE_M long. Returns None when
-    nothing is within radius_m."""
+    """Snap (lat, lng) onto the nearest edge of index within radius_m and cut it
+    there. The pieces are added to rows under fresh ids from ids and replace
+    the original in index; the original row stays in rows for the caller to
+    drop. clamp moves the cut off an edge's ends. None when nothing is within
+    radius_m."""
     found = index.nearest(lat, lng, radius_m)
     if found is None:
         return None
@@ -858,10 +809,9 @@ def _edge_row(
     raw_points: list[gpx_parse.GpxPoint],
     attrs: Mapping[str, object],
 ) -> dict | None:
-    """An edge-row-shaped dict between two OSM node ids, resampled to
-    gpx_parse's spacing and draped over the elevation cache; None for a
-    zero-length piece. attrs holds the way-level columns (way_id, highway
-    and surface_class at least) over _DEFAULT_EDGE_ATTRS."""
+    """An edge-row-shaped dict between two OSM node ids, resampled and draped;
+    None for a zero-length piece. attrs holds the way-level columns (way_id,
+    highway and surface_class at least) over _DEFAULT_EDGE_ATTRS."""
     latlng, dist, length_m = _resample(raw_points)
     if length_m <= 0:
         return None
@@ -897,9 +847,8 @@ def build_network(
     payloads: Iterable[dict],
     sampler: ElevationSampler,
 ) -> NetworkStats:
-    """Rebuild an area's graph wholesale from raw tile payloads, in one
-    transaction: a failure rolls back to the previous graph, never a
-    half-built one."""
+    """Rebuild an area's graph wholesale from raw tile payloads in one
+    transaction; a failure rolls back to the previous graph."""
     try:
         return _build_network(conn, area_id, payloads, sampler)
     except BaseException:
@@ -913,8 +862,8 @@ def _build_network(
     payloads: Iterable[dict],
     sampler: ElevationSampler,
 ) -> NetworkStats:
-    """Tiles overlap at edges, so a way can appear verbatim in more than one
-    payload; ways are deduped by their OSM id before anything else runs."""
+    """Tiles overlap, so a way can appear in several payloads; ways are deduped
+    by OSM id first."""
     ways: dict[int, dict] = {}
     node_coords: dict[int, tuple[float, float]] = {}
     amenity_nodes: dict[int, tuple[str, float, float, str | None]] = {}
@@ -940,9 +889,8 @@ def _build_network(
                     if kind is not None:
                         amenity_nodes.setdefault(node_id, (kind, lat, lon, tags.get("name")))
 
-    # "out geom" payloads carry node ids and geometry in parallel arrays on
-    # the way itself; harvest coordinates from there too so a node-id-only
-    # lookup below works regardless of which payload style produced it.
+    # "out geom" payloads carry node ids and geometry as parallel arrays on the
+    # way; harvest coordinates from there too.
     for way in ways.values():
         geom = way.get("geometry")
         node_ids = way.get("nodes") or []
@@ -987,8 +935,7 @@ def _build_network(
         graph_node_ids.add(node_ids[0])
         graph_node_ids.add(node_ids[-1])
 
-    # The graph is assembled in memory, keyed by OSM node id, and written in
-    # one short transaction at the end.
+    # Assembled in memory by OSM node id, written in one short transaction.
     nodes: dict[int, dict] = {}
 
     def ensure_node(osm_node_id: int, lat: float, lng: float) -> None:
@@ -1004,9 +951,7 @@ def _build_network(
         [(lat, lng) for kind, lat, lng, _name in amenity_nodes.values() if kind == "toilets"], NEARBY_AMENITY_RADIUS_M
     )
 
-    # Resampled to the same ~20m spacing edges get, not the raw way points --
-    # OSM nodes on an ordinary street can be 100m+ apart (only where it
-    # bends or meets another way), which would miss most of a sidewalk
+    # Resampled: street nodes can be 100m+ apart, which would miss a sidewalk
     # running between two of them.
     road_points: list[tuple[float, float]] = []
     for way in ways.values():
@@ -1038,9 +983,7 @@ def _build_network(
 
         is_road_like = highway in ROAD_LIKE_HIGHWAYS
         surface_class = _surface_class(highway, tags)
-        # A sidewalk is paved as often as not -- check regardless of the
-        # surface-derived class, not just the ones that would otherwise read
-        # as an unpaved trail.
+        # Checked whatever the surface class says: sidewalks are often paved.
         if highway == "footway" and (_is_tagged_sidewalk(tags) or _is_geometric_sidewalk(points, road_index)):
             surface_class = "sidewalk"
         way_attrs: dict[str, object] = {
@@ -1078,10 +1021,9 @@ def _build_network(
             index_edge(edge_index, edge_key, row["points_blob"])
             edges[edge_key] = row
 
-    # An amenity whose own OSM node is already a routing node (a trailhead or
-    # parking tag sitting on a way junction or endpoint) is that node:
-    # promote its kind so it's findable as a drive-to start, and never cut an
-    # edge for it -- that would split off a self-loop at the node.
+    # An amenity whose OSM node is already a routing node is that node: promote
+    # its kind so it is findable as a drive-to start, and cut no edge for it
+    # (that would split off a self-loop).
     resolved: set[int] = set()
     for osm_id, (kind, _lat, _lng, name) in amenity_nodes.items():
         routing_node = nodes.get(osm_id)
@@ -1093,13 +1035,9 @@ def _build_network(
                 routing_node["name"] = name
         resolved.add(osm_id)
 
-    # Splicing an amenity into its nearest edge makes it a real, traversable
-    # node instead of a sidecar (edge, offset) annotation -- a search can
-    # start or end a path at a trailhead the same way it does at any
-    # junction. An amenity that resolves onto an existing node, or has no
-    # edge to join, is added below with its own surveyed position. Each cut
-    # replaces its edge in the index, so a later amenity on the same edge
-    # snaps onto the right piece.
+    # Each cut replaces its edge in the index, so a later amenity on the same
+    # edge snaps onto the right piece. Amenities that resolve onto an existing
+    # node or have no edge to join are added below at their surveyed position.
     for osm_id, (kind, amenity_lat, amenity_lng, name) in amenity_nodes.items():
         if osm_id in resolved:
             continue
@@ -1108,19 +1046,16 @@ def _build_network(
             continue
         resolved.add(osm_id)
         if cut.split is None:
-            # Too short to cut meaningfully: the amenity just uses whichever
-            # existing node is closer.
+            # Too short to cut: the amenity uses the closer existing node.
             continue
         snap_ll = (cut.split["node_lat"], cut.split["node_lng"])
         if routes_spatial.equirect_distance_m(amenity_lat, amenity_lng, *snap_ll) < ACCESS_SPUR_MIN_M:
             on_edge_osm = osm_id
             nodes[osm_id] = {"kind": kind, "name": name, "lat": snap_ll[0], "lng": snap_ll[1]}
         else:
-            # The plain junction the amenity attaches to gets a synthetic
-            # osm_node_id; the amenity's own node keeps the surveyed
-            # position. The unmapped walk between them is a straight line,
-            # resampled and draped like any edge so that a path through it
-            # doesn't read as partial elevation coverage.
+            # The junction gets a synthetic osm_node_id; the amenity keeps its
+            # surveyed position. The straight-line spur is draped like any
+            # edge so a path through it doesn't read as partial elevation.
             on_edge_osm = synthetic_id_for(osm_id)
             nodes[on_edge_osm] = {"kind": "junction", "name": None, "lat": snap_ll[0], "lng": snap_ll[1]}
             nodes[osm_id] = {"kind": kind, "name": name, "lat": amenity_lat, "lng": amenity_lng}
@@ -1161,8 +1096,7 @@ _EDGE_COLUMNS = (
 def _replace_area_graph(
     conn: sqlite3.Connection, area_id: int, nodes: dict[int, dict], edges: list[dict], excluded_count: int
 ) -> None:
-    """Swap an area's nodes and edges (keyed by OSM node id) for the given
-    ones and commit, in one short transaction."""
+    """Swap an area's nodes and edges for the given ones and commit."""
     conn.execute("DELETE FROM net_edges WHERE area_id = ?", [area_id])
     conn.execute("DELETE FROM net_nodes WHERE area_id = ?", [area_id])
     first_id = conn.execute("SELECT COALESCE(MAX(node_id), 0) + 1 FROM net_nodes").fetchone()[0]
@@ -1202,10 +1136,9 @@ def _replace_area_graph(
 def _road_exposure(
     entries: list[tuple[str | None, float, int | None]], max_uncomfortable_m: float
 ) -> RoadExposure:
-    """Stateful contiguous-uncomfortable-road tracking: a run only ends when
-    a non-uncomfortable edge (comfortable, tolerable, or trail/off-road)
-    breaks it, so two short uncomfortable stretches split by anything else
-    are two runs, not one summed cost."""
+    """Contiguous-uncomfortable-road tracking: a run ends only at a
+    non-uncomfortable edge, so two stretches split by anything else are two
+    runs, not one summed cost."""
     totals: dict[str, float] = {"comfortable": 0.0, "tolerable": 0.0, "uncomfortable": 0.0}
     violations: list[RoadExposureViolation] = []
     avoided_ways: set[int] = set()
@@ -1251,12 +1184,8 @@ def score_path(
     extra_edges: Mapping[int, dict] | None = None,
 ) -> PathScore:
     """extra_edges supplies edge-row-shaped mappings consulted before the
-    database -- both for ids that don't exist in net_edges (a route search's
-    own start point is spliced into its in-memory graph via split_edge_row
-    rather than persisted, so its synthetic edges need somewhere to be
-    scored from) and, when a caller already holds an area's edges in memory
-    (a route search's per-attempt scoring), as a way to skip the query
-    entirely rather than round-tripping the same rows over and over."""
+    database: for ids absent from net_edges (a search's spliced start point)
+    and to skip the query when the caller already holds the edges."""
     if not edge_sequence:
         raise ValueError("edge_sequence must have at least one edge")
 
