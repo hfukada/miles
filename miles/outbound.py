@@ -6,23 +6,21 @@ limits. A process that downloads, imports, or spends Strava calls first takes
 an exclusive lock on a file beside the database; the OS releases it on any
 exit, so a crash leaves no stale claim.
 
-The claimant is the only process that runs jobs, so any job row still marked
-running was cut short and is marked interrupted.
+The claimant is the only process that runs jobs, so any area still marked
+importing was cut short and is marked interrupted.
 """
 
 import fcntl
 import os
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
 import click
 
-from . import db
+from . import db, events
 
-# Recorded on a job found running at startup; the health check does not flag these.
+# Recorded on an area found importing at startup; the health check does not flag these.
 IMPORT_INTERRUPTED_ERROR = "import interrupted; run it again"
-BACKFILL_INTERRUPTED_ERROR = "interrupted; run it again"
 
 _held: dict[Path, TextIO] = {}
 
@@ -36,8 +34,9 @@ def lock_path() -> Path:
 
 
 def claim() -> None:
-    """Take this database's outbound lock for the life of the process and mark
-    interrupted jobs. Idempotent within a process. Raises OutboundBusyError
+    """Take this database's outbound lock for the life of the process, mark
+    interrupted jobs, and record the process's outbound requests in the
+    database's ledger. Idempotent within a process. Raises OutboundBusyError
     when another process holds the lock."""
     path = lock_path()
     if path in _held:
@@ -72,11 +71,5 @@ def claim() -> None:
             "UPDATE areas SET status = 'error', status_error = ? WHERE status = 'importing'",
             (IMPORT_INTERRUPTED_ERROR,),
         )
-        conn.execute(
-            """
-            UPDATE terrain_backfill_status SET status = 'error', phase = 'error', error = ?, finished_at = ?
-            WHERE id = 1 AND status = 'running'
-            """,
-            (BACKFILL_INTERRUPTED_ERROR, datetime.now(timezone.utc).isoformat()),
-        )
         conn.commit()
+    events.install()

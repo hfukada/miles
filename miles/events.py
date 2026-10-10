@@ -11,8 +11,8 @@ recorded there rather than in process memory:
   pruned after EVENT_RETENTION_DAYS.
 - a `meta` key holding the Strava allowance last seen.
 
-Recording is opt-in: an entry point calls install(), which hooks http_client
-and strava_client.
+Recording is opt-in: outbound.claim() calls install(), which hooks http_client
+and strava_client, so exactly the processes that make outbound calls record.
 """
 
 import json

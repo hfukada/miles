@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from helpers import FakeResponse, fake_extract_record, write_pbf
+from helpers import FakeResponse, fake_extract_record, region_feature, region_polygon, write_pbf
 
 from miles import db, extracts, metrics, tilecache, tiles
 
@@ -271,6 +271,25 @@ def test_a_304_keeps_the_file_and_only_moves_checked_at(conn: sqlite3.Connection
     assert after["checked_at"] > before["checked_at"]
 
 
+def test_a_failed_refresh_keeps_the_registered_file_but_a_forced_download_reports_the_failure(
+    conn: sqlite3.Connection, sample_pbf: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _register_downloaded(conn, sample_pbf)
+    _set_times(conn, "test/sample", fetched_days_ago=30)
+
+    def fail(url: str, dest: Path, validators: dict, **kw):
+        raise extracts.ExtractDownloadError("geofabrik is down")
+
+    monkeypatch.setattr(extracts, "_download_with_backoff", fail)
+
+    before = extracts.get_extract(conn, "test/sample")
+    assert extracts.download_extract(conn, "test/sample", refresh=True) == before
+    with pytest.raises(extracts.ExtractDownloadError, match="geofabrik is down"):
+        extracts.download_extract(conn, "test/sample", force=True)
+    with pytest.raises(extracts.ExtractDownloadError, match="geofabrik is down"):
+        extracts.download_extract(conn, "test/other", refresh=True)
+
+
 def _serve(monkeypatch: pytest.MonkeyPatch, body: bytes, *, md5: str | None = None, headers: dict | None = None, send: int | None = None) -> list:
     """Stand in for http_client.request: the pbf URL gets body, its .md5 the
     published digest."""
@@ -360,13 +379,11 @@ def test_a_size_over_the_cap_is_refused_whether_declared_or_only_seen_while_stre
     assert list(tmp_path.iterdir()) == []
 
 
-@pytest.mark.parametrize("override", ["argument", "env"])
-def test_the_size_cap_can_be_overridden(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, override: str):
+def test_the_size_cap_can_be_overridden(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(extracts, "EXTRACT_MAX_BYTES", 3)
     _serve(monkeypatch, b"data")
-    if override == "env":
-        monkeypatch.setenv(extracts.ALLOW_LARGE_ENV, "1")
-    extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {}, allow_large=override == "argument")
+    monkeypatch.setenv(extracts.ALLOW_LARGE_ENV, "1")
+    extracts._download_with_backoff("http://x/y.pbf", tmp_path / "y.pbf", {})
     assert (tmp_path / "y.pbf").read_bytes() == b"data"
 
 
@@ -599,22 +616,13 @@ BORDER_LNG = 0.05
 STRADDLING_BBOX = (0.0, 0.0, 0.049, 0.095)
 
 
-def _region_feature(path: str, south: float, west: float, north: float, east: float) -> dict:
-    ring = [[west, south], [east, south], [east, north], [west, north], [west, south]]
-    return {
-        "type": "Feature",
-        "properties": {"urls": {"pbf": f"https://download.example.test/{path}-latest.osm.pbf"}},
-        "geometry": {"type": "Polygon", "coordinates": [ring]},
-    }
-
-
 def _border_index() -> bytes:
     return json.dumps({
         "type": "FeatureCollection",
         "features": [
-            _region_feature("example/parent", -1, -1, 1, 5),
-            _region_feature("example/parent/region-a", -1, -1, 1, BORDER_LNG),
-            _region_feature("example/parent/region-b", -1, BORDER_LNG, 1, 1),
+            region_feature("example/parent", region_polygon(-1, -1, 1, 5)),
+            region_feature("example/parent/region-a", region_polygon(-1, -1, 1, BORDER_LNG)),
+            region_feature("example/parent/region-b", region_polygon(-1, BORDER_LNG, 1, 1)),
         ],
     }).encode()
 

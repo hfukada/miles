@@ -61,6 +61,15 @@ def _gauge(name: str, help_text: str, value: float | None) -> Iterator[GaugeMetr
         yield family
 
 
+# (series, help, meta key, parser) for the last sync's outcome.
+_SYNC_GAUGES: tuple[tuple[str, str, str, Callable[[str], float]], ...] = (
+    ("miles_sync_last_success_timestamp_seconds", "Unix time of the last successful sync.", sync.META_LAST_SUCCESS, _timestamp),
+    ("miles_sync_last_failure_timestamp_seconds", "Unix time of the last failed sync.", sync.META_LAST_FAILURE, _timestamp),
+    ("miles_sync_last_duration_seconds", "Duration of the last successful sync.", sync.META_LAST_DURATION, float),
+    ("miles_sync_last_new_activities", "Activities fetched by the last successful sync.", sync.META_LAST_NEW, float),
+)
+
+
 class DatabaseCollector(Collector):
     """Series read from the database at scrape time, so they describe work done
     by any process (the sync CLI included), unlike the in-process counters."""
@@ -74,22 +83,8 @@ class DatabaseCollector(Collector):
 
     @staticmethod
     def _collect(conn: sqlite3.Connection) -> Iterator[Metric]:
-        yield from _gauge(
-            "miles_sync_last_success_timestamp_seconds", "Unix time of the last successful sync.",
-            _parsed_meta(conn, sync.META_LAST_SUCCESS, _timestamp),
-        )
-        yield from _gauge(
-            "miles_sync_last_failure_timestamp_seconds", "Unix time of the last failed sync.",
-            _parsed_meta(conn, sync.META_LAST_FAILURE, _timestamp),
-        )
-        yield from _gauge(
-            "miles_sync_last_duration_seconds", "Duration of the last successful sync.",
-            _parsed_meta(conn, sync.META_LAST_DURATION, float),
-        )
-        yield from _gauge(
-            "miles_sync_last_new_activities", "Activities fetched by the last successful sync.",
-            _parsed_meta(conn, sync.META_LAST_NEW, float),
-        )
+        for name, help_text, key, parse in _SYNC_GAUGES:
+            yield from _gauge(name, help_text, _parsed_meta(conn, key, parse))
 
         outbound = CounterMetricFamily(
             "miles_outbound_requests",
@@ -121,14 +116,6 @@ class DatabaseCollector(Collector):
 
 
 metrics.REGISTRY.register(DatabaseCollector())
-
-
-@router.get("/api/outbound")
-def get_outbound(days: int = 30) -> list[dict[str, object]]:
-    """Per-day counts of outbound requests by service, host, endpoint kind,
-    and status over the last `days` days."""
-    with db.connection() as conn:
-        return events.daily_counts(conn, days)
 
 
 @router.get("/metrics")

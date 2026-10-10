@@ -1,60 +1,13 @@
 import itertools
 import json
+import math
 import sqlite3
 import threading
 import time
 import pytest
-from helpers import ImmediateThread, climbing_sampler, node, none_sampler, way
+from helpers import FakeSampler, ImmediateThread, WayBuilder, climbing_sampler, lerp, none_sampler
 
 from miles import areas, network, route_search, routes as routes_service
-
-
-def _interp(a: tuple[float, float], b: tuple[float, float], t: float) -> tuple[float, float]:
-    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
-
-
-class _IdAllocator:
-    def __init__(self, start: int) -> None:
-        self._n = start
-
-    def __call__(self) -> int:
-        self._n += 1
-        return self._n
-
-
-def _add_segmented_edge(
-    nodes_out: list[dict],
-    ways_out: list[dict],
-    node_ids: _IdAllocator,
-    way_ids: _IdAllocator,
-    a_id: int,
-    a_ll: tuple[float, float],
-    b_id: int,
-    b_ll: tuple[float, float],
-    segments: int,
-    highway: str,
-    tags: dict | None = None,
-) -> int:
-    """segments separate 2-node ways from a to b via fresh intermediate
-    nodes -- each intermediate is shared by exactly two ways, so
-    build_network's junction detection naturally splits every segment into
-    its own edge, rather than treating the whole span as one long way.
-    Returns the way_id used for the *first* segment (the rest follow it)."""
-    prev_id = a_id
-    first_way_id: int | None = None
-    for i in range(1, segments + 1):
-        if i < segments:
-            nid = node_ids()
-            nodes_out.append(node(nid, *_interp(a_ll, b_ll, i / segments)))
-        else:
-            nid = b_id
-        wid = way_ids()
-        if first_way_id is None:
-            first_way_id = wid
-        ways_out.append(way(wid, [prev_id, nid], dict(tags or {}, highway=highway)))
-        prev_id = nid
-    assert first_way_id is not None
-    return first_way_id
 
 
 # A diamond-shaped trail ring (corners N/E/S/W, each side split into six
@@ -72,60 +25,30 @@ BUSY_WAY_TAGS = {"name": "Busy Rd", "maxspeed": "50 mph"}
 QUIET_WAY_TAGS = {"name": "Quiet Rd"}
 
 
-def _ring_elements(node_ids: _IdAllocator, way_ids: _IdAllocator) -> tuple[list[dict], list[dict]]:
+def _add_ring(builder: WayBuilder) -> None:
     """The diamond's perimeter: four corners joined by six-segment trail sides."""
-    nodes: list[dict] = [node(N_ID, *N_LL), node(E_ID, *E_LL), node(S_ID, *S_LL), node(W_ID, *W_LL)]
-    ways: list[dict] = []
+    for node_id, ll in ((N_ID, N_LL), (E_ID, E_LL), (S_ID, S_LL), (W_ID, W_LL)):
+        builder.node(*ll, node_id=node_id)
     for a_id, a_ll, b_id, b_ll in [(N_ID, N_LL, E_ID, E_LL), (E_ID, E_LL, S_ID, S_LL), (S_ID, S_LL, W_ID, W_LL), (W_ID, W_LL, N_ID, N_LL)]:
-        _add_segmented_edge(nodes, ways, node_ids, way_ids, a_id, a_ll, b_id, b_ll, segments=6, highway="path")
-    return nodes, ways
-
-
-def _add_single_way_path(
-    nodes_out: list[dict],
-    ways_out: list[dict],
-    node_ids: _IdAllocator,
-    way_id: int,
-    a_id: int,
-    a_ll: tuple[float, float],
-    b_id: int,
-    b_ll: tuple[float, float],
-    waypoints: int,
-    highway: str,
-    tags: dict | None = None,
-) -> None:
-    """One way from a to b with `waypoints` interior points that belong to
-    no other way -- geometry only, not a junction, so this stays a single
-    edge regardless of how many points shape it."""
-    node_seq = [a_id]
-    for i in range(1, waypoints + 1):
-        nid = node_ids()
-        nodes_out.append(node(nid, *_interp(a_ll, b_ll, i / (waypoints + 1))))
-        node_seq.append(nid)
-    node_seq.append(b_id)
-    ways_out.append(way(way_id, node_seq, dict(tags or {}, highway=highway)))
+        builder.path(a_id, a_ll, b_id, b_ll, highway="path", pieces=6)
 
 
 def _build_diamond_area(conn: sqlite3.Connection, area_id: int = 1) -> dict[str, int]:
-    node_ids = _IdAllocator(100)
-    way_ids = _IdAllocator(0)
-    nodes, ways = _ring_elements(node_ids, way_ids)
+    builder = WayBuilder()
+    _add_ring(builder)
+    busy_way_id = builder.path(N_ID, N_LL, S_ID, S_LL, highway="secondary", tags=BUSY_WAY_TAGS, interior=2)
+    quiet_way_id = builder.path(E_ID, E_LL, W_ID, W_LL, highway="residential", tags=QUIET_WAY_TAGS, interior=1)
 
-    busy_way_id = way_ids()
-    _add_single_way_path(nodes, ways, node_ids, busy_way_id, N_ID, N_LL, S_ID, S_LL, waypoints=2, highway="secondary", tags=BUSY_WAY_TAGS)
-    quiet_way_id = way_ids()
-    _add_single_way_path(nodes, ways, node_ids, quiet_way_id, E_ID, E_LL, W_ID, W_LL, waypoints=1, highway="residential", tags=QUIET_WAY_TAGS)
-
-    stats = network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], none_sampler())
+    stats = network.build_network(conn, area_id, [{"elements": builder.elements}], none_sampler())
     assert stats["edge_count"] >= 24
     return {"busy_way_id": busy_way_id, "quiet_way_id": quiet_way_id}
 
 
-def _build_ring_area(conn: sqlite3.Connection, area_id: int = 4, sampler=None) -> tuple[list[dict], list[dict]]:
+def _build_ring_area(conn: sqlite3.Connection, area_id: int = 4, sampler=None) -> None:
     """Only the diamond's perimeter: exactly one loop exists, ridden either way."""
-    nodes, ways = _ring_elements(_IdAllocator(100), _IdAllocator(0))
-    network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], sampler or none_sampler())
-    return nodes, ways
+    builder = WayBuilder()
+    _add_ring(builder)
+    network.build_network(conn, area_id, [{"elements": builder.elements}], sampler or none_sampler())
 
 
 def _side_length_m(conn: sqlite3.Connection, area_id: int, way_id: int) -> float:
@@ -163,7 +86,7 @@ def _ring_points(conn: sqlite3.Connection) -> set[tuple[float, float]]:
 def _start_near_n() -> dict:
     # Partway along the first N->E segment, not exactly on any node -- a
     # search's own start point should splice a fresh node in here.
-    lat, lng = _interp(N_LL, E_LL, 1.0 / 12.0)
+    lat, lng = lerp(N_LL, E_LL, 1.0 / 12.0)
     return {"lat": lat, "lng": lng}
 
 
@@ -274,7 +197,7 @@ def test_diversify_returns_distinct_candidates_and_a_loop_ridden_in_either_direc
 def test_a_start_on_an_existing_degree_two_junction_survives_contraction(conn: sqlite3.Connection):
     _build_ring_area(conn)
     perimeter = conn.execute("SELECT SUM(length_m) FROM net_edges WHERE area_id = 4").fetchone()[0]
-    lat, lng = _interp(N_LL, E_LL, 1.0 / 6.0)  # exactly on the ring's first interior junction
+    lat, lng = lerp(N_LL, E_LL, 1.0 / 6.0)  # exactly on the ring's first interior junction
 
     result = route_search.find_routes(
         conn,
@@ -395,6 +318,21 @@ def test_save_route_candidate_creates_a_route_and_an_unknown_candidate_raises(co
         route_search.get_route_candidate(conn, "not-a-real-id")
 
 
+def test_a_candidates_gain_and_loss_match_the_route_saved_from_it(conn: sqlite3.Connection):
+    jittery = FakeSampler(lambda i, lat, lng: 100.0 + (lat - 40.0) * 20000.0 + 3.0 * math.sin(i * 1.7) + 2.0 * math.sin(lng * 2.0e5))
+    _build_ring_area(conn, sampler=jittery)
+    perimeter = _perimeter_length_m(conn, 4)
+    result = route_search.find_routes(conn, _base_request(4, perimeter * 0.8, perimeter * 1.2, n=1, shape="loop"))
+    candidate = result["candidates"][0]
+
+    saved = route_search.save_route_candidate(conn, candidate["candidate_id"], "Ring")
+    route = routes_service.get_route(conn, saved["route_id"])
+
+    assert candidate["score"]["gain_m"] > 0
+    assert route["gain_m"] == pytest.approx(candidate["score"]["gain_m"], rel=0.01)
+    assert route["loss_m"] == pytest.approx(candidate["score"]["loss_m"], rel=0.01)
+
+
 # ---------------------------------------------------------------------------
 # A dense street-grid network: every intersection has degree 4, so nothing
 # contracts away and a long loop needs many short blocks -- the shape that
@@ -405,24 +343,16 @@ def test_save_route_candidate_creates_a_route_and_an_unknown_candidate_raises(co
 
 
 def _build_grid_area(conn: sqlite3.Connection, size: int, step_deg: float, area_id: int) -> None:
-    node_ids = _IdAllocator(20_000)
-    way_ids = _IdAllocator(20_000)
-    nodes: list[dict] = []
-    ways: list[dict] = []
-    grid_ids: dict[tuple[int, int], int] = {}
-    for i in range(size):
-        for j in range(size):
-            nid = node_ids()
-            grid_ids[(i, j)] = nid
-            nodes.append(node(nid, 40.0 + i * step_deg, -105.0 + j * step_deg))
+    builder = WayBuilder(first_node_id=20_001, first_way_id=20_001)
+    grid_ids = {(i, j): builder.node(40.0 + i * step_deg, -105.0 + j * step_deg) for i in range(size) for j in range(size)}
     for i in range(size):
         for j in range(size):
             if i + 1 < size:
-                ways.append(way(way_ids(), [grid_ids[(i, j)], grid_ids[(i + 1, j)]], {"highway": "residential"}))
+                builder.way([grid_ids[(i, j)], grid_ids[(i + 1, j)]], {"highway": "residential"})
             if j + 1 < size:
-                ways.append(way(way_ids(), [grid_ids[(i, j)], grid_ids[(i, j + 1)]], {"highway": "residential"}))
+                builder.way([grid_ids[(i, j)], grid_ids[(i, j + 1)]], {"highway": "residential"})
 
-    stats = network.build_network(conn, area_id, [{"elements": [*nodes, *ways]}], none_sampler())
+    stats = network.build_network(conn, area_id, [{"elements": builder.elements}], none_sampler())
     assert stats["edge_count"] == 2 * size * (size - 1)
 
 
@@ -473,7 +403,7 @@ def test_search_refuses_a_graph_built_by_an_older_network_version(conn: sqlite3.
     monkeypatch.setattr(areas.threading, "Thread", ImmediateThread)
     monkeypatch.setattr(areas, "_run_finish_only_job", started.append)
 
-    with pytest.raises(route_search.AreaRebuildingError):
+    with pytest.raises(ValueError, match="being rebuilt"):
         route_search.find_routes(conn, _base_request(area_id, 1000.0, 2000.0))
     assert started == [area_id]
 
@@ -482,7 +412,7 @@ def test_search_refuses_a_graph_built_by_an_older_network_version(conn: sqlite3.
 def test_search_refuses_a_first_import_that_has_no_graph_yet_and_uses_a_committed_graph_during_a_refresh(conn: sqlite3.Connection, status: str):
     _insert_area_row(conn, status)
 
-    with pytest.raises(route_search.AreaNotReadyError, match="not ready"):
+    with pytest.raises(ValueError, match="not ready"):
         route_search.find_routes(conn, _base_request(1, 1000.0, 2000.0))
 
     _build_diamond_area(conn)
@@ -490,11 +420,12 @@ def test_search_refuses_a_first_import_that_has_no_graph_yet_and_uses_a_committe
 
 
 def test_a_search_from_a_set_back_trailhead_does_not_flag_its_access_spur_as_missing_elevation(conn: sqlite3.Connection):
-    nodes, ways = _ring_elements(_IdAllocator(100), _IdAllocator(0))
-    lot_lat, lot_lng = _interp(N_LL, E_LL, 0.5)
+    builder = WayBuilder()
+    _add_ring(builder)
+    lot_lat, lot_lng = lerp(N_LL, E_LL, 0.5)
     lot = (lot_lat + 0.0004, lot_lng)
-    nodes.append(node(9000, *lot, tags={"amenity": "parking"}))
-    network.build_network(conn, 6, [{"elements": [*nodes, *ways]}], climbing_sampler(2.0))
+    builder.node(*lot, tags={"amenity": "parking"}, node_id=9000)
+    network.build_network(conn, 6, [{"elements": builder.elements}], climbing_sampler(2.0))
     assert conn.execute("SELECT * FROM net_edges WHERE area_id = 6 AND way_id < 0").fetchone() is not None
 
     request = _base_request(6, 1000.0, 20000.0, starts=[{"lat": lot[0], "lng": lot[1]}], gain_m_min=0.0)

@@ -83,6 +83,7 @@ REFRESH_MARGIN_S = 300.0
 # RequestException too, and is handled before this tuple is consulted.
 _TRANSPORT_ERRORS = (requests.RequestException, urllib3.exceptions.HTTPError)
 
+# Length of Strava's short rate-limit window, in seconds.
 WINDOW_S = 900
 
 
@@ -103,7 +104,7 @@ _rate_lock = threading.Lock()
 STRAVA_HOST = "www.strava.com"
 
 # Called with (daily_remaining, short_window_remaining) after each response
-# that carried rate-limit headers; events.install() points it at the database.
+# that carried rate-limit headers; outbound.claim() points it at the database.
 rate_sink: Callable[[int, int], None] | None = None
 
 

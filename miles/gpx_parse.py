@@ -21,22 +21,13 @@ from xml.etree.ElementTree import Element, ParseError
 from .routes_spatial import equirect_distance_m
 
 # Elevation deltas smaller than this, measured from the last point that
-# itself cleared the threshold, are GPS/barometric noise rather than real
-# climb or descent -- without a floor, jitter on flat ground sums to a
-# large fake gain over a long track. Distance-based smoothing (below)
-# already removes most of this noise before it reaches gain_loss_m, so the
-# floor only needs to catch what survives smoothing.
+# itself cleared the threshold, are noise: without a floor, jitter on flat
+# ground sums to a large fake gain.
 ELEVATION_NOISE_M = 1.0
 
-# Half-width, in meters of along-route distance, of the centered moving
-# average applied before the hysteresis threshold above (the window spans
-# every point within this distance on either side of the point being
-# smoothed). A distance, not a point count: point spacing varies widely
-# between GPX sources -- dense GPS tracks sample every few meters,
-# route-planner/DEM exports every twenty-plus -- so a fixed point count
-# smooths over a different physical distance depending on the file, while a
-# distance window gives the same physical smoothing regardless of sampling
-# density.
+# Longest half-width, in meters of along-route distance, of the moving
+# average applied before the threshold above. A distance rather than a point
+# count, because source point spacing varies from a few meters to twenty-plus.
 ELEVATION_SMOOTHING_HALF_WINDOW_M = 50.0
 
 # Noise floor used only when pairing turning points into climb/descent
@@ -48,19 +39,10 @@ CLIMB_SEGMENTATION_NOISE_M = 3.0
 # Target spacing for the resampled route_points table.
 RESAMPLE_SPACING_M = 20.0
 
-# Even reference spacing profile_roughness_m resamples onto before measuring
-# second differences, so the estimate reflects a profile's own smoothness
-# rather than how densely its source happened to sample the ground (dense
-# GPS tracks vs. sparse route-planner exports).
-ROUGHNESS_GRID_SPACING_M = 20.0
-
-# Roughness (see profile_roughness_m) at or below this is a smooth,
-# terrain-model-like profile -- real short rollers change slope gradually
-# from one grid step to the next, so little or no smoothing is needed to
-# keep their gain. At or above ROUGHNESS_NOISY_M it's GPS/DEM-jitter-grade
-# noise, needing the full window this project has always smoothed consumer
-# GPX with; between the two the window scales linearly. See
-# adr/0002-routes-raw-gpx-ground-truth.md's 2026-09-27 amendment.
+# Roughness (profile_roughness_m) at or below ROUGHNESS_SMOOTH_M gets no
+# smoothing, at or above ROUGHNESS_NOISY_M the full window, and the window
+# scales linearly between (adr/0002-routes-raw-gpx-ground-truth.md). The
+# thresholds are calibrated to profiles on the RESAMPLE_SPACING_M grid.
 ROUGHNESS_SMOOTH_M = 0.3
 ROUGHNESS_NOISY_M = 1.5
 
@@ -253,20 +235,14 @@ def smoothed_elevations(
 ) -> list[float]:
     """Centered moving average over a +/-half_window_m window of cumulative
     distance; edge points average over whatever falls inside the series.
-    `dist_m` must be the cumulative distance for each point in `elevations`
-    (same length, non-decreasing). half_window_m of 0 is a no-op smoothing
-    pass (each point averages only itself and any co-located duplicates).
+    `dist_m` is the cumulative distance of each point (same length,
+    non-decreasing). A half_window_m of 0 averages each point with only
+    itself and any co-located duplicates.
 
-    Run before the hysteresis threshold in gain_loss_m, not after: at
-    typical consumer GPX point spacing, per-point elevation jitter is on
-    the same scale as ELEVATION_NOISE_M itself, so hysteresis alone would
-    double count a real climb that arrives as a staircase of small steps.
-    Averaging first removes the jitter's amplitude while leaving the
-    climb's shape (which unfolds over many points) intact.
-
-    Two-pointer sliding window: as i advances, both window edges are
-    non-decreasing in cumulative distance, so each edge only ever moves
-    forward, giving O(n) instead of O(n * window size).
+    Applied before gain_loss_m's threshold, not after: per-point jitter is
+    on the scale of ELEVATION_NOISE_M, so the threshold alone would count a
+    climb that arrives as a staircase of small steps twice. Both window
+    edges only move forward, so the pass is O(n).
     """
     n = len(elevations)
     half = half_window_m
@@ -340,15 +316,11 @@ def _linear_resample(dist_m: list[float], series: list[float], targets: list[flo
 
 
 def profile_roughness_m(dist_m: list[float], ele_m: list[float]) -> float:
-    """A profile's own smoothness, independent of its source or point
-    density: elevation is linearly resampled onto an even
-    ROUGHNESS_GRID_SPACING_M grid (no smoothing), then this is the RMS
-    second difference across that grid -- how much the slope changes from
-    one grid step to the next. Real terrain features (a roller, a
-    switchback) change slope gradually over many grid steps and leave a
-    small value; GPS/DEM jitter reverses direction almost every step and
-    leaves a large one, regardless of how densely the source happened to
-    sample the ground.
+    """A profile's own smoothness, independent of its source's point density:
+    the RMS second difference of elevation linearly resampled onto an even
+    RESAMPLE_SPACING_M grid. Real terrain changes slope gradually over many
+    grid steps and leaves a small value; GPS/DEM jitter reverses direction
+    almost every step and leaves a large one.
     """
     if len(dist_m) < 3:
         return 0.0
@@ -357,7 +329,7 @@ def profile_roughness_m(dist_m: list[float], ele_m: list[float]) -> float:
     if total <= 0:
         return 0.0
     shifted = [d - origin for d in dist_m]
-    targets = _even_targets(total, ROUGHNESS_GRID_SPACING_M)
+    targets = _even_targets(total, RESAMPLE_SPACING_M)
     grid_ele = _linear_resample(shifted, ele_m, targets)
     if len(grid_ele) < 3:
         return 0.0
@@ -369,17 +341,23 @@ def profile_roughness_m(dist_m: list[float], ele_m: list[float]) -> float:
 
 
 def smoothing_half_window_for(roughness_m: float) -> float:
-    """Smoothing half-window (see smoothed_elevations) chosen from a
-    profile's own roughness rather than its source label -- a smooth
-    terrain-model-like profile needs little or none to keep real short
-    rollers; a GPS-jitter-like profile needs the full window this project
-    has always used. Linear ramp between the two thresholds."""
+    """Smoothing half-window for a profile of the given roughness: a linear
+    ramp from none (smooth) to ELEVATION_SMOOTHING_HALF_WINDOW_M (noisy)."""
     if roughness_m <= ROUGHNESS_SMOOTH_M:
         return 0.0
     if roughness_m >= ROUGHNESS_NOISY_M:
         return ELEVATION_SMOOTHING_HALF_WINDOW_M
     frac = (roughness_m - ROUGHNESS_SMOOTH_M) / (ROUGHNESS_NOISY_M - ROUGHNESS_SMOOTH_M)
     return frac * ELEVATION_SMOOTHING_HALF_WINDOW_M
+
+
+def roughness_smoothed(dist_m: list[float], elevations: list[float]) -> tuple[list[float], float]:
+    """A profile smoothed with the window its own roughness calls for; returns
+    the smoothed series and the half-window used. Every elevation source
+    (route files, terrain-model drapes, network paths) goes through this, so
+    the same profile gets the same gain wherever it is measured."""
+    half_window_m = smoothing_half_window_for(profile_roughness_m(dist_m, elevations))
+    return smoothed_elevations(elevations, dist_m, half_window_m), half_window_m
 
 
 def resample_points(

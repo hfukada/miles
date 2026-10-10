@@ -23,8 +23,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 from starlette.types import Scope
 
-from . import areas, db, events, outbound, plan, route_search, routes, strava_budget, strava_client, streams, sync, terrain
+from . import areas, db, outbound, plan, route_search, routes, strava_budget, strava_client, streams, sync, terrain
 from .build_paces import PaceClaim, pace_claims
+from .fitness import FT_PER_M
 from .classifier import LAP_MIN_DISTANCE_M, LAP_MIN_MOVING_TIME_S, WORKOUT_LABEL_PATTERNS, classify_workout
 from .build_stats import BuildStat, WeekPoint, build_stat, peak_weeks, week_offset_points, window_total_miles
 from .distance_builds import (
@@ -70,7 +71,6 @@ _mcp_app = _mcp_server.streamable_http_app()
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     outbound.claim()
-    events.install()
     terrain.start_background_rebuild_if_stale()
     async with _mcp_server.session_manager.run():
         yield
@@ -719,7 +719,7 @@ def get_activity_detail(id: int) -> ActivityDetail:
         if len(altitude) > 1:
             diffs = altitude.diff().dropna()
             loss_m = -float(cast(float, diffs[diffs < 0].sum()))
-            elevation_loss_ft = round(loss_m * 3.28084, 1)
+            elevation_loss_ft = round(loss_m * FT_PER_M, 1)
 
     return ActivityDetail(
         id=cast(int, row["id"]),
@@ -899,7 +899,7 @@ def get_activity_streams(id: int) -> ActivityStreams:
     distance_mi = [float(v) / 1609.34 if v is not None and not pd.isna(v) else None for v in df["distance_m"].tolist()]
     pace_mpm = [_speed_to_pace(float(v)) if v is not None and not pd.isna(v) else None for v in df["velocity_smooth_mps"].tolist()]
     heartrate = [float(v) if v is not None and not pd.isna(v) else None for v in df["heartrate"].tolist()]
-    elevation_ft = [float(v) * 3.28084 if v is not None and not pd.isna(v) else None for v in df["altitude_m"].tolist()]
+    elevation_ft = [float(v) * FT_PER_M if v is not None and not pd.isna(v) else None for v in df["altitude_m"].tolist()]
 
     has_velocity = bool(cast(pd.Series, df["velocity_smooth_mps"]).notna().any())
     has_grade = bool(cast(pd.Series, df["grade_smooth"]).notna().any())
@@ -1471,7 +1471,7 @@ class SyncTriggerResponse(TypedDict):
 def _run_sync_in_background(history: bool) -> None:
     """Thread target for /api/sync: opens its own connection (sqlite3.Connection
     isn't safe to share across threads) and runs the same retry loop miles-sync
-    uses, with no printer — progress is exposed only via _sync_progress, polled by
+    uses; progress is exposed via _sync_progress, polled by
     GET /api/sync/status. The history pass can wait out many 15-minute Strava
     windows, so only an explicit request runs it; the scheduled miles-sync owns
     it otherwise. Any exception (network down, bad credentials, a real bug)

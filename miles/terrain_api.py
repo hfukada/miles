@@ -1,21 +1,16 @@
-"""HTTP API for the terrain model: profile/trend/analysis/scoring reads and
-the stream-backfill job's start/status. No auth, like the rest of the app.
+"""HTTP API for the terrain model: profile/trend/analysis/scoring reads. No
+auth, like the rest of the app.
 """
-
-import logging
-import threading
 
 from fastapi import APIRouter, HTTPException
 
-from . import db, terrain, terrain_backfill
-from .errors import describe_error
+from . import db, terrain
 
 router = APIRouter()
-_logger = logging.getLogger(__name__)
 
 
 @router.get("/api/terrain/profile")
-def get_terrain_profile(window_days: int = terrain.ROLLING_WINDOW_DAYS) -> terrain.TerrainProfile:
+def get_terrain_profile(window_days: int = terrain.ROLLING_WINDOW_DAYS) -> dict:
     with db.connection(terrain.connect) as conn:
         return terrain.get_terrain_profile(conn, window_days=window_days)
 
@@ -54,31 +49,3 @@ def get_route_terrain_score(route_id: int) -> terrain.RouteTerrainScore:
 def get_route_terrain_points(route_id: int) -> list[terrain.RoutePointClass]:
     with db.connection(terrain.connect) as conn:
         return terrain.route_point_classes(conn, route_id)
-
-
-def _run_terrain_backfill_in_background() -> None:
-    """Thread target for /api/terrain/backfill: runs one pass on its own
-    connection, persisting progress to terrain_backfill_status."""
-    with db.connection() as conn:
-        progress = terrain_backfill.BackfillProgress(conn)
-        try:
-            terrain_backfill.run_backfill(conn, progress)
-            progress.finish()
-        except Exception as e:
-            _logger.exception("Terrain backfill failed")
-            progress.fail(describe_error(e))
-
-
-@router.post("/api/terrain/backfill")
-def start_terrain_backfill() -> terrain_backfill.BackfillStatus:
-    with db.connection(terrain.connect) as conn:
-        progress = terrain_backfill.BackfillProgress(conn)
-        if progress.try_start():
-            threading.Thread(target=_run_terrain_backfill_in_background, daemon=True).start()
-        return progress.snapshot()
-
-
-@router.get("/api/terrain/backfill/status")
-def get_terrain_backfill_status() -> terrain_backfill.BackfillStatus:
-    with db.connection(terrain.connect) as conn:
-        return terrain_backfill.BackfillProgress(conn).snapshot()

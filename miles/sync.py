@@ -6,15 +6,14 @@ import threading
 import time
 import urllib.error
 from collections import defaultdict
-from collections.abc import Callable, Collection
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Collection
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
 import click
 from typing_extensions import TypedDict
 
-from . import db, elevation, events, outbound, plan, strava_budget, strava_client, streams, terrain, terrain_backfill, weather as weather_module
+from . import db, elevation, outbound, plan, strava_budget, strava_client, streams, terrain, terrain_backfill, weather as weather_module
 from .classifier import classify_workout
 from .derive import derive_all
 from .errors import StravaAllowanceLowError, describe_error
@@ -33,6 +32,8 @@ META_LAST_FAILURE = "last_sync_failed_at"
 META_LAST_ERROR = "last_sync_error"
 META_LAST_DURATION = "last_sync_duration_s"
 META_LAST_NEW = "last_sync_new_activities"
+# The last history pass's failure, cleared when a pass completes.
+META_HISTORY_ERROR = "history_pass_error"
 
 
 class SyncStatus(TypedDict):
@@ -47,40 +48,29 @@ class SyncStatus(TypedDict):
     new_activities: int | None
 
 
-@dataclass
-class _SyncState:
-    status: str = "idle"
-    phase: str | None = None
-    done: int | None = None
-    total: int | None = None
-    until: str | None = None
-    started_at: str | None = None
-    finished_at: str | None = None
-    error: str | None = None
-    new_activities: int | None = None
+def _idle_status() -> SyncStatus:
+    return {
+        "status": "idle", "phase": None, "done": None, "total": None, "until": None,
+        "started_at": None, "finished_at": None, "error": None, "new_activities": None,
+    }
 
 
 class SyncProgress:
     """Thread-safe status for one sync run, polled by /api/sync/status and
-    (optionally) echoed to the terminal by the CLI. Holds only the current phase —
-    there is no history, just "what's happening right now." One instance is reused
-    across an entire run_sync call, including any waits on the rate limit."""
+    logged as it moves. Holds only the current phase -- there is no history,
+    just "what's happening right now." One instance is reused across an
+    entire run_sync call, including any waits on the rate limit."""
 
-    def __init__(self, printer: Callable[[SyncStatus], None] | None = None) -> None:
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._printer = printer
-        self._state = _SyncState()
+        self._state = _idle_status()
 
-    def _snapshot_locked(self) -> SyncStatus:
-        return cast(SyncStatus, asdict(self._state))
-
-    def _notify_locked(self) -> None:
-        if self._printer is not None:
-            self._printer(self._snapshot_locked())
+    def _update_locked(self, **changes: object) -> None:
+        self._state = cast(SyncStatus, {**self._state, **changes})
+        _log_progress(self._state)
 
     def _start_locked(self) -> None:
-        self._state = _SyncState(status="running", started_at=datetime.now(timezone.utc).isoformat())
-        self._notify_locked()
+        self._state = {**_idle_status(), "status": "running", "started_at": datetime.now(timezone.utc).isoformat()}
 
     def start(self) -> None:
         with self._lock:
@@ -90,7 +80,7 @@ class SyncProgress:
         """Atomically switch to running unless a run is already in progress.
         Returns whether this call won the race and should launch the sync."""
         with self._lock:
-            if self._state.status == "running":
+            if self._state["status"] == "running":
                 return False
             self._start_locked()
             return True
@@ -99,50 +89,41 @@ class SyncProgress:
         self, name: str, *, done: int | None = None, total: int | None = None, until: str | None = None
     ) -> None:
         with self._lock:
-            self._state = replace(self._state, phase=name, done=done, total=total, until=until)
-            self._notify_locked()
+            self._update_locked(phase=name, done=done, total=total, until=until)
 
     def finish(self, new_activities: int) -> None:
         with self._lock:
-            self._state = replace(
-                self._state, status="done", phase="done", new_activities=new_activities,
+            self._update_locked(
+                status="done", phase="done", new_activities=new_activities,
                 finished_at=datetime.now(timezone.utc).isoformat(),
             )
-            self._notify_locked()
 
     def fail(self, error: str) -> None:
         with self._lock:
-            self._state = replace(
-                self._state, status="error", phase="error", error=error,
-                finished_at=datetime.now(timezone.utc).isoformat(),
+            self._update_locked(
+                status="error", phase="error", error=error, finished_at=datetime.now(timezone.utc).isoformat()
             )
-            self._notify_locked()
 
     def snapshot(self) -> SyncStatus:
         with self._lock:
-            return self._snapshot_locked()
+            return cast(SyncStatus, dict(self._state))
 
     @property
     def status(self) -> str:
         with self._lock:
-            return self._state.status
+            return self._state["status"]
 
 
-def _print_progress(snapshot: SyncStatus) -> None:
-    """miles-sync's connection to a SyncProgress: turns each phase update back into
-    the terminal text a live run has always printed. The API's background sync
-    passes no printer, so this never runs there — its progress is exposed only via
-    GET /api/sync/status."""
+def _log_progress(snapshot: SyncStatus) -> None:
     phase = snapshot["phase"]
     if phase == "activities":
-        print(f"  {snapshot['done']} activities fetched...")
+        _logger.info("  %s activities fetched...", snapshot["done"])
     elif phase == "waiting":
-        print(f"\nRate limit hit — waiting until {snapshot['until']}...")
+        _logger.info("\nRate limit hit — waiting until %s...", snapshot["until"])
     elif snapshot["total"] is not None and phase not in ("derive", "error"):
-        print(f"  {phase} {snapshot['done']}/{snapshot['total']}...")
+        _logger.info("  %s %s/%s...", phase, snapshot["done"], snapshot["total"])
     elif phase == "done":
-        n = snapshot["new_activities"] or 0
-        print(f"Sync complete. {n} new/updated activities.")
+        _logger.info("Sync complete. %s new/updated activities.", snapshot["new_activities"] or 0)
 
 
 def history_enabled() -> bool:
@@ -151,44 +132,31 @@ def history_enabled() -> bool:
     return os.environ.get(HISTORY_ENV, "1").strip().lower() not in ("0", "false", "no", "off")
 
 
-class _PhaseSink:
-    """Reports a pass's progress as sync phases (`<prefix><phase>`) and, for
-    the history pass, mirrors it into the terrain backfill's status row."""
+def _phase_reporter(progress: SyncProgress, prefix: str = "") -> terrain_backfill.PhaseReporter:
+    """Reports a pass's progress as sync phases named `<prefix><phase>`."""
 
-    def __init__(self, progress: SyncProgress, prefix: str = "", mirror: terrain_backfill.BackfillProgress | None = None) -> None:
-        self._progress = progress
-        self._prefix = prefix
-        self._mirror = mirror
+    def report(phase: str, done: int, total: int) -> None:
+        progress.phase(f"{prefix}{phase}", done=done, total=total)
 
-    def start(self, total: int) -> None:
-        if self._mirror is not None:
-            self._mirror.start(total)
-
-    def phase(self, phase: str, *, done: int, total: int) -> None:
-        self._progress.phase(f"{self._prefix}{phase}", done=done, total=total)
-        if self._mirror is not None:
-            self._mirror.phase(phase, done=done, total=total)
+    return report
 
 
 def _fetch_laps(
     conn: sqlite3.Connection,
     ids: list[int],
     gate: strava_budget.Gate,
-    sink: _PhaseSink,
-    *,
-    names: dict[int, str | None] | None = None,
+    report: terrain_backfill.PhaseReporter,
 ) -> int:
     """Fetch and store laps and the description for each id in order (one
     request each), stopping when the gate refuses. Each activity is stamped
-    and committed on its own, so an interruption loses nothing. With `names`,
-    a workout label is set from the activity's name. Returns how many were
-    fetched."""
+    and committed on its own, so an interruption loses nothing. Returns how
+    many were fetched."""
     if not ids:
         return 0
     total = len(ids)
     fetched = 0
     lap_total = 0
-    sink.phase("laps", done=0, total=total)
+    report("laps", 0, total)
     try:
         for activity_id in ids:
             description, laps = gate.call("detail", lambda: strava_client.get_activity_detail(activity_id))
@@ -197,23 +165,14 @@ def _fetch_laps(
                 laps = gate.call("laps", lambda: strava_client.get_activity_laps(activity_id))
             db.store_activity_laps(conn, activity_id, laps)
             lap_total += len(laps)
-            if names is not None:
-                name = names.get(activity_id)
-                label = classify_workout(name) if name else None
-                if label:
-                    conn.execute(
-                        "UPDATE activities SET workout_label = ? WHERE activity_id = ? AND workout_label IS NULL",
-                        (label, activity_id),
-                    )
-                    conn.commit()
             fetched += 1
             if fetched % 10 == 0 or fetched == total:
-                sink.phase("laps", done=fetched, total=total)
+                report("laps", fetched, total)
     except StravaAllowanceLowError as e:
         # laps_synced_at stays unset for the rest, so a later run fetches them.
         _logger.warning("lap fetch stopped: %s", e)
-    sink.phase("laps", done=fetched, total=total)
-    print(f"Laps done. {lap_total} laps for {fetched} activities.")
+    report("laps", fetched, total)
+    _logger.info("Laps done. %s laps for %s activities.", lap_total, fetched)
     return fetched
 
 
@@ -233,9 +192,9 @@ def _pass_activities(
         # renames or retags of recent activities. Upserts are idempotent and
         # an unchanged listing leaves derived values alone.
         after = (datetime.fromisoformat(after) - INCREMENTAL_LOOKBACK).isoformat()
-        print(f"Incremental sync: fetching activities after {after}")
+        _logger.info("Incremental sync: fetching activities after %s", after)
     else:
-        print("Full sync: fetching all activities (may take a few minutes)...")
+        _logger.info("Full sync: fetching all activities (may take a few minutes)...")
 
     def list_activities() -> list[db.ActivityRow]:
         listed: list[db.ActivityRow] = []
@@ -256,13 +215,12 @@ def _pass_activities(
         for row in rows
         if row["activity_id"] not in known and row["sport_type"] in terrain.TERRAIN_SPORT_TYPES
     }
-    rewritten = db.count_rewritten(conn, rows)
-    if rows:
-        for activity_id in db.upsert_activities(conn, rows):
-            streams.discard_raw_streams(activity_id)
+    rewritten, changed_ids = db.upsert_activities(conn, rows)
+    for activity_id in changed_ids:
+        streams.discard_raw_streams(activity_id)
 
     total = conn.execute("SELECT COUNT(*) FROM activities").fetchone()[0]
-    print(f"Done. {rewritten} new/updated. {total} total in DB.")
+    _logger.info("Done. %s new/updated. %s total in DB.", rewritten, total)
     return rewritten, new_run_ids
 
 
@@ -270,7 +228,7 @@ def _derive(conn: sqlite3.Connection, progress: SyncProgress) -> None:
     progress.phase("derive")
     counts = derive_all(conn)
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no changes"
-    print(f"Derive done. {summary}")
+    _logger.info("Derive done. %s", summary)
 
 
 def _pass_details(conn: sqlite3.Connection, new_run_ids: Collection[int], gate: strava_budget.Gate, progress: SyncProgress) -> None:
@@ -294,20 +252,19 @@ def _pass_details(conn: sqlite3.Connection, new_run_ids: Collection[int], gate: 
         ORDER BY start_date
     """).fetchall()
     if unsynced:
-        print(f"Fetching laps for {len(unsynced)} workout(s)...")
+        _logger.info("Fetching laps for %s workout(s)...", len(unsynced))
         _fetch_laps(
             conn,
             [a["activity_id"] for a in unsynced],
             gate,
-            _PhaseSink(progress),
-            names={a["activity_id"]: a["name"] for a in unsynced},
+            _phase_reporter(progress),
         )
 
-    # Backfill labels for any workout activities that have laps but no label yet.
-    unlabeled = conn.execute("""
+    # Label workouts and races whose laps are in but that have no label yet.
+    unlabeled = conn.execute(f"""
         SELECT activity_id, name FROM activities
-        WHERE run_type = 'workout' AND workout_label IS NULL
-          AND activity_id IN (SELECT DISTINCT activity_id FROM laps)
+        WHERE {effective_run_type} IN ('workout', 'race') AND workout_label IS NULL
+          AND laps_synced_at IS NOT NULL
     """).fetchall()
     for activity in unlabeled:
         unlabeled_name: str | None = activity["name"]
@@ -322,29 +279,26 @@ def _pass_details(conn: sqlite3.Connection, new_run_ids: Collection[int], gate: 
         conn.commit()
 
     if new_run_ids:
-        print(f"Fetching streams for {len(new_run_ids)} new run(s)...")
+        _logger.info("Fetching streams for %s new run(s)...", len(new_run_ids))
         try:
-            terrain_backfill.run_backfill(conn, _PhaseSink(progress), gate=gate, only_ids=new_run_ids)
+            terrain_backfill.run_backfill(conn, _phase_reporter(progress), gate=gate, only_ids=new_run_ids)
         except terrain.TerrainRebuildingError:
             # Segmenting needs the terrain model, which a rebuild in progress
             # owns; the history pass picks these runs up afterwards.
             _note_terrain_rebuilding(progress)
         except (terrain_backfill.BackfillAbortedError, elevation.ElevationFetchError) as e:
             # The new activities are stored; the history pass retries what is
-            # left, and its status row reports a persistent failure.
-            _logger.warning("stream fetch for new runs stopped: %s", describe_error(e, None))
-            print(f"Stream fetch for new runs stopped: {describe_error(e, None)}")
+            # left, and its recorded failure reports a persistent one.
+            _logger.warning("Stream fetch for new runs stopped: %s", describe_error(e, None))
         except Exception as e:
             # The terrain model is derived data: its failure must not skip
             # the weather, history, and derive passes or the last-sync stamp.
-            _logger.warning("terrain work for new runs failed", exc_info=True)
+            _logger.warning("Terrain work for new runs failed: %s", describe_error(e, None), exc_info=True)
             conn.rollback()
-            print(f"Terrain work for new runs failed: {describe_error(e, None)}")
 
 
 def _note_terrain_rebuilding(progress: SyncProgress) -> None:
-    _logger.info("streams skipped: a terrain model rebuild is running")
-    print("Streams skipped: a terrain model rebuild is running; a later sync will fetch them.")
+    _logger.info("Streams skipped: a terrain model rebuild is running; a later sync will fetch them.")
     progress.phase("streams-skipped-terrain-rebuilding")
 
 
@@ -379,7 +333,7 @@ def _pass_weather(conn: sqlite3.Connection, progress: SyncProgress) -> None:
         return
 
     total_w = len(needs_weather)
-    print(f"Fetching weather for {total_w} activities...")
+    _logger.info("Fetching weather for %s activities...", total_w)
 
     # Group by rounded location (~11km grid); each group is then fetched in
     # windows of at most weather.MAX_WINDOW_DAYS days, one request per window.
@@ -396,7 +350,7 @@ def _pass_weather(conn: sqlite3.Connection, progress: SyncProgress) -> None:
         })
 
     total_groups = len(groups)
-    print(f"  {total_groups} location group(s).")
+    _logger.info("  %s location group(s).", total_groups)
     fetched_w = 0
     progress.phase("weather", done=0, total=total_groups)
     for g_idx, ((lat, lng), specs) in enumerate(groups.items(), 1):
@@ -407,14 +361,15 @@ def _pass_weather(conn: sqlite3.Connection, progress: SyncProgress) -> None:
                 group_fetched += len(rows)
         except (urllib.error.URLError, OSError, ValueError) as e:
             fetched_w += group_fetched
-            _logger.warning("weather pass stopped: %s", describe_error(e, None))
-            print(f"Weather stopped: {describe_error(e, None)}. {fetched_w} new records; the rest wait for the next sync.")
+            _logger.warning(
+                "Weather stopped: %s. %s new records; the rest wait for the next sync.", describe_error(e, None), fetched_w
+            )
             return
         fetched_w += group_fetched
-        print(f"  Group {g_idx}/{total_groups} ({lat:.1f},{lng:.1f}): {group_fetched}/{len(specs)} fetched. Total: {fetched_w}/{total_w}")
+        _logger.info("  Group %s/%s (%.1f,%.1f): %s/%s fetched. Total: %s/%s", g_idx, total_groups, lat, lng, group_fetched, len(specs), fetched_w, total_w)
         progress.phase("weather", done=g_idx, total=total_groups)
 
-    print(f"Weather done. {fetched_w} new records.")
+    _logger.info("Weather done. %s new records.", fetched_w)
 
 
 def remaining_lap_ids(conn: sqlite3.Connection) -> list[int]:
@@ -436,35 +391,29 @@ def remaining_lap_ids(conn: sqlite3.Connection) -> list[int]:
 
 def _pass_history(conn: sqlite3.Connection, limit: int, gate: strava_budget.Gate, progress: SyncProgress) -> None:
     """Pass 4: the remaining laps, then the remaining streams and terrain
-    segments, spending only what is left above the Strava reserve. It holds
-    the terrain backfill's status row for the duration, so the standalone
-    backfill (API) and a second sync cannot spend the same allowance at
-    once; if that row is held, the pass is skipped. A failure here is
-    recorded on that row, not raised: the sync's own work is done."""
+    segments, spending only what is left above the Strava reserve. A failure
+    here is recorded under META_HISTORY_ERROR, not raised: the sync's own work
+    is done."""
     lap_ids = remaining_lap_ids(conn)
     stream_work = terrain_backfill.refresh_backfill_queue(conn) > 0 or bool(terrain.activities_to_segment(conn))
     if not lap_ids and not stream_work:
         return
 
-    backfill = terrain_backfill.BackfillProgress(conn)
-    if not backfill.try_start():
-        print("History pass skipped: a terrain backfill is already running.")
-        return
-    sink = _PhaseSink(progress, "backfill-", mirror=backfill)
+    report = _phase_reporter(progress, "backfill-")
     try:
-        backfill.start(0)
         if lap_ids:
-            _fetch_laps(conn, lap_ids[:limit], gate, sink)
+            _fetch_laps(conn, lap_ids[:limit], gate, report)
         if stream_work:
             try:
-                terrain_backfill.run_backfill(conn, sink, limit=limit, gate=gate)
+                terrain_backfill.run_backfill(conn, report, limit=limit, gate=gate)
             except terrain.TerrainRebuildingError:
                 _note_terrain_rebuilding(progress)
-        backfill.finish()
+        conn.execute("DELETE FROM meta WHERE key = ?", (META_HISTORY_ERROR,))
+        conn.commit()
     except Exception as e:
-        _logger.exception("history pass failed")
-        backfill.fail(describe_error(e))
-        print(f"History pass stopped: {describe_error(e, None)}")
+        _logger.exception("History pass stopped: %s", describe_error(e, None))
+        conn.rollback()
+        _set_meta(conn, META_HISTORY_ERROR, describe_error(e))
 
 
 def _run(
@@ -508,7 +457,7 @@ def _run(
     # matching race (see plan.auto_complete_plan).
     completed_plan_id = plan.auto_complete_plan(conn)
     if completed_plan_id is not None:
-        print(f"Plan {completed_plan_id} auto-completed (matching race synced).")
+        _logger.info("Plan %s auto-completed (matching race synced).", completed_plan_id)
 
     _pass_details(conn, new_run_ids, gate, progress)
     _pass_weather(conn, progress)
@@ -587,7 +536,11 @@ def main(
     max_hr: int | None,
     long_run_floor: float | None,
 ) -> None:
-    events.install()
+    # The run reports through logging; the terminal gets its plain messages.
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(logging.Formatter("%(message)s"))
+    _logger.addHandler(console)
+    _logger.setLevel(logging.INFO)
     conn = db.connect()
     db.init_db(conn)
 
@@ -604,7 +557,7 @@ def main(
         # as a DERIVE_VERSION bump to take effect on existing activities.
         counts = derive_all(conn, full=True)
         summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "no changes"
-        print(f"Athlete profile updated. Derive done. {summary}")
+        _logger.info("Athlete profile updated. Derive done. %s", summary)
         return
 
     if db.get_athlete(conn) is None and sys.stdin.isatty():
@@ -620,7 +573,7 @@ def main(
         db.upsert_athlete(conn, max_hr=prompted_max_hr, long_run_floor_miles=None)
 
     outbound.claim()
-    progress = SyncProgress(printer=_print_progress)
+    progress = SyncProgress()
     progress.start()
     new_count = run_sync(conn, full, history, history_limit, reserve, progress)
     progress.finish(new_count)

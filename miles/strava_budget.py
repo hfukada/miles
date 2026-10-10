@@ -34,7 +34,6 @@ RESERVE_ENV = "MILES_STRAVA_RESERVE"
 DEFAULT_RESERVE = 12
 # Calls left unused in the 15-minute window.
 SHORT_WINDOW_RESERVE = 10
-WINDOW_MINUTES = 15
 _WINDOW_SLACK_S = 5
 # The activity listing is the essential work of a sync: reserves never stop it.
 LISTING_KIND = "activities"
@@ -54,8 +53,8 @@ def wait_for_next_window(on_wait: Callable[[str], None] | None = None) -> None:
     """Sleep until the next 15-minute rate-limit window opens. on_wait gets the
     local "HH:MM" it ends at, for progress reporting."""
     now = datetime.now()
-    seconds_into_window = (now.minute % WINDOW_MINUTES) * 60 + now.second
-    wait = WINDOW_MINUTES * 60 - seconds_into_window + _WINDOW_SLACK_S
+    seconds_into_window = (now.minute * 60 + now.second) % strava_client.WINDOW_S
+    wait = strava_client.WINDOW_S - seconds_into_window + _WINDOW_SLACK_S
     if on_wait is not None:
         on_wait((now + timedelta(seconds=wait)).strftime("%H:%M"))
     time.sleep(wait)

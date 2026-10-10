@@ -5,7 +5,7 @@ import pytest
 from helpers import insert_activity, none_sampler, strava_fault
 from stravalib.model import Stream
 
-from miles import db, elevation, strava_budget, strava_client, streams, terrain, terrain_backfill
+from miles import elevation, strava_budget, strava_client, streams, terrain, terrain_backfill
 
 
 @pytest.fixture(autouse=True)
@@ -42,7 +42,7 @@ def _model_is_current(conn: sqlite3.Connection) -> None:
 
 
 def _backfill(conn: sqlite3.Connection, **kwargs) -> int:
-    return terrain_backfill.run_backfill(conn, terrain_backfill.BackfillProgress(conn), **kwargs)
+    return terrain_backfill.run_backfill(conn, lambda *a: None, **kwargs)
 
 
 def _segment_count(conn: sqlite3.Connection, activity_id: int) -> int:
@@ -105,14 +105,14 @@ def test_run_backfill_fetches_caches_and_segments(conn: sqlite3.Connection, monk
     _run(conn, 7, 3)
     asked = _strava_streams(monkeypatch)
 
-    progress = terrain_backfill.BackfillProgress(conn)
-    assert progress.try_start()
-    assert terrain_backfill.run_backfill(conn, progress, only_ids={3}) == 1
+    phases: list[tuple[str, int, int]] = []
+    assert terrain_backfill.run_backfill(conn, lambda *a: phases.append(a), only_ids={3}) == 1
     assert asked == [3]
     assert _queued(conn) == 2
     asked.clear()
 
-    fetched = terrain_backfill.run_backfill(conn, progress)
+    phases.clear()
+    fetched = terrain_backfill.run_backfill(conn, lambda *a: phases.append(a))
 
     assert fetched == 2
     assert sorted(asked) == [1, 2]
@@ -121,10 +121,7 @@ def test_run_backfill_fetches_caches_and_segments(conn: sqlite3.Connection, monk
         assert streams.has_cached_streams(activity_id) is True
         assert _segment_count(conn, activity_id) > 0
 
-    snap = progress.snapshot()
-    assert snap["status"] == "running"  # run_backfill doesn't call finish() -- the caller does
-    assert snap["done"] == 2
-    assert snap["total"] == 2
+    assert phases[-1] == ("streams", 2, 2)
 
 
 def test_the_reserve_stops_the_run_before_any_request_that_would_dip_into_it_with_the_queue_intact(
@@ -241,24 +238,6 @@ def test_a_transient_server_error_is_retried_and_not_held_against_the_activity(c
 
     assert _backfill(conn) == 1
     assert _failures(conn) == 0
-
-
-# ---------------------------------------------------------------------------
-# BackfillProgress persistence
-# ---------------------------------------------------------------------------
-
-
-def test_backfill_progress_persists_across_connections():
-    progress1 = terrain_backfill.BackfillProgress(db.connect())
-    assert progress1.try_start() is True
-    progress1.phase("streams", done=3, total=10)
-
-    progress2 = terrain_backfill.BackfillProgress(db.connect())
-    snap = progress2.snapshot()
-    assert snap["status"] == "running"
-    assert snap["done"] == 3
-    assert snap["total"] == 10
-    assert progress2.try_start() is False  # already running, per the persisted status
 
 
 # ---------------------------------------------------------------------------

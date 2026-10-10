@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
+from typing import cast
 from typing_extensions import TypedDict
 
 import osmium
@@ -97,10 +98,6 @@ class ExtractRecord(TypedDict):
     last_modified: str | None
 
 
-def _large_extracts_allowed() -> bool:
-    return os.environ.get(ALLOW_LARGE_ENV, "").strip().lower() in ("1", "true", "yes")
-
-
 def init_extract_schema(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS map_extracts (
@@ -130,16 +127,7 @@ def init_extract_schema(conn: sqlite3.Connection) -> None:
 
 
 def _row_to_record(row: sqlite3.Row) -> ExtractRecord:
-    return {
-        "region": row["region"],
-        "path": row["path"],
-        "sha256": row["sha256"],
-        "fetched_at": row["fetched_at"],
-        "checked_at": row["checked_at"],
-        "data_as_of": row["data_as_of"],
-        "etag": row["etag"],
-        "last_modified": row["last_modified"],
-    }
+    return cast(ExtractRecord, dict(row))
 
 
 def get_extract(conn: sqlite3.Connection, region: str) -> ExtractRecord | None:
@@ -228,29 +216,6 @@ def throttled_progress(
     return report
 
 
-def _refreshed(
-    conn: sqlite3.Connection,
-    extract: ExtractRecord,
-    *,
-    refresh: bool,
-    force: bool,
-    on_wait: Callable[[], None] | None = None,
-    on_progress: DownloadProgress | None = None,
-) -> ExtractRecord:
-    if not Path(extract["path"]).is_file():
-        return download_extract(conn, extract["region"], force=force, on_wait=on_wait, on_progress=on_progress)
-    if not refresh and not force:
-        return extract
-    try:
-        return download_extract(
-            conn, extract["region"], refresh=True, force=force, on_wait=on_wait, on_progress=on_progress
-        )
-    except ExtractDownloadError:
-        if force:
-            raise
-        return extract
-
-
 def _too_large_hint(conn: sqlite3.Connection, region: str, bbox: tuple[float, float, float, float]) -> str:
     try:
         known = geofabrik.cached_regions(conn)
@@ -282,8 +247,7 @@ def select_extracts(
     Paths are looked up in the registry; a missing region or file is
     downloaded, one after another.
 
-    refresh=True first asks Geofabrik for a newer file (see download_extract);
-    one that can't be refreshed is used as is. force=True replaces the file
+    refresh=True first asks Geofabrik for a newer file (see download_extract). force=True replaces the file
     and reports failure instead of falling back. on_wait is called once if a
     download waits on another thread's download of the same region;
     on_progress receives bytes written and expected total. A region over the
@@ -294,16 +258,10 @@ def select_extracts(
         raise ExtractDownloadError(str(e)) from e
     chosen: list[ExtractRecord] = []
     for path in paths:
-        registered = get_extract(conn, path)
         try:
-            if registered is not None:
-                chosen.append(
-                    _refreshed(
-                        conn, registered, refresh=refresh, force=force, on_wait=on_wait, on_progress=on_progress
-                    )
-                )
-            else:
-                chosen.append(download_extract(conn, path, force=force, on_wait=on_wait, on_progress=on_progress))
+            chosen.append(
+                download_extract(conn, path, refresh=refresh, force=force, on_wait=on_wait, on_progress=on_progress)
+            )
         except ExtractTooLargeError as e:
             raise ExtractTooLargeError(f"{e}{_too_large_hint(conn, path, bbox)}") from e
     return chosen
@@ -498,7 +456,6 @@ def _download_with_backoff(
     dest: Path,
     validators: dict[str, str],
     *,
-    allow_large: bool = False,
     on_progress: DownloadProgress | None = None,
     on_request: Callable[[], None] | None = None,
 ) -> _Download | None:
@@ -507,7 +464,7 @@ def _download_with_backoff(
     conditional headers in validators (dest untouched).
 
     A HEAD comes first for the redirect target and declared size, refused over
-    EXTRACT_MAX_BYTES unless allow_large. on_request is called once, just
+    EXTRACT_MAX_BYTES unless ALLOW_LARGE_ENV is set. on_request is called once, just
     before the first GET.
 
     Verified before dest is replaced: bytes written equal Content-Length (a cut
@@ -516,7 +473,7 @@ def _download_with_backoff(
     on every exit. on_progress gets 0 bytes first, then at most once per
     PROGRESS_INTERVAL_S, then the final count."""
     part = dest.with_name(f"{dest.name}.{os.getpid()}.{secrets.token_hex(4)}.part")
-    allowed = allow_large or _large_extracts_allowed()
+    allowed = os.environ.get(ALLOW_LARGE_ENV, "").strip().lower() in ("1", "true", "yes")
 
     def too_large(size: int) -> ExtractDownloadError:
         return ExtractTooLargeError(
@@ -588,14 +545,9 @@ def _conditional_headers(existing: ExtractRecord) -> dict[str, str]:
     registered without any is compared by its download time."""
     if not Path(existing["path"]).is_file():
         return {}
-    headers: dict[str, str] = {}
-    if existing["etag"]:
-        headers["If-None-Match"] = existing["etag"]
-    if existing["last_modified"]:
-        headers["If-Modified-Since"] = existing["last_modified"]
-    elif not existing["etag"]:
-        headers["If-Modified-Since"] = format_datetime(datetime.fromisoformat(existing["fetched_at"]), usegmt=True)
-    return headers
+    return http_client.conditional_headers(existing["etag"], existing["last_modified"]) or {
+        "If-Modified-Since": format_datetime(datetime.fromisoformat(existing["fetched_at"]), usegmt=True)
+    }
 
 
 def _stamp_request(conn: sqlite3.Connection, region: str) -> None:
@@ -653,18 +605,17 @@ def download_extract(
     conn: sqlite3.Connection,
     region: str,
     *,
-    base_url: str | None = None,
     refresh: bool = False,
     force: bool = False,
-    allow_large: bool = False,
     on_wait: Callable[[], None] | None = None,
     on_progress: DownloadProgress | None = None,
 ) -> ExtractRecord:
     """Register region's Geofabrik extract, downloading only if none is
     registered or its file is gone. A registered extract is returned as is
     unless refresh=True, which makes a conditional request: a 304 only updates
-    checked_at, a 200 replaces the file. force=True downloads unconditionally,
-    replacing a bad but registered file.
+    checked_at, a 200 replaces the file, and a failure leaves the registered
+    file in use. force=True downloads unconditionally, replacing a bad but
+    registered file, and reports failure.
 
     Within EXTRACT_MIN_REFETCH_INTERVAL_HOURS of its last success a registered
     extract is not asked about again, and within REQUEST_COOLDOWN_HOURS of the
@@ -673,18 +624,8 @@ def download_extract(
     per-region lock stops two importers fetching one file; a waiter then uses
     the holder's file. on_wait is called once if the lock is taken;
     on_progress receives bytes written and expected total (not for a 304)."""
-    existing, validators = _validators_for(conn, region, refresh, force)
-    if validators is None:
-        assert existing is not None
-        metrics.cache("extract", "hit")
-        return existing
-    _raise_if_cooling_down(conn, region)
-
-    lock = _region_lock(region)
-    if not lock.acquire(blocking=False):
-        if on_wait is not None:
-            on_wait()
-        lock.acquire()
+    registered = get_extract(conn, region)
+    fallback = registered if registered is not None and refresh and not force and Path(registered["path"]).is_file() else None
     try:
         existing, validators = _validators_for(conn, region, refresh, force)
         if validators is None:
@@ -692,35 +633,47 @@ def download_extract(
             metrics.cache("extract", "hit")
             return existing
         _raise_if_cooling_down(conn, region)
-        path = _extract_path(region)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _sweep_stale_parts(path.parent)
-        url = f"{(base_url or GEOFABRIK_BASE_URL).rstrip('/')}/{region}-latest.osm.pbf"
-        downloaded = _download_with_backoff(
-            url,
-            path,
-            validators,
-            allow_large=allow_large,
-            on_progress=on_progress,
-            on_request=lambda: _stamp_request(conn, region),
-        )
-        if downloaded is None:
-            assert existing is not None
-            metrics.cache("extract", "not_modified")
-            conn.execute(
-                "UPDATE map_extracts SET checked_at = ? WHERE region = ?",
-                (datetime.now(timezone.utc).isoformat(), region),
+
+        lock = _region_lock(region)
+        if not lock.acquire(blocking=False):
+            if on_wait is not None:
+                on_wait()
+            lock.acquire()
+        try:
+            existing, validators = _validators_for(conn, region, refresh, force)
+            if validators is None:
+                assert existing is not None
+                metrics.cache("extract", "hit")
+                return existing
+            _raise_if_cooling_down(conn, region)
+            path = _extract_path(region)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _sweep_stale_parts(path.parent)
+            url = f"{GEOFABRIK_BASE_URL.rstrip('/')}/{region}-latest.osm.pbf"
+            downloaded = _download_with_backoff(
+                url, path, validators, on_progress=on_progress, on_request=lambda: _stamp_request(conn, region)
             )
-            conn.commit()
-            refreshed = get_extract(conn, region)
-            assert refreshed is not None
-            return refreshed
-        metrics.cache("extract", "miss")
-        return register_local_extract(
-            conn, path, region, etag=downloaded["etag"], last_modified=downloaded["last_modified"]
-        )
-    finally:
-        lock.release()
+            if downloaded is None:
+                assert existing is not None
+                metrics.cache("extract", "not_modified")
+                conn.execute(
+                    "UPDATE map_extracts SET checked_at = ? WHERE region = ?",
+                    (datetime.now(timezone.utc).isoformat(), region),
+                )
+                conn.commit()
+                refreshed = get_extract(conn, region)
+                assert refreshed is not None
+                return refreshed
+            metrics.cache("extract", "miss")
+            return register_local_extract(
+                conn, path, region, etag=downloaded["etag"], last_modified=downloaded["last_modified"]
+            )
+        finally:
+            lock.release()
+    except ExtractDownloadError:
+        if fallback is None:
+            raise
+        return fallback
 
 
 # ---------------------------------------------------------------------------

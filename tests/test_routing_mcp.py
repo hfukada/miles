@@ -1,11 +1,12 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 
 import pytest
 from helpers import ORIGIN_LAT, ORIGIN_LNG, FakeOsrm, by_deg_lat, call_tool, node, none_sampler, way
 from mcp.server.fastmcp import FastMCP
 
-from miles import db, network, route_search, search_mcp
+from miles import network, route_search, routing_mcp
 
 # A single 400m trail with a named trailhead at its near end, a mile or so
 # from the drive origin -- enough distance for OSRM drive time to matter,
@@ -56,7 +57,7 @@ def test_drive_mode_fans_out_over_osrm_and_carries_each_starts_label_and_drive_t
     result = route_search.find_routes(conn, request)
     assert result["candidates"]
     for candidate in result["candidates"]:
-        summary = search_mcp._candidate_summary(candidate)
+        summary = routing_mcp._candidate_summary(candidate)
         assert summary["start"]["label"] == candidate["start"]["label"] in labels
         assert (summary["start"]["drive_minutes"] == 0.0) is (candidate["start"]["label"] == "Out the door")
 
@@ -74,54 +75,23 @@ def test_resolve_starts_refuses_contradictory_or_missing_start_arguments(conn: s
         route_search.resolve_starts(conn, 1, drive_k=8, **arguments)
 
 
-class _Borrowed:
-    """A connection a tool may close without ending the test's own use of it."""
-
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
-        self.closed = False
-
-    def __getattr__(self, name: str):
-        return getattr(self._conn, name)
-
-    def close(self) -> None:
-        self.closed = True
-
-
 @pytest.fixture
 def tool(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
-    """Call a registered search tool against the test database; the
-    connections it opens are recorded on `.lent`."""
+    """Call a registered search tool against the test database, which stays
+    open across calls."""
     server = FastMCP("test")
-    search_mcp.register_search_tools(server)
-    lent: list[_Borrowed] = []
+    routing_mcp.register_routing_tools(server)
 
-    def open_connection() -> _Borrowed:
-        lent.append(_Borrowed(conn))
-        return lent[-1]
+    @contextmanager
+    def lend(opener=None):
+        yield conn
 
-    monkeypatch.setattr(search_mcp.db, "connect", open_connection)
+    monkeypatch.setattr(routing_mcp.db, "connection", lend)
 
     def call(name: str, args: dict) -> dict:
         return call_tool(server, name, args)
 
-    call.lent = lent  # type: ignore[attr-defined]
     return call
-
-
-@pytest.mark.parametrize("name", ["find_routes", "get_route_candidate", "save_route_candidate"])
-def test_every_search_tool_closes_its_connection_even_on_an_error(tool, name: str):
-    args = {
-        "find_routes": {"area_id": 1, "distance_mi_min": 0.1, "distance_mi_max": 0.5, "shape": "bogus",
-                        "start_lat": TH_LAT, "start_lng": ORIGIN_LNG},
-        "get_route_candidate": {"candidate_id": "missing"},
-        "save_route_candidate": {"candidate_id": "missing", "name": "x"},
-    }[name]
-
-    result = tool(name, args)
-
-    assert "error" in result
-    assert [b.closed for b in tool.lent] == [True]
 
 
 @pytest.mark.parametrize("as_json_text", [False, True])

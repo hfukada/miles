@@ -2,15 +2,18 @@
 
 Status: accepted · 2026-09-27
 
-Design: `docs/design-terrain-and-route-search.md`.
-
 ## Context
 
 The route database (ADR 0002) answers questions about GPX the athlete already
 has. Finding a run in an unfamiliar area, or judging how runnable a route is
 for this particular athlete, needs two things it doesn't have: a model of the
 athlete's own performance by grade, and a routable trail/road network built
-from open map data.
+from open map data. The ranking of candidates against a free-text request is
+an agent's job over MCP; miles supplies deterministic candidates with enough
+breakdown to reason about and explain them.
+
+Out of scope: turn-by-turn navigation, seasonal or permit closures (open map
+data doesn't carry them reliably), and measured traffic volume.
 
 ## Decision
 
@@ -18,7 +21,8 @@ from open map data.
   stored gzipped per fixed 0.05° tile with its sha256, query version, source,
   and cut time; elevation tiles are stored as fetched. The network
   graph is derived from them and rebuilt when `NETWORK_DERIVE_VERSION` bumps
-  or a tile refreshes. Downloads are shared across areas by tile, so
+  or a tile refreshes (from the cached tiles, no downloads; a search of an
+  area being rebuilt is refused until the new graph is in place). Downloads are shared across areas by tile, so
   overlapping and repeated searches never refetch. Pinned areas are kept;
   unpinned areas expire. Nothing refreshes by age: an area is refreshed when
   asked, and reports the date its data is as of.
@@ -34,13 +38,18 @@ from open map data.
   one is validated against the index. The tile payload keeps its
   Overpass-JSON shape and records its source (every extract it was cut
   from: all the registered ones touching the tile, except a region whose
-  descendant contains the whole tile), so the tile stays the ground truth. An area
+  descendant contains the whole tile), so the tile stays the ground truth.
+  A tile is always cut afresh from those extracts, never merged with its
+  stored elements, so a way deleted upstream leaves the tile when its extract
+  is refreshed; it is current only when its regions and each file's
+  `fetched_at` are the ones it was cut from. An area
   where no usable extract exists, or one too large to cut on the server, is
   cut elsewhere with `miles-area-import --pbf` and uploaded as tiles.
 - **The athlete's terrain model is derived from their own streams.** Runs are
   resampled to 20 m segments; per-grade-bin speed, efficiency, and walk
   fraction over a rolling window give a walk-onset grade, a comfortable
   descent grade, and an expected speed by grade, fatigue, and temperature.
+  Weekly snapshots keep the model's own history queryable.
   `TERRAIN_MODEL_VERSION` gates a rebuild from cached streams. Grade comes
   from terrain-model elevation draped on the track where tiles are cached,
   recorded altitude otherwise.
@@ -66,12 +75,25 @@ from open map data.
   when missing), lanes, and separation, corrected by athlete overrides stored
   by OSM way id. Continuous exposure to uncomfortable road is a stateful
   constraint: a run of it longer than the athlete's limit rejects a route.
+- **Path elevation is smoothed over the whole path, as a stored route's is.**
+  Edges keep the terrain model's elevation unsmoothed, because the smoothing
+  window is chosen from a profile's roughness (`gpx_parse.roughness_smoothed`)
+  and most edges are too short to measure one. `score_path` joins consecutive
+  edges into one profile and smooths that, so a candidate's gain, loss, and
+  grades equal those of the route saved from it.
 - **Search is heuristic, pure Python, and returns several diverse
-  candidates.** Contracted graph, bounded around each start, randomized
-  beam-limited generation per shape, full evaluation, a shared-edge penalty
-  for diversity, a time budget, and near misses with the constraints they
-  miss when nothing qualifies. Results are reproducible per request. Ranking
-  a free-text request against the candidates is left to an agent over MCP.
+  candidates.** Degree-2 chains are contracted (except at a start), the graph
+  is bounded around each start by half the maximum distance after removing
+  avoided ways, and candidates are generated per shape: randomized,
+  beam-limited walks that turn home as the remaining distance nears the
+  shortest way back (bounded by distance, since a street grid needs many more
+  steps than a trail network), shortest-path trees to turnaround points, and
+  lollipops as a stem plus a loop. Each is evaluated in full and dropped on a
+  hard-constraint violation; generation continues past N, repeats of the same
+  edge set are dropped, and the top N are chosen under a penalty on edges
+  shared with those already chosen. A time budget bounds the search, and when
+  nothing qualifies the closest few come back with the constraints they miss.
+  Results are reproducible per request.
 - **Candidates are ephemeral until saved.** They live in a TTL'd table; saving
   one writes a GPX and a normal route, so everything in ADR 0002 applies.
 - **Drive-to starts** are trailheads and trail-adjacent public parking, timed
@@ -93,3 +115,16 @@ from open map data.
 - Performance on small hardware is unmeasured for large areas; every search
   input is a portable artifact, so search can move to a faster machine
   without changing the data model.
+
+## Open questions
+
+- Traffic data beyond OpenStreetMap: per-state traffic counts would sharpen
+  road comfort but differ per state; class-based estimates plus overrides come
+  first, with counts a later provider behind the same tiers.
+- The walk threshold (130 steps per minute) is a constant; it could be learned
+  from the valley in the athlete's cadence distribution.
+- `oneway` on paths is sparsely tagged; some directional rules exist only on
+  land-manager signage.
+- Edge technicality (`sac_scale`, `smoothness`), distance to a major road for
+  trails alongside one, and nearby water are not stored, since nothing reads
+  them.

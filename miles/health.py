@@ -2,7 +2,7 @@
 
 Read entirely from the database, so the answer is the same whichever process
 asks: the last sync's outcome, the throttling and credential log (events.py),
-and the background jobs' status rows. Cheap enough to poll every minute.
+and the background jobs' recorded failures. Cheap enough to poll every minute.
 """
 
 import os
@@ -78,8 +78,8 @@ def _credential_reasons(conn: sqlite3.Connection, now: datetime, details: dict[s
 
 
 def _history_work_remains(conn: sqlite3.Connection) -> bool:
-    """Whether any history (streams or laps) is waiting; a backfill error with
-    nothing left to fetch is stale."""
+    """Whether any history (streams or laps) is waiting; a history-pass error
+    with nothing left to fetch is stale."""
     if conn.execute("SELECT 1 FROM terrain_backfill_queue LIMIT 1").fetchone() is not None:
         return True
     return bool(sync.remaining_lap_ids(conn))
@@ -87,15 +87,10 @@ def _history_work_remains(conn: sqlite3.Connection) -> bool:
 
 def _job_reasons(conn: sqlite3.Connection, now: datetime, details: dict[str, object]) -> list[str]:
     reasons: list[str] = []
-    backfill = conn.execute("SELECT status, error FROM terrain_backfill_status WHERE id = 1").fetchone()
-    if (
-        backfill is not None
-        and backfill["status"] == "error"
-        and backfill["error"] != outbound.BACKFILL_INTERRUPTED_ERROR
-        and _history_work_remains(conn)
-    ):
-        details["terrain_backfill_error"] = backfill["error"]
-        reasons.append("terrain backfill in error")
+    history_error = get_meta(conn, sync.META_HISTORY_ERROR)
+    if history_error is not None and _history_work_remains(conn):
+        details["history_pass_error"] = history_error
+        reasons.append("history pass in error")
 
     rebuild_error = get_meta(conn, terrain.REBUILD_ERROR_META)
     if rebuild_error is not None and not terrain.model_is_current(conn):

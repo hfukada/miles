@@ -261,7 +261,7 @@
   }
 
   function renderGapAnalysis(gap) {
-    const bins = [...gap.bins].sort((a, b) => a.lo_pct - b.lo_pct);
+    const bins = gap.bins;
     const rows = bins.map(b => `
       <tr>
         <td>${gradeBinLabel(b)}</td>

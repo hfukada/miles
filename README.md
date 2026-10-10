@@ -69,9 +69,7 @@ first sync of a long history:
   `MILES_STRAVA_RESERVE`), so a sync later the same day can still pull new activities; none
   takes the last calls of the 15-minute window, waiting for the next one instead. Turn the
   history pass off with `--no-history` or `MILES_SYNC_HISTORY=0`. `--extra`, `--extra-limit`,
-  and `--extra-reserve` still work as older names. `miles-terrain-backfill` runs the stream
-  part on its own with the same reserve; it and a sync's history pass never run at once (they
-  share the backfill's status row), so they cannot spend the same allowance twice.
+  and `--extra-reserve` still work as older names.
 - The first interactive sync asks once for your max heart rate (Enter to skip). Set it later —
   or set a personal long-run distance floor — with `uv run miles-sync --max-hr 185` /
   `--long-run-floor 14` (updates the profile, rebuilds derived values, and exits; no Strava calls).
@@ -135,7 +133,7 @@ Without `history=true` the sync skips the history trickle (the Sync button in th
 Poll `GET /api/sync/status` for progress; `GET /api/health` tells a monitor whether the last
 sync worked.
 
-The CLIs (`miles-auth`, `miles-sync`, `miles-terrain-backfill`,
+The CLIs (`miles-auth`, `miles-sync`,
 `miles-area-refresh`) and the stdio server (`miles-mcp`) stay for development and self-hosting. Each is a
 single-process tool with its own throttle state, so the process that makes outbound calls
 takes an exclusive lock file beside the database (`activities.db.outbound.lock`) when it
@@ -186,47 +184,11 @@ Opens a local web interface at `http://localhost:8000` with six pages:
 
 ## MCP tools
 
-| Tool | Description |
-|---|---|
-| `get_weekly_mileage` | Miles per ISO week, optional date range |
-| `get_activities` | List runs filtered by effective run type, date range |
-| `get_training_block` | Aggregate stats for a date range, broken down by run type |
-| `get_training_periods` | Detected stretches of consistent training, their gaps, and race-anchored builds |
-| `get_consistency_report` | Streaks, gaps, rolling volume and ramp — the "how consistent am I" tool |
-| `get_race_history` | Every race at every distance with PR flags, effort labels, pre-race context |
-| `get_personal_bests` | Per-distance PRs with full progression |
-| `get_race_equivalents` | Riegel cross-distance equivalents; casual-effort races excluded by default |
-| `get_race_splits` | Post-race split analysis (negative/even/positive verdict) |
-| `get_race_comparison` | Any race's result alongside its pre-race training window |
-| `get_marathon_comparison` | All marathon results with 12-week build breakdowns and peak week stats |
-| `get_build_snapshot` | Week-by-week view of the build before any race |
-| `get_fitness_estimate` | Estimated race paces and training zones as of a date, with confidence |
-| `get_fitness_trend` | Monthly estimated-fitness checkpoints over time |
-| `get_workout_laps` | Workout sessions with per-lap breakdown, filterable by label |
-| `get_workout_session` | Lap-by-lap detail for one workout: lap types and intensity zones |
-| `compare_workouts_by_build` | Cross-build comparison of a workout label's rep pace/HR |
-| `get_easy_hr_trend` | Monthly easy-run HR and pace — long-term aerobic fitness signal |
-| `get_activity_weather` | Hourly weather breakdown for one activity |
-| `get_training_plan` | The current training plan (or any version), version history, diffs, and this week's targets vs synced actuals |
-| `get_plan_adherence` | Week-by-week plan adherence bands and pattern flags |
-| `start_plan_draft` | Open a new mutable plan draft (used by the `miles:miles-plan` planner) |
-| `start_revision_draft` | Copy the active plan's current version into a new draft for revision |
-| `set_draft_weeks` / `set_draft_days` | Author or edit any subset of a draft incrementally |
-| `delete_draft_weeks` / `delete_draft_days` | Retract part of a draft |
-| `get_draft` | Draft state with a gap report and sanity warnings |
-| `commit_plan` | Freeze and commit the draft after athlete approval; past weeks snapshotted, never rewritten |
-| `discard_draft` | Throw a draft away |
-| `log_plan_adjustment` | Record day-level reality ("skipped Tue") without a version bump |
-| `abandon_plan` | Mark the active plan abandoned, with the reason logged |
-| `run_sql` | Ad-hoc read-only SQL against all tables, including derived columns |
-| `list_routes` | Stored routes, filterable by distance, ft/mi, a tag, or proximity to a lat/lng |
-| `get_route` | Full detail for one route: stats, climbs, grade bands, waypoints, leg definition |
-| `find_route_junctions` | Where two routes meet: contact points plus any shared/overlapping stretches |
-| `find_routes_near` | Routes near a point or near another route |
-| `compose_route` | Stitch route legs (partial spans, reversible) and connector legs into a combined run, optionally saving the result |
-| `compare_route_to_course` | Side-by-side ft/mi, grade histograms, climb lists, and descent placement for two routes |
-| `update_route` | Edit a route's name/notes/tags |
-| `get_outbound_requests` | Requests miles made to each outside service per day, by host, endpoint kind, and status |
+The tool descriptions the server publishes are the reference; ask Claude Code what a tool does.
+They cover training analysis (mileage, activities, blocks, periods, consistency), races and
+builds, fitness estimates, workouts and laps, weather, training plans (draft, commit, adherence),
+stored routes (compare, compose, junctions, proximity), the terrain model, area import and route
+search, outbound-request counts, and read-only SQL over every table.
 
 `run_type` reflects the label you set in Strava (`easy`, `workout`, `long_run`, `race`);
 untagged activities get an inferred type from name, distance, and pace history — your
@@ -275,28 +237,20 @@ variable that points it at your own instance. Two settings are worth making:
 
 ## Operations
 
-### Health check: `/api/health`
-
-`GET /api/health` answers `200 {"status": "ok"}` when nothing needs attention and
-`503 {"status": "attention", "reasons": [...]}` otherwise, so an uptime monitor's HTTP-status
-or keyword check can watch it. `?verbose=1` adds the underlying values. It reads only
-the database (a few indexed queries), so it gives the same answer whichever process did the work. It
-reports:
-
-- the last sync failed, or none has succeeded in `MILES_HEALTH_SYNC_MAX_HOURS` (default 36)
-- any request that ended on a 429 from any service in the last 24 hours (a 429 that a retry got
-  past does not count)
-- the terrain backfill in error while history work remains, a terrain model rebuild in error, or an
-  area import that failed in the last 7 days; a run cut off by a restart is not an alert
-- Strava rejecting the credentials, until a later sync succeeds
+`GET /api/health` answers `200 {"status": "ok"}` when nothing needs attention and `503` with a
+list of reasons otherwise (a failed or stale sync, a 429 from any service in the last day, Strava
+rejecting the credentials, a failed history pass, terrain rebuild, or area import); `?verbose=1`
+adds the underlying values and `MILES_HEALTH_SYNC_MAX_HOURS` (default 36) sets how old the last
+sync may be. It reads only the database, so any process gives the same answer.
 
 ### Metrics: `/metrics`
 
 Off by default: set `MILES_METRICS=1` and `GET /metrics` serves the Prometheus text format
 (it is a 404 otherwise). Series:
 
-- `miles_outbound_requests_total{service,host,kind,status}`: every outbound request, from a durable
-  per-day ledger (below), so it survives restarts and includes CLI runs. `status` is the HTTP
+- `miles_outbound_requests_total{service,host,kind,status}`: every outbound request, from a
+  per-day table in the database (400 days kept; the `get_outbound_requests` MCP tool reads it),
+  so it survives restarts and includes CLI runs. `status` is the HTTP
   code, or `error` for a connection failure; `kind` is the Strava endpoint (`activities`,
   `detail`, `laps`, `streams`, `token`, `other`) and empty for other services
 - `miles_strava_daily_calls_remaining` and `miles_strava_short_window_calls_remaining`: the
@@ -314,17 +268,3 @@ stdio MCP server, and each CLI run count separately, and a counter restarts at z
 process does. Everything else is read from the database at scrape time, so it covers runs by any
 process. The exposition is rendered by `prometheus_client`; sample values print as floats.
 
-### Outbound request ledger
-
-Each process that serves or runs miles (the API server, the MCP server, `miles-sync`, the
-backfill and refresh CLIs) records every outbound request in the `outbound_requests` table: one
-row per day, service, host, endpoint kind, and status, with a count. The hostname is the one
-actually requested, so a self-hosted override appears as its own host. Rows older than 400 days
-are dropped. A scheduled `miles-sync` that exits in a minute is counted the same as the server.
-
-- `GET /api/outbound?days=30` returns the per-day rows for the last N days.
-- The `get_outbound_requests` MCP tool returns the same, so "how many requests did we make to
-  each service this month" is a question to ask directly.
-- A request that ends on a 429 (after any retries) or a Strava credential rejection also leaves a
-  timestamped row for a week, which is what the health check's 24-hour window reads. The
-  per-day counts include every attempt, retried ones too.

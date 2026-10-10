@@ -23,14 +23,12 @@ from typing_extensions import NotRequired, TypedDict
 from xml.sax.saxutils import escape as xml_escape
 
 from . import db, elevation, gpx_parse, routes_spatial
-from .fitness import MILE_M
+from .fitness import FT_PER_M, MILE_M
 
 # Bumped for DEM draping (elevation_source preference, ele_source,
 # elevation_pending) and roughness-based smoothing -- both change what
 # _apply_derived computes from the same raw GPX bytes.
 ROUTE_DERIVE_VERSION = 4
-
-FT_PER_M = 3.28084
 
 RouteLegKind = Literal["route", "connector"]
 
@@ -332,8 +330,7 @@ class _ElevationStats(NamedTuple):
 def _elevation_stats(dist_m: list[float], elevations: list[float], total_distance: float) -> _ElevationStats:
     """The profile smoothed with a window chosen from its own roughness, and
     its gain, loss, extremes, and gain per mile."""
-    half_window_m = gpx_parse.smoothing_half_window_for(gpx_parse.profile_roughness_m(dist_m, elevations))
-    smoothed = gpx_parse.smoothed_elevations(elevations, dist_m, half_window_m)
+    smoothed, half_window_m = gpx_parse.roughness_smoothed(dist_m, elevations)
     gain_m, loss_m = gpx_parse.gain_loss_m(smoothed)
     ft_per_mi = (gain_m * FT_PER_M) / (total_distance / MILE_M) if total_distance > 0 else None
     return _ElevationStats(smoothed, half_window_m, gain_m, loss_m, min(elevations), max(elevations), ft_per_mi)
@@ -664,10 +661,8 @@ def update_route(
     new value instead; tags can be cleared with an empty list.
 
     Changing elevation_source (auto/file/dem) re-derives the route's
-    elevation immediately under the new preference, cache-only -- the same
-    no-network guarantee as every other derive path. If the new preference
-    needs a tile that isn't cached yet, the route comes back pending; call
-    redrape_route to fetch it now instead of waiting for the next derive.
+    elevation at once from cached tiles only; a route that needs an uncached
+    tile comes back pending (see redrape_route).
     """
     row = _get_route_row(conn, route_id)
     sets: list[str] = []
@@ -710,11 +705,8 @@ def _redrape_route(conn: sqlite3.Connection, route_id: int, *, fetch_tiles: bool
 
 
 def redrape_route(conn: sqlite3.Connection, route_id: int) -> RouteDetail:
-    """Re-derive one route's elevation with network fetches allowed, unlike
-    every other derive path here (upload, full rebuild, a preference
-    change), which only read the elevation tile cache. Use after an area
-    import has cached tiles the route needed, or any time a pending drape
-    should be retried now instead of waiting for the next derive."""
+    """Re-derive one route's elevation, fetching any missing tiles; every
+    other derive path reads only the tile cache. Retries a pending drape."""
     _redrape_route(conn, route_id, fetch_tiles=True)
     return get_route(conn, route_id)
 
@@ -793,19 +785,15 @@ def routes_near_route(conn: sqlite3.Connection, route_id: int, radius_m: float) 
     anchor_points = _route_points_latlng(conn, route_id)
     if not anchor_points:
         raise RouteNotFoundError(f"No route {route_id}")
-    grid = routes_spatial.Grid(anchor_points, cell_size_m=max(radius_m, 15.0))
+    anchor_index = routes_spatial.point_index(anchor_points, radius_m)
     rows = conn.execute(
         "SELECT route_id, name FROM routes WHERE distance_m IS NOT NULL AND route_id != ?", [route_id]
     ).fetchall()
     out: list[RouteNearby] = []
     for r in rows:
         pts = _route_points_latlng(conn, r["route_id"])
-        best: float | None = None
-        for lat, lng in pts:
-            for j in grid.near(lat, lng, radius_m):
-                d = routes_spatial.equirect_distance_m(lat, lng, anchor_points[j][0], anchor_points[j][1])
-                if d <= radius_m and (best is None or d < best):
-                    best = d
+        hits = (anchor_index.nearest(lat, lng, radius_m) for lat, lng in pts)
+        best = min((hit[2] for hit in hits if hit is not None), default=None)
         if best is not None:
             out.append({"route_id": r["route_id"], "name": r["name"], "distance_m": best})
     out.sort(key=lambda x: x["distance_m"])

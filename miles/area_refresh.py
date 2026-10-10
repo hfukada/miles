@@ -3,7 +3,7 @@ request, on the host that owns the database."""
 
 import click
 
-from . import areas, db, events, geocode, outbound
+from . import areas, db, geocode, outbound
 
 
 @click.command()
@@ -17,7 +17,6 @@ def main(label: str | None, geocode_place: str | None, force_extract: bool) -> N
     if label is None and geocode_place is None:
         raise click.UsageError("give an area LABEL to refresh, or --geocode PLACE")
     outbound.claim()
-    events.install()
     conn = db.connect()
     if geocode_place is not None:
         try:

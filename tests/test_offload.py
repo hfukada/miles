@@ -5,16 +5,15 @@ import pytest
 from helpers import ORIGIN_LAT, ORIGIN_LNG, FakeOsrm, meadow_payload, none_sampler
 from mcp.server.fastmcp import FastMCP
 
-from miles import areas_mcp, db, drive_mcp, network, search_mcp
+from miles import areas_mcp, db, network, routing_mcp
 
 SLOW_S = 0.2
 
 
 def _server() -> FastMCP:
     server = FastMCP("test")
-    drive_mcp.register_drive_tools(server)
     areas_mcp.register_area_tools(server)
-    search_mcp.register_search_tools(server)
+    routing_mcp.register_routing_tools(server)
     return server
 
 

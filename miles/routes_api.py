@@ -166,10 +166,7 @@ def patch_route(route_id: int, body: RouteUpdateBody) -> routes_service.RouteDet
 
 @router.post("/api/routes/{route_id}/redrape")
 def post_redrape_route(route_id: int) -> routes_service.RouteDetail:
-    """Re-derive this route's elevation with network fetches allowed --
-    unlike every other derive path, which only reads the elevation tile
-    cache. Use after an area import has cached tiles the route needed, or
-    to retry a pending drape immediately."""
+    """Re-derive this route's elevation, fetching tiles (routes.redrape_route)."""
     with db.connection(routes_service.connect) as conn:
         try:
             return routes_service.redrape_route(conn, route_id)

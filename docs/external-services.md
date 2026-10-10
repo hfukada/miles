@@ -10,7 +10,7 @@ per service), retries transient failures with exponential backoff, honors
 for more than five minutes), and gives up after a bounded number of attempts.
 
 Every request, and its outcome, is counted per day by service and host in the
-database (`/api/outbound`, the `get_outbound_requests` MCP tool, and `/metrics`;
+database (the `get_outbound_requests` MCP tool and `/metrics`;
 see the README), so "how much traffic do we send to each service" has an answer
 that includes short-lived CLI runs.
 
@@ -143,8 +143,11 @@ date, or the cut time of tiles uploaded from a local file) and `refresh_suggeste
   second process-wide, with an identifying User-Agent; it caches answers and
   never caches a failure. Anything heavier belongs on your own server, via
   `MILES_OSRM_URL`.
-- **miles enforces:** a 1.1 s gap between requests and up to three attempts on
-  429/503/504, connection errors, and bodies cut short. Drive times are cached
+- **miles enforces:** a 1.1 s gap between requests and up to two attempts on
+  429/503/504, connection errors, and bodies cut short, each with a 3 s
+  timeout. A search is waiting on the answer, so a dead server costs it about
+  seven seconds before the estimates take over, and the single retry is spaced
+  by the 1.1 s gap like any other request. Drive times are cached
   by origin (the 100 m grid cell it falls in) and destination: 180 days for a
   measured time and 7 days for an "unreachable" answer, which may be a gap in
   the road data. Expired rows are deleted as searches run. A failed request is
@@ -209,7 +212,7 @@ date, or the cut time of tiles uploaded from a local file) and `refresh_suggeste
 ### Strava
 
 - **Used for:** the activity list, laps, and streams.
-- **Called:** by `miles-sync` and the Sync button, the terrain backfill, and an
+- **Called:** by `miles-sync` and the Sync button, and by an
   activity page that fetches its own streams. A sync runs in passes: the
   activity list always, then detail for what is new, then (for `miles-sync`
   when history is on, the default; the Sync button skips it unless asked with

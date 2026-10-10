@@ -41,6 +41,7 @@ Effort = Literal["raced", "hard", "casual"]
 _SOFT_CONFIDENCE = ("medium-low", "low")
 
 MILE_M = 1609.34
+FT_PER_M = 3.28084  # feet per meter
 
 # Projection targets: the four headline distances plus the two zone anchors.
 PREDICTED_KEYS = ("5K", "10K", "half", "marathon")

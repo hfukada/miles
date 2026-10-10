@@ -65,7 +65,7 @@ def test_backfill_rewrites_start_date_to_local_wall_time_once_and_leaves_rows_wi
 # column definition changes the hash; the version must then be bumped, the
 # upgrade for existing databases written in init_db, and the new hash recorded.
 _SCHEMA_HASHES = {
-    1: "6d6f3f3b6ff16e9660ddf69b22fa07e347c5296d7337f182910cbcaa96070672",
+    1: "aea5ae73e40fa9e1797a71628ba98d85203433a908c53572313b52db2ef83721",
 }
 
 

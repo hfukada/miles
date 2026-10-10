@@ -1,7 +1,7 @@
-"""Route search over an area's network graph
-(docs/design-terrain-and-route-search.md, section 4): bound the graph around
-each start, contract degree-2 chains, generate randomized candidates per
-shape, score each through network.score_path, and diversify.
+"""Route search over an area's network graph (adr/0003-terrain-model-and-route-search.md):
+bound the graph around each start, contract degree-2 chains, generate
+randomized candidates per shape, score each through network.score_path, and
+diversify.
 
 A search never writes to the network graph: a start point is spliced into an
 in-memory copy. Candidates are kept behind a TTL until saved
@@ -112,16 +112,6 @@ class RouteSearchResult(TypedDict):
 
 class CandidateNotFoundError(LookupError):
     pass
-
-
-class AreaNotReadyError(ValueError):
-    """The area is importing or its last import failed, so its graph may be
-    absent, partial, or about to be replaced."""
-
-
-class AreaRebuildingError(ValueError):
-    """The area's network predates the current network.NETWORK_DERIVE_VERSION and is
-    being rebuilt from its cached tiles; searching it now would use a stale graph."""
 
 
 # ---------------------------------------------------------------------------
@@ -755,13 +745,13 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         # A failed or interrupted refresh leaves the committed graph searchable.
         has_graph = conn.execute("SELECT 1 FROM net_graphs WHERE area_id = ?", [area_id]).fetchone()
         if has_graph is None:
-            raise AreaNotReadyError(
+            raise ValueError(
                 f"area {area_id} is not ready (status: {area_status['status']}); "
                 "check get_area_status and search again when it is ready"
             )
 
     if areas.rebuild_stale_network(conn, area_id):
-        raise AreaRebuildingError(
+        raise ValueError(
             f"area {area_id} is being rebuilt for a newer network model; "
             "check get_area_status and search again when it is ready"
         )

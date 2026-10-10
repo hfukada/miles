@@ -1,17 +1,17 @@
-"""Pure spatial geometry for route matching: distance, a coarse grid index,
-junction/overlap detection between two point sequences, shape
+"""Pure spatial geometry for route matching: distance, a bucketed point
+index, junction/overlap detection between two point sequences, shape
 classification, and the pointwise slicing compose_route needs to stitch
 partial legs together.
 
-Deliberately dependency-light -- equirectangular distance plus a grid index
-over lat/lng cells, no GIS library. At the scale of a single hike or race
+Deliberately dependency-light -- equirectangular distance plus a bucketed
+index over lat/lng cells, no GIS library. At the scale of a single hike or race
 course (tens of km, thousands of points) the flat-earth approximation this
 uses is accurate to well under a meter, and a real projection library would
 be a lot of dependency for a problem this local in extent.
 """
 
 import math
-from typing import Hashable, Iterable, Iterator
+from typing import Hashable, Iterable, Iterator, cast
 from typing_extensions import TypedDict
 
 _EARTH_RADIUS_M = 6371000.0
@@ -74,45 +74,6 @@ def equirect_distance_m(lat1: float, lng1: float, lat2: float, lng2: float) -> f
     return math.sqrt(x * x + y * y) * _EARTH_RADIUS_M
 
 
-class Grid:
-    """Coarse lat/lng bucket index over a fixed point list, for
-    radius queries. Cell size is fixed at construction from a reference
-    latitude (the mean of the indexed points) -- good enough since every
-    use here spans a single route or a local neighborhood, not enough
-    latitude range for the deg-per-meter approximation to drift.
-    """
-
-    def __init__(self, points: list[tuple[float, float]], cell_size_m: float):
-        self._points = points
-        self._cell_size_m = cell_size_m
-        ref_lat = sum(p[0] for p in points) / len(points) if points else 0.0
-        self._deg_per_m_lat = 1.0 / METERS_PER_DEG_LAT
-        self._deg_per_m_lng = 1.0 / meters_per_deg_lng(ref_lat)
-        self._cell_lat = cell_size_m * self._deg_per_m_lat
-        self._cell_lng = cell_size_m * self._deg_per_m_lng
-        self._cells: dict[tuple[int, int], list[int]] = {}
-        for i, (lat, lng) in enumerate(points):
-            self._cells.setdefault(self._cell_of(lat, lng), []).append(i)
-
-    def _cell_of(self, lat: float, lng: float) -> tuple[int, int]:
-        return (int(math.floor(lat / self._cell_lat)), int(math.floor(lng / self._cell_lng)))
-
-    def near(self, lat: float, lng: float, radius_m: float) -> list[int]:
-        """Candidate point indices within radius_m -- a superset (cell
-        granularity, no exact-distance filtering); callers must re-check
-        with equirect_distance_m."""
-        if not self._points:
-            return []
-        cx, cy = self._cell_of(lat, lng)
-        reach_x = max(1, math.ceil(radius_m / max(self._cell_size_m, 1e-9)))
-        reach_y = reach_x
-        out: list[int] = []
-        for dx in range(-reach_x, reach_x + 1):
-            for dy in range(-reach_y, reach_y + 1):
-                out.extend(self._cells.get((cx + dx, cy + dy), []))
-        return out
-
-
 class NearestIndex:
     """Bucketed sample points of keyed polylines (a network's edges, a set of
     road points), answering "which key's polyline passes nearest here, at
@@ -122,17 +83,15 @@ class NearestIndex:
     latitude: a point within radius_m is always returned and a farther one
     never is. Longitude cells are a fixed number of degrees wide, set from
     the first point added, so the number of cells a lookup spans is worked
-    out from its own latitude."""
+    out from its own latitude. A removed key is gone for good: callers give
+    every key they add a fresh id."""
 
     def __init__(self, cell_size_m: float) -> None:
         self._cell_m = cell_size_m
         self._cell_lat = cell_size_m / METERS_PER_DEG_LAT
         self._cell_lng: float | None = None  # fixed by the first point added
-        self._cells: dict[tuple[int, int], list[tuple[Hashable, int, float, float, float]]] = {}
-        # Key -> generation of its points; remove() advances it, so points
-        # added before a removal never come back when the key is added again.
-        self._generation: dict[Hashable, int] = {}
-        self._live: set[Hashable] = set()
+        self._cells: dict[tuple[int, int], list[tuple[Hashable, float, float, float]]] = {}
+        self._removed: set[Hashable] = set()
 
     def _cell_of(self, lat: float, lng: float) -> tuple[int, int]:
         assert self._cell_lng is not None
@@ -140,16 +99,13 @@ class NearestIndex:
 
     def add(self, key: Hashable, points: Iterable[tuple[float, float, float]]) -> None:
         """points are (lat, lng, offset_m along the key's polyline)."""
-        self._live.add(key)
-        generation = self._generation.get(key, 0)
         for lat, lng, offset_m in points:
             if self._cell_lng is None:
                 self._cell_lng = self._cell_m / meters_per_deg_lng(lat)
-            self._cells.setdefault(self._cell_of(lat, lng), []).append((key, generation, lat, lng, offset_m))
+            self._cells.setdefault(self._cell_of(lat, lng), []).append((key, lat, lng, offset_m))
 
     def remove(self, key: Hashable) -> None:
-        self._live.discard(key)
-        self._generation[key] = self._generation.get(key, 0) + 1
+        self._removed.add(key)
 
     def within(self, lat: float, lng: float, radius_m: float) -> Iterator[tuple[Hashable, float, float]]:
         """(key, offset_m, distance_m) for every indexed point within radius_m."""
@@ -162,8 +118,8 @@ class NearestIndex:
         reach_cols = max(1, math.ceil(lng_deg / self._cell_lng))
         for d_row in range(-reach_rows, reach_rows + 1):
             for d_col in range(-reach_cols, reach_cols + 1):
-                for key, generation, plat, plng, offset_m in self._cells.get((row + d_row, col + d_col), ()):
-                    if key not in self._live or generation != self._generation.get(key, 0):
+                for key, plat, plng, offset_m in self._cells.get((row + d_row, col + d_col), ()):
+                    if key in self._removed:
                         continue
                     d = equirect_distance_m(lat, lng, plat, plng)
                     if d <= radius_m:
@@ -172,6 +128,15 @@ class NearestIndex:
     def nearest(self, lat: float, lng: float, radius_m: float) -> tuple[Hashable, float, float] | None:
         """The (key, offset_m, distance_m) of the closest indexed point within radius_m."""
         return min(self.within(lat, lng, radius_m), key=lambda hit: hit[2], default=None)
+
+
+def point_index(points: list[tuple[float, float]], radius_m: float) -> NearestIndex:
+    """A NearestIndex over bare points, each its own key (its position in
+    `points`), for radius_m lookups."""
+    index = NearestIndex(max(radius_m, 15.0))
+    for i, (lat, lng) in enumerate(points):
+        index.add(i, ((lat, lng, 0.0),))
+    return index
 
 
 def _typical_spacing_m(dist: list[float]) -> float:
@@ -210,7 +175,7 @@ def find_junctions(
     tolerance_m: float = 30.0,
 ) -> JunctionResult:
     """For every point of A, find its nearest point of B within
-    tolerance_m (via a grid index over B), collapse consecutive matched
+    tolerance_m (via an index over B), collapse consecutive matched
     points of A into runs, then split each run wherever B's matched
     position jumps (see _split_run_by_b_continuity) before classifying
     each piece as a Junction (short contact) or an Overlap (a run at
@@ -225,15 +190,11 @@ def find_junctions(
     if not points_a or not points_b:
         return {"junctions": [], "overlaps": []}
 
-    grid = Grid(points_b, cell_size_m=max(tolerance_m, 15.0))
+    index = point_index(points_b, tolerance_m)
     matches: list[tuple[int, int, float] | None] = []
     for i, (lat, lng) in enumerate(points_a):
-        best: tuple[int, float] | None = None
-        for j in grid.near(lat, lng, tolerance_m):
-            d = equirect_distance_m(lat, lng, points_b[j][0], points_b[j][1])
-            if d <= tolerance_m and (best is None or d < best[1]):
-                best = (j, d)
-        matches.append((i, best[0], best[1]) if best is not None else None)
+        hit = index.nearest(lat, lng, tolerance_m)
+        matches.append((i, cast(int, hit[0]), hit[2]) if hit is not None else None)
 
     runs: list[list[tuple[int, int, float]]] = []
     current: list[tuple[int, int, float]] = []
@@ -317,16 +278,9 @@ def routes_near_point(
     points: list[tuple[float, float]],
 ) -> float | None:
     """Closest approach in meters from (query_lat, query_lng) to any of
-    points, or None if nothing lies within radius_m. Used both for
-    routes_near (fixed point vs. many routes) and routes_near_route
-    (route vs. route, called once per candidate)."""
-    grid = Grid(points, cell_size_m=max(radius_m, 15.0))
-    best: float | None = None
-    for j in grid.near(query_lat, query_lng, radius_m):
-        d = equirect_distance_m(query_lat, query_lng, points[j][0], points[j][1])
-        if d <= radius_m and (best is None or d < best):
-            best = d
-    return best
+    points, or None if nothing lies within radius_m."""
+    hit = point_index(points, radius_m).nearest(query_lat, query_lng, radius_m)
+    return None if hit is None else hit[2]
 
 
 def slice_by_distance(

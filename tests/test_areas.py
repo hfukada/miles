@@ -219,7 +219,9 @@ def test_gc_removes_stale_unpinned_areas_their_networks_and_orphaned_tiles(conn:
         assert conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
 
 
-def test_an_import_prepares_without_the_import_lock_then_reports_queued_until_it_holds_it(conn: sqlite3.Connection):
+def test_an_import_downloads_without_the_import_slot_then_reports_queued_until_it_holds_it(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+):
     area_id = _insert_area(conn, "q", status="importing")
     phases: list = []
     entered = threading.Event()
@@ -228,17 +230,21 @@ def test_an_import_prepares_without_the_import_lock_then_reports_queued_until_it
     def phase() -> str:
         return conn.execute("SELECT status_phase FROM areas WHERE area_id = ?", (area_id,)).fetchone()[0]
 
-    def prepare(c, aid):
+    def select(c, aid, refresh=False, force_extract=False):
         entered.set()
         release.wait(5)
+        return []
 
-    def body(c, aid):
+    def fetch_tiles(c, aid, area, selected):
         phases.append(c.execute("SELECT status_phase FROM areas WHERE area_id = ?", (aid,)).fetchone()[0])
 
-    runner = _REAL_THREAD(target=areas_service._run_job, args=(area_id, body, prepare))
+    monkeypatch.setattr(areas_service, "select_area_extracts", select)
+    monkeypatch.setattr(areas_service, "_fetch_tiles_phase", fetch_tiles)
+    monkeypatch.setattr(areas_service, "_finish_import", lambda c, aid, area: None)
+    runner = _REAL_THREAD(target=areas_service._run_import_job, args=(area_id,))
     runner.start()
     assert entered.wait(5)
-    assert areas_service._import_lock.acquire(timeout=1), "preparing must not hold the import lock"
+    assert areas_service._import_lock.acquire(timeout=1), "downloading must not hold the import slot"
     try:
         release.set()
         assert _wait_until(lambda: phase() == "queued")
@@ -257,12 +263,13 @@ def test_imports_run_one_at_a_time_process_wide(monkeypatch: pytest.MonkeyPatch)
 
     def slow_body(conn, area_id):
         nonlocal active, max_active
-        with guard:
-            active += 1
-            max_active = max(max_active, active)
-        threading.Event().wait(0.05)
-        with guard:
-            active -= 1
+        with areas_service._import_slot(conn, area_id):
+            with guard:
+                active += 1
+                max_active = max(max_active, active)
+            threading.Event().wait(0.05)
+            with guard:
+                active -= 1
 
     threads = [threading.Thread(target=areas_service._run_job, args=(i, slow_body)) for i in (1, 2, 3)]
     for t in threads:

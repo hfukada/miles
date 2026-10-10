@@ -9,15 +9,13 @@ by the best score that time could still give them, and only the most
 promising uncached ones sent. Answers are cached by origin cell and
 destination node. When OSRM cannot be reached, drive times are straight-line
 estimates, flagged, never cached, and OSRM is left alone for
-OSRM_RETRY_COOLDOWN_S (kept in process memory).
+OSRM_RETRY_COOLDOWN_S (http_client's quiet period, kept in process memory).
 """
 
 import http.client
 import json
 import os
 import sqlite3
-import threading
-import time
 import urllib.error
 from collections import Counter
 from datetime import datetime, timedelta, timezone
@@ -25,7 +23,6 @@ from typing import cast
 from typing_extensions import TypedDict
 
 from . import areas, gpx_parse, http_client, metrics, network, routes_spatial
-from .fitness import MILE_M
 
 OSRM_BASE = os.environ.get("MILES_OSRM_URL", "https://router.project-osrm.org")
 
@@ -229,29 +226,15 @@ def _cache_lookup(
     return found
 
 
-_EXPIRE_INTERVAL_S = 3600.0
-_last_expired_at: float | None = None
-_expire_lock = threading.Lock()
-
-
 def _cache_store(conn: sqlite3.Connection, origin_key: tuple[int, int], results: dict[int, float | None]) -> None:
-    """Upsert OSRM's answers. Rows past their TTL are deleted along the way, at
-    most once an hour per process: the TTLs are days, and the delete takes a
-    write lock."""
-    global _last_expired_at
+    """Upsert OSRM's answers, deleting rows past their TTL along the way."""
     now = datetime.now(timezone.utc)
-    with _expire_lock:
-        expire = _last_expired_at is None or time.monotonic() - _last_expired_at >= _EXPIRE_INTERVAL_S
-        if expire:
-            _last_expired_at = time.monotonic()
-    if expire:
-        conn.execute(
-            "DELETE FROM drive_time_cache WHERE fetched_at < CASE WHEN drive_s IS NULL THEN ? ELSE ? END",
-            [
-                (now - timedelta(days=UNREACHABLE_CACHE_TTL_DAYS)).isoformat(),
-                (now - timedelta(days=DRIVE_TIME_CACHE_TTL_DAYS)).isoformat(),
-            ],
-        )
+    measured_cutoff = (now - timedelta(days=DRIVE_TIME_CACHE_TTL_DAYS)).isoformat()
+    unreachable_cutoff = (now - timedelta(days=UNREACHABLE_CACHE_TTL_DAYS)).isoformat()
+    conn.execute(
+        "DELETE FROM drive_time_cache WHERE fetched_at < ? AND (drive_s IS NULL OR fetched_at < ?)",
+        [unreachable_cutoff, measured_cutoff],
+    )
     conn.executemany(
         """
         INSERT INTO drive_time_cache (origin_lat_r, origin_lng_r, dest_node_id, drive_s, fetched_at)
@@ -286,18 +269,6 @@ def _fetch_durations(url: str) -> list[float | None] | None:
     if not durations:
         return None
     return list(durations[0][1:])  # index 0 is the origin-to-origin entry
-
-
-_osrm_unavailable_until = 0.0
-
-
-def _osrm_available() -> bool:
-    return time.monotonic() >= _osrm_unavailable_until
-
-
-def _note_osrm_failure() -> None:
-    global _osrm_unavailable_until
-    _osrm_unavailable_until = time.monotonic() + OSRM_RETRY_COOLDOWN_S
 
 
 def _straight_line_km(origin_lat: float, origin_lng: float, c: dict) -> float:
@@ -337,12 +308,12 @@ def _resolve_drive_times(
     if not to_ask:
         return result
     durations = None
-    if _osrm_available():
+    if http_client.quiet_remaining_s(http_client.OSRM) <= 0:
         url = _osrm_table_url((origin_lat, origin_lng), [(c["lat"], c["lng"]) for c in to_ask])
         durations = _fetch_durations(url)
         if durations is None or len(durations) != len(to_ask):
             durations = None
-            _note_osrm_failure()
+            http_client.pause(http_client.OSRM, OSRM_RETRY_COOLDOWN_S)
     if durations is None:
         # Estimates stay out of the cache so a later search asks for real times.
         for c in to_ask:
@@ -416,17 +387,3 @@ def drive_starts(
 
     top = [cast(DriveStart, {key: c[key] for key in DriveStart.__annotations__}) for c in scored[:k]]
     return [origin_start, *top]
-
-
-def athlete_view(start: DriveStart) -> dict:
-    """A start in the units the HTTP and MCP surfaces report: minutes and miles."""
-    return {
-        "lat": start["lat"],
-        "lng": start["lng"],
-        "label": start["label"],
-        "drive_minutes": start["drive_s"] / 60.0,
-        "kind": start["kind"],
-        "osm_node_id": start["osm_node_id"],
-        "trail_miles_nearby": start["trail_m_nearby"] / MILE_M,
-        "drive_time_estimated": start["drive_time_estimated"],
-    }

@@ -16,6 +16,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Callable, cast
 from typing_extensions import NotRequired, TypedDict
@@ -551,19 +552,13 @@ def select_area_extracts(
 
 
 def _fetch_tiles_phase(
-    conn: sqlite3.Connection,
-    area_id: int,
-    area: sqlite3.Row,
-    refresh: bool = False,
-    force_extract: bool = False,
-    selected: list[extracts.ExtractRecord] | None = None,
+    conn: sqlite3.Connection, area_id: int, area: sqlite3.Row, selected: list[extracts.ExtractRecord]
 ) -> None:
     """Fill map_tiles for the area's bbox from the selected extracts
-    (docs/design-terrain-and-route-search.md section 2). A caller that already
-    ran select_area_extracts passes its result as selected. Tile membership is
-    recorded first so a concurrent import's gc cannot evict tiles still being
-    filled. Tiles are re-cut unless all were cut from exactly the extracts
-    needed now, at their current fetched_at (extracts.tiles_cut_from)."""
+    (select_area_extracts). Tile membership is recorded first so a concurrent
+    import's gc cannot evict tiles still being filled. Tiles are re-cut unless
+    all were cut from exactly the extracts needed now, at their current
+    fetched_at (extracts.tiles_cut_from)."""
     bbox = tiles.bbox_for_center_radius(area["center_lat"], area["center_lng"], area["radius_km"])
     needed = tiles.tiles_in_bbox(*bbox)
     total = len(needed)
@@ -574,8 +569,6 @@ def _fetch_tiles_phase(
     )
     conn.commit()
 
-    if selected is None:
-        selected = select_area_extracts(conn, area_id, refresh, force_extract)
     _set_progress(conn, area_id, phase="tiles", done=0, total=total)
     if extracts.tiles_cut_from(conn, selected, needed):
         metrics.cache("map_tiles", "hit", total)
@@ -605,7 +598,7 @@ def _payload_extent(payloads: Iterable[dict]) -> tuple[float, float, float, floa
 
 
 def _finish_import(conn: sqlite3.Connection, area_id: int, area: sqlite3.Row) -> None:
-    """Elevation prefetch and network build, shared by _do_import and
+    """Elevation prefetch and network build, shared by an extract import and
     import_tiles (tiles uploaded already cut)."""
     needed = [(r["gx"], r["gy"]) for r in conn.execute(
         "SELECT gx, gy FROM area_tiles WHERE area_id = ?", (area_id,)
@@ -629,20 +622,6 @@ def _finish_import(conn: sqlite3.Connection, area_id: int, area: sqlite3.Row) ->
     _set_progress(conn, area_id, phase="network", done=0, total=1)
     network.build_network(conn, area_id, area_tile_payloads(conn, area_id), elevation.sampler_for(conn))
     _set_progress(conn, area_id, phase="network", done=1, total=1)
-
-
-def _do_import(
-    conn: sqlite3.Connection,
-    area_id: int,
-    refresh: bool = False,
-    force_extract: bool = False,
-    selected: list[extracts.ExtractRecord] | None = None,
-) -> None:
-    """The tile and elevation work on a caller-owned connection, so it can
-    run synchronously without a second connection."""
-    area = _get_area_row(conn, area_id)
-    _fetch_tiles_phase(conn, area_id, area, refresh, force_extract, selected)
-    _finish_import(conn, area_id, area)
 
 
 class TilePayload(TypedDict):
@@ -684,26 +663,21 @@ def import_tiles(
     return get_area_status(conn, area_id)
 
 
-def _run_job(
-    area_id: int,
-    body: Callable[[sqlite3.Connection, int], None],
-    before_lock: Callable[[sqlite3.Connection, int], None] | None = None,
-) -> None:
-    """Thread target for an import: opens its own connection, runs body, and
-    records ready/error in the areas row.
+@contextmanager
+def _import_slot(conn: sqlite3.Connection, area_id: int) -> Iterator[None]:
+    """One network phase at a time process-wide: each is a burst of requests to
+    shared public services. The area reads "queued" until it holds the slot."""
+    _set_progress(conn, area_id, phase="queued", done=0, total=1)
+    with _import_lock:
+        yield
 
-    body runs under _import_lock. before_lock runs first, outside it, because
-    it may wait hours on another import's extract download."""
+
+def _run_job(area_id: int, body: Callable[[sqlite3.Connection, int], None]) -> None:
+    """Thread target for an import: opens its own connection, runs body, and
+    records ready/error in the areas row."""
     conn = db.connect()
     try:
-        # One network phase at a time process-wide: each is a burst of requests
-        # to shared public services.
-        _set_progress(conn, area_id, phase="queued", done=0, total=1)
-        if before_lock is not None:
-            before_lock(conn, area_id)
-            _set_progress(conn, area_id, phase="queued", done=0, total=1)
-        with _import_lock:
-            body(conn, area_id)
+        body(conn, area_id)
         now = datetime.now(timezone.utc).isoformat()
         conn.execute(
             """
@@ -727,23 +701,25 @@ def _run_job(
 
 
 def _run_import_job(area_id: int, refresh: bool = False, force_extract: bool = False) -> None:
-    selected: list[list[extracts.ExtractRecord]] = []
+    def body(conn: sqlite3.Connection, aid: int) -> None:
+        # The download may wait hours on another import's, so it holds no slot.
+        selected = select_area_extracts(conn, aid, refresh, force_extract)
+        with _import_slot(conn, aid):
+            area = _get_area_row(conn, aid)
+            _fetch_tiles_phase(conn, aid, area, selected)
+            _finish_import(conn, aid, area)
 
-    def prepare(conn: sqlite3.Connection, aid: int) -> None:
-        selected.append(select_area_extracts(conn, aid, refresh, force_extract))
-
-    _run_job(
-        area_id,
-        lambda conn, aid: _do_import(conn, aid, refresh, force_extract, selected[0]),
-        before_lock=prepare,
-    )
+    _run_job(area_id, body)
 
 
 def _run_finish_only_job(area_id: int) -> None:
     """Thread target for import_tiles: the caller already stored the tiles,
     so only the elevation + network-build tail runs here."""
+
     def body(conn: sqlite3.Connection, aid: int) -> None:
-        _finish_import(conn, aid, _get_area_row(conn, aid))
+        with _import_slot(conn, aid):
+            _finish_import(conn, aid, _get_area_row(conn, aid))
+
     _run_job(area_id, body)
 
 

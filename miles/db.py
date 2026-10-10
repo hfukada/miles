@@ -676,7 +676,7 @@ def mark_derive_dirty(conn: sqlite3.Connection, since_date: str) -> None:
     )
 
 
-def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list[int]:
+def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> tuple[int, list[int]]:
     """Insert or refresh the Strava-owned columns. Columns the app derives or
     records itself (description, laps_synced_at, run_type_inferred, race and
     intensity labels) are never in the SET list, so re-syncing an activity
@@ -684,11 +684,31 @@ def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list
     time or start changed on Strava (a trimmed or merged recording): its laps
     and description describe the old recording, so they are cleared and
     laps_synced_at reset for the next sync to fetch them again; its terrain
-    segments and weather are dropped for the same reason. Returns the ids of
-    those activities so the caller can discard their cached raw streams once
-    the transaction has committed."""
-    changed, old_dates = _changed_activities(conn, rows)
-    rewritten_dates = _rewritten_dates(conn, rows)
+    segments and weather are dropped for the same reason.
+
+    Returns how many rows were new or differed from what was stored, and the
+    ids of the activities whose recording changed, so the caller can discard
+    their cached raw streams once the transaction has committed."""
+    rewritten = 0
+    changed: list[int] = []
+    dirty_dates: list[str] = []
+    for row in rows:
+        stored = conn.execute("SELECT * FROM activities WHERE activity_id = ?", [row["activity_id"]]).fetchone()
+        if stored is not None and not any(stored[c] != row[c] for c in row if c not in _VOLATILE_COLUMNS):  # type: ignore[literal-required]
+            continue
+        rewritten += 1
+        if row["start_date"]:
+            dirty_dates.append(row["start_date"][:10])
+        if stored is not None and _recording_changed(stored, row):
+            changed.append(row["activity_id"])
+            if stored["start_date"] and not _same_start(stored["start_date"], row["start_date"]):
+                dirty_dates.append(stored["start_date"][:10])
+    if len(changed) > CHANGED_ACTIVITIES_WARN_COUNT:
+        _logger.warning(
+            "%d of %d upserted activities differ from what is stored; their laps will be refetched",
+            len(changed),
+            len(rows),
+        )
     conn.executemany("""
         INSERT INTO activities (
             activity_id, name, sport_type, start_date,
@@ -737,11 +757,10 @@ def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list
             f"UPDATE activities SET laps_synced_at = NULL, description = NULL WHERE activity_id IN ({placeholders})",
             changed,
         )
-    dates = rewritten_dates + old_dates
-    if dates:
-        mark_derive_dirty(conn, min(dates))
+    if dirty_dates:
+        mark_derive_dirty(conn, min(dirty_dates))
     conn.commit()
-    return changed
+    return rewritten, changed
 
 
 # Excluded from the comparison of a listed row with the stored one: the key,
@@ -750,58 +769,14 @@ def upsert_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list
 _VOLATILE_COLUMNS = frozenset({"activity_id", "synced_at", "raw_json"})
 
 
-def _rewritten(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list[ActivityRow]:
-    """The rows that are new or differ from what is stored."""
-    out: list[ActivityRow] = []
-    for row in rows:
-        columns = [c for c in row if c not in _VOLATILE_COLUMNS]
-        stored = conn.execute(
-            f"SELECT {', '.join(columns)} FROM activities WHERE activity_id = ?", [row["activity_id"]]
-        ).fetchone()
-        if stored is None or any(stored[c] != row[c] for c in columns):  # type: ignore[literal-required]
-            out.append(row)
-    return out
-
-
-def count_rewritten(conn: sqlite3.Connection, rows: list[ActivityRow]) -> int:
-    """How many of the rows upsert_activities would add or change."""
-    return len(_rewritten(conn, rows))
-
-
-def _rewritten_dates(conn: sqlite3.Connection, rows: list[ActivityRow]) -> list[str]:
-    """Start dates of the rows that are new or differ from what is stored.
-    Listing an unchanged activity again must not dirty derived values."""
-    return [row["start_date"][:10] for row in _rewritten(conn, rows) if row["start_date"]]
-
-
-def _changed_activities(conn: sqlite3.Connection, rows: list[ActivityRow]) -> tuple[list[int], list[str]]:
-    """(ids, previous start dates) of the stored activities that `rows` would
-    change in distance, elapsed time or start."""
-    changed: list[int] = []
-    old_dates: list[str] = []
-    for row in rows:
-        old = conn.execute(
-            "SELECT distance_m, elapsed_time_s, start_date FROM activities WHERE activity_id = ?",
-            [row["activity_id"]],
-        ).fetchone()
-        if old is None:
-            continue
-        start_moved = not _same_start(old["start_date"], row["start_date"])
-        if (
-            _differs(old["distance_m"], row["distance_m"], CHANGED_DISTANCE_M)
-            or _differs(old["elapsed_time_s"], row["elapsed_time_s"], CHANGED_ELAPSED_S)
-            or start_moved
-        ):
-            changed.append(row["activity_id"])
-            if old["start_date"] and start_moved:
-                old_dates.append(old["start_date"][:10])
-    if len(changed) > CHANGED_ACTIVITIES_WARN_COUNT:
-        _logger.warning(
-            "%d of %d upserted activities differ from what is stored; their laps will be refetched",
-            len(changed),
-            len(rows),
-        )
-    return changed, old_dates
+def _recording_changed(stored: sqlite3.Row, row: ActivityRow) -> bool:
+    """Whether the listed row's distance, elapsed time or start differs from
+    the stored activity's enough to be a different recording."""
+    return (
+        _differs(stored["distance_m"], row["distance_m"], CHANGED_DISTANCE_M)
+        or _differs(stored["elapsed_time_s"], row["elapsed_time_s"], CHANGED_ELAPSED_S)
+        or not _same_start(stored["start_date"], row["start_date"])
+    )
 
 
 def _differs(old: float | None, new: float | None, tolerance: float) -> bool:
@@ -811,20 +786,17 @@ def _differs(old: float | None, new: float | None, tolerance: float) -> bool:
 
 
 def _same_start(old: str | None, new: str | None) -> bool:
-    """Whether two stored start_date strings are the same instant. Compared as
-    parsed datetimes so a change in how the string is written is not an edit;
-    a string that does not parse is compared as text."""
+    """Whether two stored start_date strings are the same wall time. Compared
+    as parsed datetimes so a change in how the string is written is not an
+    edit; a string that does not parse is compared as text."""
     if old == new:
         return True
     if old is None or new is None:
         return False
     try:
-        a, b = datetime.fromisoformat(old), datetime.fromisoformat(new)
+        return datetime.fromisoformat(old) == datetime.fromisoformat(new)
     except ValueError:
         return False
-    if (a.tzinfo is None) != (b.tzinfo is None):
-        return a.replace(tzinfo=None) == b.replace(tzinfo=None)
-    return a == b
 
 
 def upsert_weather(conn: sqlite3.Connection, rows: list[WeatherRow]) -> None:

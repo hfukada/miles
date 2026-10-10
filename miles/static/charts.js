@@ -197,10 +197,10 @@ function speedToPace(speedMps) {
   return (MILE_METERS / speedMps) / 60;
 }
 
-// Label for a grade bin {lo_pct, hi_pct}; +/-999 marks an open end.
+// Label for a grade bin {lo_pct, hi_pct}; null marks an open end.
 function gradeBinLabel(b) {
-  if (b.lo_pct <= -999) return `< ${b.hi_pct.toFixed(0)}%`;
-  if (b.hi_pct >= 999) return `≥ ${b.lo_pct.toFixed(0)}%`;
+  if (b.lo_pct == null) return `< ${b.hi_pct.toFixed(0)}%`;
+  if (b.hi_pct == null) return `≥ ${b.lo_pct.toFixed(0)}%`;
   return `${b.lo_pct.toFixed(0)}–${b.hi_pct.toFixed(0)}%`;
 }
 

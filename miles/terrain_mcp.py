@@ -1,5 +1,4 @@
-"""MCP tools for the terrain model (docs/design-terrain-and-route-search.md,
-section 5)."""
+"""MCP tools for the terrain model (adr/0003-terrain-model-and-route-search.md)."""
 
 import functools
 import json

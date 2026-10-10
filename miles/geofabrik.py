@@ -7,13 +7,13 @@ fetched once, stored gzipped in the database, and refreshed at most every
 INDEX_MAX_AGE_DAYS with a conditional GET (a stale copy keeps serving if the
 refresh fails).
 
-Region choice is the cheapest cover of the area's box: the smallest region
-whose boundary contains it, or a smaller set of regions that together cover
-it for less ground. Regions nest, so an area straddling two states is
-contained only by their parent, possibly a multi-gigabyte extract. Size is
-compared by polygon area in degrees squared, since the index carries no file
-sizes. Containment and coverage use sample points of the box and a plain
-ray-casting test, which can miss a boundary notch between sample points.
+Region choice is the cheapest cover of the area's box: one region whose
+boundary contains it, or a set of regions that together cover it for less
+ground. Regions nest, so an area straddling two states is contained only by
+their parent, possibly a multi-gigabyte extract. Size is compared by polygon
+area in degrees squared, since the index carries no file sizes. Coverage uses
+sample points of the box and a plain ray-casting test, which can miss a
+boundary notch between sample points.
 """
 
 import difflib
@@ -25,7 +25,6 @@ import os
 import re
 import sqlite3
 import urllib.error
-from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
@@ -129,18 +128,6 @@ def _area(region: Region) -> float:
     return sum(_ring_area(p[0]) - sum(_ring_area(h) for h in p[1:]) for p in region.polygons)
 
 
-def _memoized_area() -> Callable[[Region], float]:
-    """_area memoized by region path (a Region is unhashable)."""
-    cache: dict[str, float] = {}
-
-    def area(region: Region) -> float:
-        if region.path not in cache:
-            cache[region.path] = _area(region)
-        return cache[region.path]
-
-    return area
-
-
 def _grid_points(bbox: tuple[float, float, float, float], n: int) -> list[tuple[float, float]]:
     """An n-by-n lattice over bbox, corners and edges included."""
     south, west, north, east = bbox
@@ -211,70 +198,51 @@ def contains_bbox(region: Region, bbox: tuple[float, float, float, float]) -> bo
     return _contains(region, _grid_points(bbox, _CONTAIN_GRID))
 
 
-def smallest_containing(regions: list[Region], bbox: tuple[float, float, float, float]) -> Region | None:
-    points = _grid_points(bbox, _CONTAIN_GRID)
-    containing = [r for r in regions if _contains(r, points)]
-    return min(containing, key=_area) if containing else None
-
-
-# Containment samples a coarse lattice of the box; a covering set is searched
-# exactly over a finer one.
+# contains_bbox tests a coarse lattice of the box; a covering set is searched
+# over a finer one.
 _CONTAIN_GRID = 3
 _COVER_GRID = 5
 MAX_COVER_REGIONS = 4
 _MAX_COVER_CANDIDATES = 24
 
 
-def covering_set(
-    regions: list[Region],
-    bbox: tuple[float, float, float, float],
-    *,
-    smaller_than: float | None = None,
-    area: Callable[[Region], float] | None = None,
-) -> list[Region] | None:
+def covering_set(regions: list[Region], bbox: tuple[float, float, float, float]) -> list[Region] | None:
     """At most MAX_COVER_REGIONS regions whose polygons together cover every
     sample point of bbox with the least total area (fewest regions on a tie),
-    or None. Regions that cover a subset of a no-larger region are dropped
-    before the search; with smaller_than, so are regions of that area or more,
-    since a set containing one can't total less. area is a shared memoized _area."""
-    area = area or _memoized_area()
+    or None. A region covering only part of a larger-or-equal region's points
+    is dropped before the search, and the search keeps the _MAX_COVER_CANDIDATES
+    smallest of the rest plus the cheapest single region covering everything."""
     points = _grid_points(bbox, _COVER_GRID)
     everything = frozenset(range(len(points)))
-    best_by_cover: dict[frozenset[int], Region] = {}
+    best_by_cover: dict[frozenset[int], tuple[float, Region]] = {}
     for region in regions:
-        if smaller_than is not None and area(region) >= smaller_than:
-            continue
         cover = _covered(region, points)
-        if cover and (cover not in best_by_cover or area(region) < area(best_by_cover[cover])):
-            best_by_cover[cover] = region
-    candidates = [
-        (cover, region)
-        for cover, region in best_by_cover.items()
-        if not any(cover < other and area(other_region) <= area(region) for other, other_region in best_by_cover.items())
-    ]
-    candidates = sorted(candidates, key=lambda c: area(c[1]))[:_MAX_COVER_CANDIDATES]
+        if not cover:
+            continue
+        area = _area(region)
+        if cover not in best_by_cover or area < best_by_cover[cover][0]:
+            best_by_cover[cover] = (area, region)
+    candidates = sorted(
+        (
+            (area, cover, region)
+            for cover, (area, region) in best_by_cover.items()
+            if not any(cover < other and other_area <= area for other, (other_area, _) in best_by_cover.items())
+        ),
+        key=lambda c: c[0],
+    )
+    kept = candidates[:_MAX_COVER_CANDIDATES]
+    whole = next((c for c in candidates if c[1] == everything), None)
+    if whole is not None and whole not in kept:
+        kept.append(whole)
     best: tuple[float, int, tuple[Region, ...]] | None = None
     for size in range(1, MAX_COVER_REGIONS + 1):
-        for combo in itertools.combinations(candidates, size):
-            if frozenset().union(*(c for c, _ in combo)) != everything:
+        for combo in itertools.combinations(kept, size):
+            if frozenset().union(*(cover for _, cover, _ in combo)) != everything:
                 continue
-            key = (sum(area(r) for _, r in combo), size, tuple(r for _, r in combo))
+            key = (sum(area for area, _, _ in combo), size, tuple(region for _, _, region in combo))
             if best is None or key[:2] < best[:2]:
                 best = key
     return list(best[2]) if best is not None else None
-
-
-def cheapest_cover(regions: list[Region], bbox: tuple[float, float, float, float]) -> list[Region] | None:
-    """The regions to download for bbox: the smallest containing region, unless
-    a set of smaller ones totals less ground. None when nothing covers bbox."""
-    area = _memoized_area()
-    single = smallest_containing(regions, bbox)
-    cover = covering_set(regions, bbox, smaller_than=area(single) if single is not None else None, area=area)
-    if single is None:
-        return cover
-    if cover is None or area(single) <= sum(area(r) for r in cover) * (1 + 1e-9):
-        return [single]
-    return cover
 
 
 def covering_children(regions: list[Region], parent: str, bbox: tuple[float, float, float, float]) -> list[Region] | None:
@@ -307,11 +275,7 @@ def _is_fresh(row: sqlite3.Row) -> bool:
 
 
 def _refresh(conn: sqlite3.Connection, row: sqlite3.Row | None) -> sqlite3.Row:
-    headers: dict[str, str] = {}
-    if row is not None and row["etag"]:
-        headers["If-None-Match"] = row["etag"]
-    if row is not None and row["last_modified"]:
-        headers["If-Modified-Since"] = row["last_modified"]
+    headers = http_client.conditional_headers(row["etag"], row["last_modified"]) if row is not None else {}
     url = f"{GEOFABRIK_BASE_URL.rstrip('/')}/index-v1.json"
     now = datetime.now(timezone.utc).isoformat()
 
@@ -393,7 +357,7 @@ def validate_region(conn: sqlite3.Connection, region: str) -> None:
 
 
 def _cover_paths(known: list[Region], bbox: tuple[float, float, float, float]) -> list[str] | None:
-    found = cheapest_cover(known, bbox)
+    found = covering_set(known, bbox)
     return [r.path for r in found] if found is not None else None
 
 

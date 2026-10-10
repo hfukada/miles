@@ -7,7 +7,7 @@ from typing import Literal, Sequence, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import areas_mcp, db, drive_mcp, elevation, events, network_mcp, outbound, outbound_mcp, search_mcp
+from . import areas_mcp, db, elevation, outbound, outbound_mcp, routing_mcp
 from . import routes as routes_service
 from .terrain_mcp import register_terrain_tools
 from .weather import ATTRIBUTION as WEATHER_ATTRIBUTION
@@ -2801,10 +2801,8 @@ def redrape_route(route_id: int) -> str:
 
 register_terrain_tools(mcp)
 areas_mcp.register_area_tools(mcp)
-network_mcp.register_network_tools(mcp)
-drive_mcp.register_drive_tools(mcp)
 outbound_mcp.register_outbound_tools(mcp)
-search_mcp.register_search_tools(mcp)
+routing_mcp.register_routing_tools(mcp)
 
 
 def main() -> None:
@@ -2812,7 +2810,6 @@ def main() -> None:
         outbound.claim()
     except outbound.OutboundBusyError as e:
         raise SystemExit(e.message) from None
-    events.install()
     mcp.run()
 
 

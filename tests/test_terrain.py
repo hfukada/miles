@@ -2,6 +2,7 @@ import json
 import math
 import sqlite3
 import threading
+from datetime import date
 
 import pandas as pd
 import pytest
@@ -278,7 +279,7 @@ def test_analyze_activity_terrain_requires_cached_streams(conn: sqlite3.Connecti
 def test_analyze_activity_terrain_reports_climbs(conn: sqlite3.Connection, monkeypatch):
     df = _synthetic_stream_df()
     monkeypatch.setattr(streams, "has_cached_streams", lambda activity_id: True)
-    monkeypatch.setattr(streams, "fetch_and_cache_streams", lambda activity_id: df)
+    monkeypatch.setattr(streams, "get_stream_dataframe", lambda activity_id: df)
 
     analysis = terrain.analyze_activity_terrain(conn, 1)
 
@@ -483,3 +484,46 @@ def test_a_request_during_a_rebuild_is_turned_away_not_queued(conn: sqlite3.Conn
             terrain.ensure_terrain_derived(conn)
     finally:
         terrain._rebuild_lock.release()
+
+
+@pytest.mark.parametrize(
+    "grade, index, bounds",
+    [
+        (-45.0, 0, (-math.inf, -30.0)),
+        (-30.1, 0, (-math.inf, -30.0)),
+        (-30.0, 1, (-30.0, -28.0)),
+        (-0.1, 15, (-2.0, 0.0)),
+        (0.0, 16, (0.0, 2.0)),
+        (29.9, 30, (28.0, 30.0)),
+        (30.0, 31, (30.0, math.inf)),
+        (80.0, 31, (30.0, math.inf)),
+    ],
+)
+def test_grades_fall_into_numbered_bins_with_open_ends(grade: float, index: int, bounds: tuple[float, float]):
+    assert terrain._grade_bin(grade) == index
+    assert terrain._bin_bounds(index) == bounds
+
+
+def test_the_profile_reports_open_ended_bins_as_null_bounds(conn: sqlite3.Connection):
+    profile = terrain.get_terrain_profile(conn)
+
+    bins = json.loads(json.dumps(profile))["bins"]
+    assert len(bins) == terrain.N_GRADE_BINS
+    assert (bins[0]["lo_pct"], bins[0]["hi_pct"]) == (None, -30.0)
+    assert (bins[-1]["lo_pct"], bins[-1]["hi_pct"]) == (30.0, None)
+    assert all(b["lo_pct"] is not None and b["hi_pct"] is not None for b in bins[1:-1])
+
+
+def test_a_percentile_is_taken_among_segments_in_the_same_open_ended_bin(conn: sqlite3.Connection):
+    insert_activity(conn, 1)
+    conn.execute(
+        "INSERT INTO terrain_segment_dates (activity_id, start_date, segment_count, needs_dem) VALUES (1, ?, 3, 0)",
+        [date.today().isoformat()],
+    )
+    conn.executemany(
+        "INSERT INTO terrain_segments (activity_id, idx, dist_m, elapsed_s, grade_dpct, speed_cms, is_walking, ele_source) "
+        "VALUES (1, ?, 20, 10, ?, ?, 0, 0)",
+        [(0, 400, 100), (1, 450, 200), (2, 100, 900)],
+    )
+
+    assert terrain._percentile_at_grade(conn, 41.0, 1.5, 90) == pytest.approx(50.0)

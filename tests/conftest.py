@@ -46,23 +46,11 @@ def _fresh_strava_token_state(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _osrm_available(monkeypatch):
-    """A test that makes OSRM fail does not leave the next one estimating."""
-    monkeypatch.setattr(drive_starts, "_osrm_unavailable_until", 0.0)
-    monkeypatch.setattr(drive_starts, "_last_expired_at", None)
-
-
-@pytest.fixture(autouse=True)
-def _fresh_http_throttle_state(monkeypatch):
-    """No test inherits another's throttle stamps or quiet periods."""
+def _fresh_http_state(monkeypatch):
+    """No test inherits another's throttle stamps or quiet periods, nor the
+    request ledger that outbound.claim() hooks into the clients for the life
+    of a process."""
     monkeypatch.setattr(http_client, "_states", {})
-
-
-@pytest.fixture(autouse=True)
-def _no_ledger_sinks(monkeypatch):
-    """events.install() hooks the request ledger into http_client and
-    strava_client for the life of the process; a test that calls it must not
-    leave later tests writing outbound counts into a database."""
     monkeypatch.setattr(http_client, "request_sink", None)
     monkeypatch.setattr(http_client, "outcome_sink", None)
     monkeypatch.setattr(strava_client, "rate_sink", None)

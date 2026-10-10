@@ -209,7 +209,7 @@
   // actually bins on.
   function populateBandSelect() {
     const select = document.getElementById('band-select');
-    const bins = profile.bins.filter(b => b.lo_pct > -999 && b.hi_pct < 999);
+    const bins = profile.bins.filter(b => b.lo_pct != null && b.hi_pct != null);
     select.innerHTML = bins.map((b, i) => `<option value="${i}">${gradeBinLabel(b)}</option>`).join('');
     const zeroIdx = bins.findIndex(b => b.lo_pct <= 0 && b.hi_pct > 0);
     selectedBandIdx = zeroIdx >= 0 ? zeroIdx : 0;
@@ -217,7 +217,7 @@
   }
 
   async function loadSpeedTrend() {
-    const bins = profile.bins.filter(b => b.lo_pct > -999 && b.hi_pct < 999);
+    const bins = profile.bins.filter(b => b.lo_pct != null && b.hi_pct != null);
     const band = bins[selectedBandIdx];
     if (!band) return;
     const points = await fetchTrend(

@@ -32,7 +32,7 @@ def test_nearest_index_returns_the_closest_key_offset_and_distance_within_the_ra
     assert rs.NearestIndex(cell_size_m=50.0).nearest(40.0, -105.0, 100.0) is None
 
 
-def test_nearest_index_follows_removed_added_and_readded_keys():
+def test_nearest_index_follows_removed_and_added_keys():
     index = rs.NearestIndex(cell_size_m=50.0)
     index.add(1, [(40.0, -105.0, 0.0)])
     index.remove(1)
@@ -40,11 +40,8 @@ def test_nearest_index_follows_removed_added_and_readded_keys():
     index.add(2, [(40.0, -105.0, 7.0)])
     assert index.nearest(40.0, -105.0, 100.0) == (2, 7.0, 0.0)
 
-    # Re-adding a removed key brings back none of its old points.
     index.remove(2)
-    index.add(2, [(40.0, -105.001, 5.0)])
-    assert index.nearest(40.0, -105.0, 20.0) is None
-    assert index.nearest(40.0, -105.001, 20.0) == (2, 5.0, 0.0)
+    assert index.nearest(40.0, -105.0, 100.0) is None
 
 
 def test_nearest_index_finds_every_point_in_range_far_from_the_first_points_latitude():

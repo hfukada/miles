@@ -4,7 +4,10 @@ preference profile, way overrides, and path scoring that read it.
 Nodes are OSM nodes shared by two or more routable ways, way endpoints, and
 amenity nodes snapped onto their nearest edge by splitting it, so an amenity
 is a real traversable node. Edges are way pieces between nodes, resampled to
-gpx_parse's 20m spacing and draped with an injected elevation sampler.
+gpx_parse's 20m spacing and draped with an injected elevation sampler. Edge
+elevation stays unsmoothed: a window chosen from roughness needs a profile
+longer than most edges, so smoothing happens over whole paths (score_path),
+exactly as it does for a stored route.
 
 Road comfort is not stored on an edge: only its static inputs are, and the
 tier is computed from the current preference profile at score time, so a
@@ -29,7 +32,7 @@ from typing_extensions import TypedDict
 from . import gpx_parse, routes_spatial
 from .elevation import ElevationSampler
 
-NETWORK_DERIVE_VERSION = 7
+NETWORK_DERIVE_VERSION = 8
 
 # Paths with no vehicle traffic: they carry no road-comfort tier.
 TRAIL_HIGHWAYS = frozenset({"path", "footway", "bridleway", "steps", "cycleway"})
@@ -71,14 +74,6 @@ DEFAULT_MAXSPEED_MPH_BY_CLASS: dict[str, float] = {
 
 AMENITY_SNAP_RADIUS_M = 300.0
 
-_SEGMENT_LEN_M = gpx_parse.RESAMPLE_SPACING_M
-
-# Grade thresholds (percent) for the default runnability scorer; the
-# terrain model's athlete-calibrated scorer replaces it in real use.
-HIKE_ONSET_PCT = 15.0
-GRIND_ONSET_PCT = 8.0
-STEEP_DESCENT_PCT = -15.0
-
 
 RunnabilityResult = dict[str, float]
 RunnabilityFn = Callable[[Sequence[float]], RunnabilityResult]
@@ -117,9 +112,10 @@ class PathScore(TypedDict):
     # Access spurs to a trailhead or parking; counted in neither trail, unpaved
     # nor paved distance.
     connector_distance_m: float
-    # gain_m/loss_m sum only the edges that have elevation; has_elevation is
-    # True only when every edge does, elevation_coverage_pct says how much
-    # of the distance they cover.
+    # gain_m/loss_m cover only the stretches of consecutive edges that have
+    # elevation, each smoothed as a route would be; has_elevation is True
+    # only when every edge has it, elevation_coverage_pct says how much of
+    # the distance they cover.
     gain_m: float | None
     loss_m: float | None
     has_elevation: bool
@@ -178,8 +174,8 @@ def init_network_schema(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_net_nodes_area ON net_nodes(area_id)")
     # points_blob: packed (lat, lng, dist_m, ele_m) doubles at 20m spacing,
-    # from_node -> to_node only; ele_m is NaN without elevation. The backward
-    # profile is derived at scoring time.
+    # from_node -> to_node only; ele_m is the unsmoothed terrain-model value,
+    # NaN without elevation. The backward profile is derived at scoring time.
     conn.execute("""
         CREATE TABLE IF NOT EXISTS net_edges (
             edge_id                 INTEGER PRIMARY KEY,
@@ -193,8 +189,6 @@ def init_network_schema(conn: sqlite3.Connection) -> None:
             to_node_id              INTEGER NOT NULL REFERENCES net_nodes(node_id) ON DELETE CASCADE,
             length_m                REAL NOT NULL,
             has_elevation           INTEGER NOT NULL,
-            gain_fwd_m              REAL,
-            loss_fwd_m              REAL,
             maxspeed_mph            REAL,
             maxspeed_filled         INTEGER,
             lanes                   INTEGER,
@@ -313,44 +307,6 @@ def avoided_way_ids(conn: sqlite3.Connection) -> set[int]:
     """Every way the athlete has marked 'avoid'."""
     rows = conn.execute("SELECT way_id FROM net_way_overrides WHERE verdict = 'avoid'").fetchall()
     return {r["way_id"] for r in rows}
-
-
-# ---------------------------------------------------------------------------
-# Default runnability scorer
-# ---------------------------------------------------------------------------
-
-
-def default_runnability_scorer(grades_pct: Sequence[float]) -> RunnabilityResult:
-    """Fixed-threshold runnability, for tests and standalone use."""
-    n = len(grades_pct)
-    if n == 0:
-        return {"run_pct": 0.0, "grind_pct": 0.0, "hike_pct": 0.0, "longest_hike_m": 0.0, "steep_descent_m": 0.0}
-
-    run = grind = hike = 0
-    steep_descent_segments = 0
-    longest_hike_run = 0
-    cur_hike_run = 0
-    for g in grades_pct:
-        if g >= HIKE_ONSET_PCT:
-            hike += 1
-            cur_hike_run += 1
-            longest_hike_run = max(longest_hike_run, cur_hike_run)
-        else:
-            cur_hike_run = 0
-            if g >= GRIND_ONSET_PCT:
-                grind += 1
-            else:
-                run += 1
-        if g <= STEEP_DESCENT_PCT:
-            steep_descent_segments += 1
-
-    return {
-        "run_pct": 100.0 * run / n,
-        "grind_pct": 100.0 * grind / n,
-        "hike_pct": 100.0 * hike / n,
-        "longest_hike_m": longest_hike_run * _SEGMENT_LEN_M,
-        "steep_descent_m": steep_descent_segments * _SEGMENT_LEN_M,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -578,12 +534,6 @@ def _resample(raw_points: list[gpx_parse.GpxPoint]) -> tuple[list[tuple[float, f
     return [(p[0], p[1]) for p in resampled], [p[2] for p in resampled], dist_m[-1]
 
 
-def _point_index(points: list[tuple[float, float]], radius_m: float) -> routes_spatial.NearestIndex:
-    index = routes_spatial.NearestIndex(max(radius_m, 15.0))
-    index.add(0, ((lat, lng, 0.0) for lat, lng in points))
-    return index
-
-
 # ---------------------------------------------------------------------------
 # Edge splitting
 # ---------------------------------------------------------------------------
@@ -629,8 +579,8 @@ _WAY_COLUMNS = (
 
 def split_edge_row(row: dict, offset_m: float) -> EdgeSplit | None:
     """Cut an edge-row-shaped mapping (anything answering row["field"] for the
-    net_edges columns) at offset_m along its forward direction, re-deriving
-    gain/loss per piece. None when either piece would be under
+    net_edges columns) at offset_m along its forward direction. None when
+    either piece would be under
     MIN_SPLIT_CLEARANCE_M. Used at build time for amenities and, unpersisted,
     for a search's own start point."""
     length_m = row["length_m"]
@@ -648,15 +598,10 @@ def split_edge_row(row: dict, offset_m: float) -> EdgeSplit | None:
         _, lng = routes_spatial.slice_by_distance(dist_m, lng_vals, from_m, to_m)
         _, ele = routes_spatial.slice_by_distance(dist_m, ele_vals, from_m, to_m)
         has_elevation = bool(row["has_elevation"]) and all(e is not None for e in ele)
-        gain_m = loss_m = None
-        if has_elevation:
-            gain_m, loss_m = gpx_parse.gain_loss_m(cast("list[float]", ele))
         latlng = list(zip(cast("list[float]", lat), cast("list[float]", lng)))
         edge = {c: row[c] for c in _WAY_COLUMNS} | {
             "length_m": dist[-1] if dist else 0.0,
             "has_elevation": int(has_elevation),
-            "gain_fwd_m": gain_m,
-            "loss_fwd_m": loss_m,
             "points_blob": _pack_points(latlng, dist, ele),
         }
         return edge, lat, lng
@@ -743,12 +688,7 @@ def _edge_row(
         return None
     elevations = sampler.sample(latlng)
     has_elevation = len(elevations) == len(latlng) and all(e is not None for e in elevations)
-    gain_m = loss_m = None
-    ele_out: list[float | None] = [None] * len(latlng)
-    if has_elevation:
-        smoothed = gpx_parse.smoothed_elevations(cast(list[float], elevations), dist)
-        gain_m, loss_m = gpx_parse.gain_loss_m(smoothed)
-        ele_out = cast(list[float | None], smoothed)
+    ele_out: list[float | None] = cast(list[float | None], elevations) if has_elevation else [None] * len(latlng)
     return {
         **_DEFAULT_EDGE_ATTRS,
         **attrs,
@@ -756,8 +696,6 @@ def _edge_row(
         "to_osm": to_osm,
         "length_m": length_m,
         "has_elevation": int(has_elevation),
-        "gain_fwd_m": gain_m,
-        "loss_fwd_m": loss_m,
         "points_blob": _pack_points(latlng, dist, ele_out),
     }
 
@@ -875,7 +813,7 @@ def _build_network(
         if way_points is None:
             continue
         road_points.extend(_resample([(lat, lng, None) for lat, lng in way_points])[0])
-    road_index = _point_index(road_points, SIDEWALK_ROAD_PROXIMITY_M)
+    road_index = routes_spatial.point_index(road_points, SIDEWALK_ROAD_PROXIMITY_M)
 
     edges: dict[int, dict] = {}
     edge_ids = itertools.count()
@@ -989,7 +927,7 @@ def _build_network(
     }
 
 
-_EDGE_COLUMNS = (*_WAY_COLUMNS, "length_m", "has_elevation", "gain_fwd_m", "loss_fwd_m", "points_blob")
+_EDGE_COLUMNS = (*_WAY_COLUMNS, "length_m", "has_elevation", "points_blob")
 
 
 def _replace_area_graph(
@@ -1106,10 +1044,11 @@ def score_path(
     overrides = get_way_overrides(conn, way_ids)
 
     distance_m = trail_m = unpaved_m = paved_m = connector_m = 0.0
-    gain_total = loss_total = 0.0
-    gain_known = False
     elevation_m = 0.0
-    grade_profile: list[float] = []
+    # Consecutive edges with elevation form one profile, as one stored route
+    # would; an edge without it ends the stretch.
+    stretches: list[list[gpx_parse.GpxPoint]] = []
+    stretch: list[gpx_parse.GpxPoint] | None = None
     exposure_entries: list[tuple[str | None, float, int | None]] = []
 
     for edge_id, forward in edge_sequence:
@@ -1128,27 +1067,17 @@ def score_path(
         else:
             paved_m += length_m
 
-        gain_edge, loss_edge = row["gain_fwd_m"], row["loss_fwd_m"]
-        if gain_edge is not None and loss_edge is not None:
-            gain_known = True
-            elevation_m += length_m
-            if forward:
-                gain_total += gain_edge
-                loss_total += loss_edge
-            else:
-                gain_total += loss_edge
-                loss_total += gain_edge
-
         if row["has_elevation"]:
+            elevation_m += length_m
+            if stretch is None:
+                stretch = []
+                stretches.append(stretch)
             points = unpack_edge_points(bytes(row["points_blob"]))
-            seq = points if forward else list(reversed(points))
-            for (lat0, lng0, _, e0), (lat1, lng1, _, e1) in zip(seq, seq[1:]):
-                if e0 is None or e1 is None:
-                    continue
-                seg_len = routes_spatial.equirect_distance_m(lat0, lng0, lat1, lng1)
-                if seg_len <= 0:
-                    continue
-                grade_profile.append((e1 - e0) / seg_len * 100.0)
+            for lat, lng, _d, ele in points if forward else reversed(points):
+                if not (stretch and stretch[-1][0] == lat and stretch[-1][1] == lng):
+                    stretch.append((lat, lng, ele))
+        else:
+            stretch = None
 
         way_id = row["way_id"]
         override = overrides.get(way_id)
@@ -1164,15 +1093,27 @@ def score_path(
                 tier = "uncomfortable"
         exposure_entries.append((tier, length_m, avoided_way_id))
 
+    gain_total = loss_total = 0.0
+    grade_profile: list[float] = []
+    for points in stretches:
+        dist = gpx_parse.cumulative_distances_m(points)
+        smoothed, _half_window = gpx_parse.roughness_smoothed(dist, cast("list[float]", [p[2] for p in points]))
+        gain_m, loss_m = gpx_parse.gain_loss_m(smoothed)
+        gain_total += gain_m
+        loss_total += loss_m
+        grade_profile.extend(
+            (e1 - e0) / (d1 - d0) * 100.0 for e0, e1, d0, d1 in zip(smoothed, smoothed[1:], dist, dist[1:]) if d1 > d0
+        )
+
     return {
         "distance_m": distance_m,
         "trail_distance_m": trail_m,
         "unpaved_road_distance_m": unpaved_m,
         "paved_distance_m": paved_m,
         "connector_distance_m": connector_m,
-        "gain_m": gain_total if gain_known else None,
-        "loss_m": loss_total if gain_known else None,
-        "has_elevation": gain_known and elevation_m >= distance_m,
+        "gain_m": gain_total if stretches else None,
+        "loss_m": loss_total if stretches else None,
+        "has_elevation": bool(stretches) and elevation_m >= distance_m,
         "elevation_coverage_pct": 100.0 * min(elevation_m / distance_m, 1.0) if distance_m > 0 else 0.0,
         "runnability": runnability(grade_profile),
         "road_exposure": _road_exposure(exposure_entries, prefs["max_continuous_uncomfortable_m"]),

@@ -38,7 +38,7 @@ class ServiceBackoffError(urllib.error.URLError):
     waiting out (a block, not a rate limit); nothing was sent."""
 
 # Called with (service, host, status, kind) for every attempt: status is the
-# HTTP code, or "error" for a connection failure. events.install() points it
+# HTTP code, or "error" for a connection failure. outbound.claim() points it
 # at the database; None leaves accounting off.
 request_sink: Callable[[str, str, str, str], None] | None = None
 
@@ -102,7 +102,9 @@ NOMINATIM = ServicePolicy(
     min_pause_s={429: 60.0, 403: 3600.0},
     timeout_s=30.0,
 )
-OSRM = ServicePolicy("osrm", min_interval_s=1.1, max_attempts=3, backoff_base_s=2.0, timeout_s=60.0)
+# A search waits on OSRM before falling back to estimates, so a dead server
+# must be given up on in seconds: one retry, short timeout.
+OSRM = ServicePolicy("osrm", min_interval_s=1.1, max_attempts=2, backoff_base_s=1.0, timeout_s=3.0)
 TERRARIUM = ServicePolicy("terrarium", min_interval_s=0.1, max_attempts=4, backoff_base_s=1.0, timeout_s=60.0)
 OPEN_METEO = ServicePolicy(
     "open-meteo", min_interval_s=1.0, max_attempts=3, backoff_base_s=2.0, min_pause_s={429: 60.0}, timeout_s=60.0
@@ -131,6 +133,29 @@ _states_lock = threading.Lock()
 def _state(policy: ServicePolicy) -> _State:
     with _states_lock:
         return _states.setdefault(policy.name, _State())
+
+
+def conditional_headers(etag: str | None, last_modified: str | None) -> dict[str, str]:
+    """Request headers asking the server to answer 304 when the stored copy,
+    identified by these validators, is still current."""
+    headers: dict[str, str] = {}
+    if etag:
+        headers["If-None-Match"] = etag
+    if last_modified:
+        headers["If-Modified-Since"] = last_modified
+    return headers
+
+
+def pause(policy: ServicePolicy, seconds: float) -> None:
+    """Keep every caller of the service quiet for `seconds` (a longer pause
+    already in force stays)."""
+    _state(policy).stay_quiet_until(time.monotonic() + seconds)
+
+
+def quiet_remaining_s(policy: ServicePolicy) -> float:
+    """Seconds left of the service's quiet period; a caller that would rather
+    do without the service than wait it out checks this first."""
+    return max(0.0, _state(policy).quiet_until - time.monotonic())
 
 
 def _wait_turn(policy: ServicePolicy, state: _State) -> None:

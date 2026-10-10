@@ -16,9 +16,10 @@ import logging
 import sqlite3
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Literal, Sequence, cast
+from typing import Literal, Mapping, Sequence, cast
 from typing_extensions import TypedDict
 
 import pandas as pd
@@ -31,7 +32,7 @@ _logger = logging.getLogger(__name__)
 
 # Bump whenever a change alters what rebuild_terrain computes from the same
 # cached streams; it gates a full resegmentation.
-TERRAIN_MODEL_VERSION = 5
+TERRAIN_MODEL_VERSION = 6
 
 
 def model_version_tag() -> str:
@@ -40,9 +41,14 @@ def model_version_tag() -> str:
     full resegmentation from the raw files on disk."""
     return f"{TERRAIN_MODEL_VERSION}.{streams.STREAM_DERIVE_VERSION}"
 
-# A virtual run's "terrain" is whatever the app simulated, not ground the
-# athlete ran on.
-TERRAIN_SPORT_TYPES = tuple(t for t in races.RUN_SPORT_TYPES if t != "VirtualRun")
+def sport_filter() -> tuple[str, list[str]]:
+    """A WHERE condition (and its parameters) selecting the activities the
+    terrain model covers. A virtual run's "terrain" is whatever the app
+    simulated, not ground the athlete ran on."""
+    return races.run_sport_filter(exclude=("VirtualRun",))
+
+
+TERRAIN_SPORT_TYPES = tuple(sport_filter()[1])
 
 # Stored as a small int: the row count of a multi-year history makes a string costly.
 ELE_SOURCE_RECORDED = 0
@@ -53,13 +59,13 @@ WALK_THRESHOLD_SPM = 130.0
 WALK_SPEED_FALLBACK_MPS = 2.2
 ROLLING_WINDOW_DAYS = 90
 
+# Grade bins are numbered 0..N_GRADE_BINS-1: bin 0 holds everything below
+# GRADE_BIN_MIN_PCT, the last bin everything from GRADE_BIN_MAX_PCT up, and
+# each bin between spans GRADE_BIN_WIDTH_PCT.
 GRADE_BIN_WIDTH_PCT = 2.0
 GRADE_BIN_MIN_PCT = -30.0
 GRADE_BIN_MAX_PCT = 30.0
-# Sentinel bounds for the open-ended overflow bins, in place of +/-inf, which
-# SQLite binding and JSON serialization handle poorly.
-_UNDERFLOW_LO = -999.0
-_OVERFLOW_HI = 999.0
+N_GRADE_BINS = int((GRADE_BIN_MAX_PCT - GRADE_BIN_MIN_PCT) / GRADE_BIN_WIDTH_PCT) + 2
 
 # Minimum samples before a grade bin's stats are trusted over the default.
 MIN_SAMPLES_FOR_BIN = 5
@@ -164,19 +170,6 @@ def init_terrain_schema(conn: sqlite3.Connection) -> None:
             model_version TEXT
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS terrain_backfill_status (
-            id          INTEGER PRIMARY KEY CHECK (id = 1),
-            status      TEXT NOT NULL DEFAULT 'idle',
-            phase       TEXT,
-            done        INTEGER,
-            total       INTEGER,
-            started_at  TEXT,
-            finished_at TEXT,
-            error       TEXT
-        )
-    """)
-    conn.execute("INSERT OR IGNORE INTO terrain_backfill_status (id, status) VALUES (1, 'idle')")
     conn.commit()
 
 
@@ -206,32 +199,33 @@ def connect() -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 
-def _grade_bin_bounds(grade_pct: float) -> tuple[float, float]:
+def _grade_bin(grade_pct: float) -> int:
     if grade_pct < GRADE_BIN_MIN_PCT:
-        return (_UNDERFLOW_LO, GRADE_BIN_MIN_PCT)
+        return 0
     if grade_pct >= GRADE_BIN_MAX_PCT:
-        return (GRADE_BIN_MAX_PCT, _OVERFLOW_HI)
-    steps = math.floor((grade_pct - GRADE_BIN_MIN_PCT) / GRADE_BIN_WIDTH_PCT)
-    lo = GRADE_BIN_MIN_PCT + steps * GRADE_BIN_WIDTH_PCT
-    return (lo, lo + GRADE_BIN_WIDTH_PCT)
+        return N_GRADE_BINS - 1
+    return 1 + math.floor((grade_pct - GRADE_BIN_MIN_PCT) / GRADE_BIN_WIDTH_PCT)
 
 
-def _all_bin_bounds() -> list[tuple[float, float]]:
-    bins = [(_UNDERFLOW_LO, GRADE_BIN_MIN_PCT)]
-    lo = GRADE_BIN_MIN_PCT
-    while lo < GRADE_BIN_MAX_PCT - 1e-9:
-        bins.append((lo, lo + GRADE_BIN_WIDTH_PCT))
-        lo += GRADE_BIN_WIDTH_PCT
-    bins.append((GRADE_BIN_MAX_PCT, _OVERFLOW_HI))
-    return bins
+def _bin_bounds(index: int) -> tuple[float, float]:
+    """(lo, hi) percent of a bin; the first has no lower bound, the last no
+    upper bound."""
+    lo = -math.inf if index == 0 else GRADE_BIN_MIN_PCT + (index - 1) * GRADE_BIN_WIDTH_PCT
+    hi = math.inf if index == N_GRADE_BINS - 1 else GRADE_BIN_MIN_PCT + index * GRADE_BIN_WIDTH_PCT
+    return lo, hi
 
 
-def _bin_center(lo: float, hi: float) -> float:
-    if lo == _UNDERFLOW_LO:
-        return GRADE_BIN_MIN_PCT - GRADE_BIN_WIDTH_PCT / 2
-    if hi == _OVERFLOW_HI:
-        return GRADE_BIN_MAX_PCT + GRADE_BIN_WIDTH_PCT / 2
+def _bin_center(index: int) -> float:
+    lo, hi = _bin_bounds(index)
+    if math.isinf(lo):
+        return hi - GRADE_BIN_WIDTH_PCT / 2
+    if math.isinf(hi):
+        return lo + GRADE_BIN_WIDTH_PCT / 2
     return (lo + hi) / 2
+
+
+def _json_bound(pct: float) -> float | None:
+    return None if math.isinf(pct) else pct
 
 
 def _clip(value: float, lo: float, hi: float) -> float:
@@ -252,12 +246,31 @@ def _band_multiplier(bands: Sequence[tuple[float, float, float]], x: float) -> f
 
 @dataclass
 class GradeBinStats:
-    lo_pct: float
-    hi_pct: float
+    index: int
     median_speed_mps: float | None
     efficiency_median: float | None
     walk_fraction: float | None
     sample_count: int
+
+    @property
+    def lo_pct(self) -> float:
+        return _bin_bounds(self.index)[0]
+
+    @property
+    def hi_pct(self) -> float:
+        return _bin_bounds(self.index)[1]
+
+    def to_dict(self) -> dict:
+        """The bin as the API and snapshots report it: bounds in percent, null
+        where the bin is open-ended."""
+        return {
+            "lo_pct": _json_bound(self.lo_pct),
+            "hi_pct": _json_bound(self.hi_pct),
+            "median_speed_mps": self.median_speed_mps,
+            "efficiency_median": self.efficiency_median,
+            "walk_fraction": self.walk_fraction,
+            "sample_count": self.sample_count,
+        }
 
 
 @dataclass
@@ -272,13 +285,6 @@ class TerrainModel:
     fatigue_bands: list[tuple[float, float, float]] = field(default_factory=list)
     temp_bands: list[tuple[float, float, float]] = field(default_factory=list)
 
-    def _bin_for(self, grade_pct: float) -> GradeBinStats | None:
-        lo, hi = _grade_bin_bounds(grade_pct)
-        for b in self.bins:
-            if b.lo_pct == lo and b.hi_pct == hi:
-                return b
-        return None
-
     def classify_grade(self, grade_pct: float) -> Literal["run", "grind", "hike"]:
         if grade_pct >= self.walk_onset_grade_pct:
             return "hike"
@@ -289,9 +295,9 @@ class TerrainModel:
         return "run"
 
     def expected_speed_mps(self, grade_pct: float, elapsed_s: float = 0.0, temp_c: float | None = None) -> float:
-        bin_ = self._bin_for(grade_pct)
-        if bin_ is not None and bin_.median_speed_mps is not None:
-            base = bin_.median_speed_mps
+        median_speed = self.bins[_grade_bin(grade_pct)].median_speed_mps
+        if median_speed is not None:
+            base = median_speed
         else:
             base = _DEFAULT_FLAT_SPEED_MPS / streams.minetti_cost_ratio(grade_pct)
         fatigue = _band_multiplier(self.fatigue_bands, elapsed_s)
@@ -329,11 +335,11 @@ def default_model() -> TerrainModel:
     """Generic defaults for an athlete with no terrain history: speed per grade
     follows the Minetti cost curve from a ~9:00/mi flat pace."""
     bins: list[GradeBinStats] = []
-    for lo, hi in _all_bin_bounds():
-        center = _bin_center(lo, hi)
+    for index in range(N_GRADE_BINS):
+        center = _bin_center(index)
         speed = _DEFAULT_FLAT_SPEED_MPS / streams.minetti_cost_ratio(center)
         walk_fraction = 0.0 if center < _DEFAULT_WALK_ONSET_PCT else 1.0
-        bins.append(GradeBinStats(lo, hi, speed, None, walk_fraction, 0))
+        bins.append(GradeBinStats(index, speed, None, walk_fraction, 0))
     neutral_fatigue = [(lo, hi, 1.0) for lo, hi in zip(FATIGUE_BAND_EDGES_S, FATIGUE_BAND_EDGES_S[1:])]
     neutral_temp = [(lo, hi, 1.0) for lo, hi in zip(TEMP_BAND_EDGES_C, TEMP_BAND_EDGES_C[1:])]
     return TerrainModel(
@@ -441,32 +447,27 @@ def current_model(
 
     df = pd.DataFrame([dict(r) for r in rows])
     df["gap_speed_mps"] = df["speed_mps"] * df["grade_pct"].apply(streams.minetti_cost_ratio)
-    bin_bounds = df["grade_pct"].apply(_grade_bin_bounds)
-    df["bin_lo"] = bin_bounds.apply(lambda t: t[0])
-    df["bin_hi"] = bin_bounds.apply(lambda t: t[1])
+    df["bin"] = df["grade_pct"].map(_grade_bin)
+    by_bin: dict[int, pd.DataFrame] = {cast(int, index): group for index, group in df.groupby("bin")}
 
-    default_by_range = {(b.lo_pct, b.hi_pct): b for b in defaults.bins}
     bins: list[GradeBinStats] = []
     total_real_samples = 0
-    for lo, hi in _all_bin_bounds():
-        sub = cast(pd.DataFrame, df[(df["bin_lo"] == lo) & (df["bin_hi"] == hi)])
-        n = len(sub)
-        if n < MIN_SAMPLES_FOR_BIN:
-            bins.append(default_by_range[(lo, hi)])
+    for default in defaults.bins:
+        sub = by_bin.get(default.index)
+        if sub is None or len(sub) < MIN_SAMPLES_FOR_BIN:
+            bins.append(default)
             continue
+        n = len(sub)
         total_real_samples += n
-        speed_vals = cast(pd.Series, sub["speed_mps"]).dropna()
-        median_speed = (
-            float(cast(float, speed_vals.median())) if len(speed_vals) else default_by_range[(lo, hi)].median_speed_mps
-        )
-        heartrate_col = cast(pd.Series, sub["heartrate"])
-        eff_sub = cast(pd.DataFrame, sub[heartrate_col.notna() & (heartrate_col > 0)])
+        speeds = cast(pd.Series, sub["speed_mps"]).dropna()
+        median_speed = float(cast(float, speeds.median())) if len(speeds) else default.median_speed_mps
+        with_heartrate = cast(pd.DataFrame, sub[cast(pd.Series, sub["heartrate"]) > 0])
         efficiency = (
-            float(cast(float, (cast(pd.Series, eff_sub["gap_speed_mps"]) / cast(pd.Series, eff_sub["heartrate"])).median()))
-            if len(eff_sub) else None
+            float(cast(float, cast(pd.Series, with_heartrate["gap_speed_mps"] / with_heartrate["heartrate"]).median()))
+            if len(with_heartrate) else None
         )
         walk_fraction = float(cast(float, cast(pd.Series, sub["is_walking"]).mean()))
-        bins.append(GradeBinStats(lo, hi, median_speed, efficiency, walk_fraction, n))
+        bins.append(GradeBinStats(default.index, median_speed, efficiency, walk_fraction, n))
 
     walk_onset = _derive_walk_onset(bins, defaults.walk_onset_grade_pct)
     descent_comfort = _derive_descent_comfort(bins, defaults.descent_comfort_grade_pct)
@@ -577,8 +578,7 @@ def _drape_activity_dem(
         raw[i] = value
     if all(v is not None for v in raw):
         values = cast(list[float], raw)
-        half_window_m = gpx_parse.smoothing_half_window_for(gpx_parse.profile_roughness_m(dist_m, values))
-        return cast(list[float | None], gpx_parse.smoothed_elevations(values, dist_m, half_window_m))
+        return cast(list[float | None], gpx_parse.roughness_smoothed(dist_m, values)[0])
     return raw
 
 
@@ -770,20 +770,46 @@ def segment_cached_activity(
     return n
 
 
+def segment_or_record_failure(
+    conn: sqlite3.Connection,
+    activity_id: int,
+    raw_streams: Mapping[str, object] | None = None,
+    *,
+    fetch_dem: bool = False,
+    dem_sampler: elevation.ElevationSampler | None = None,
+) -> int | None:
+    """segment_cached_activity, after storing raw_streams (just fetched from
+    Strava) when given. A failure that is the activity's own is recorded
+    against it, its partial rows dropped, and None returned; a database error
+    or a failed tile fetch propagates, since neither is the activity's fault."""
+    try:
+        if raw_streams is not None:
+            streams.cache_streams(activity_id, raw_streams)
+        return segment_cached_activity(conn, activity_id, fetch_dem=fetch_dem, dem_sampler=dem_sampler)
+    except (sqlite3.Error, elevation.ElevationFetchError):
+        raise
+    except Exception as e:
+        _logger.warning("terrain segmentation failed for activity %s", activity_id, exc_info=True)
+        for table in ("terrain_segments", "terrain_segment_dates"):
+            conn.execute(f"DELETE FROM {table} WHERE activity_id = ?", [activity_id])
+        record_segmentation_failure(conn, activity_id, e)
+        return None
+
+
 def activities_to_segment(conn: sqlite3.Connection) -> list[int]:
     """Terrain-model activities with streams on disk that are unprocessed or
     were segmented without full tile coverage, newest first. Activities whose
     segmentation failed at this model version are left out."""
     failed = segmentation_failed_ids(conn)
-    placeholders = ",".join("?" * len(TERRAIN_SPORT_TYPES))
+    sport_sql, sport_params = sport_filter()
     rows = conn.execute(
         f"""
-        SELECT a.activity_id FROM activities a
-        LEFT JOIN terrain_segment_dates d ON d.activity_id = a.activity_id
-        WHERE a.sport_type IN ({placeholders}) AND (d.activity_id IS NULL OR d.needs_dem = 1)
+        SELECT activity_id FROM activities a
+        LEFT JOIN terrain_segment_dates d USING (activity_id)
+        WHERE {sport_sql} AND (d.activity_id IS NULL OR d.needs_dem = 1)
         ORDER BY a.start_date DESC
         """,
-        list(TERRAIN_SPORT_TYPES),
+        sport_params,
     ).fetchall()
     return [r["activity_id"] for r in rows if r["activity_id"] not in failed and streams.has_cached_streams(r["activity_id"])]
 
@@ -801,10 +827,8 @@ def model_is_current(conn: sqlite3.Connection) -> bool:
 
 
 def _has_terrain_activities(conn: sqlite3.Connection) -> bool:
-    placeholders = ",".join("?" * len(TERRAIN_SPORT_TYPES))
-    return conn.execute(
-        f"SELECT 1 FROM activities WHERE sport_type IN ({placeholders}) LIMIT 1", list(TERRAIN_SPORT_TYPES)
-    ).fetchone() is not None
+    sport_sql, sport_params = sport_filter()
+    return conn.execute(f"SELECT 1 FROM activities WHERE {sport_sql} LIMIT 1", sport_params).fetchone() is not None
 
 
 def ensure_terrain_derived(conn: sqlite3.Connection) -> None:
@@ -925,13 +949,13 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
         }
     skipped = already_segmented | segmentation_failed_ids(conn)
 
-    placeholders = ",".join("?" * len(TERRAIN_SPORT_TYPES))
-    eligible = f"SELECT activity_id FROM activities WHERE sport_type IN ({placeholders})"
+    sport_sql, sport_params = sport_filter()
     for table in ("terrain_segments", "terrain_segment_dates"):
-        conn.execute(f"DELETE FROM {table} WHERE activity_id NOT IN ({eligible})", list(TERRAIN_SPORT_TYPES))
+        conn.execute(
+            f"DELETE FROM {table} WHERE activity_id NOT IN (SELECT activity_id FROM activities WHERE {sport_sql})", sport_params
+        )
     rows = conn.execute(
-        f"SELECT activity_id FROM activities WHERE sport_type IN ({placeholders}) ORDER BY start_date DESC",
-        list(TERRAIN_SPORT_TYPES),
+        f"SELECT activity_id FROM activities WHERE {sport_sql} ORDER BY start_date DESC", sport_params
     ).fetchall()
 
     # Runs on request/startup paths, so it must never wait on a tile fetch.
@@ -944,18 +968,8 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
             continue
         if not streams.has_cached_streams(activity_id):
             continue  # backfill hasn't reached this activity yet
-        try:
-            n = segment_cached_activity(conn, activity_id, dem_sampler=dem_sampler)
-        except sqlite3.Error:
-            raise
-        except Exception as e:
-            # One failing activity must not keep the model stale for the rest.
-            _logger.warning("terrain segmentation failed for activity %s", activity_id, exc_info=True)
-            for table in ("terrain_segments", "terrain_segment_dates"):
-                conn.execute(f"DELETE FROM {table} WHERE activity_id = ?", [activity_id])
-            record_segmentation_failure(conn, activity_id, e)
-            continue
-        if n:
+        # One failing activity must not keep the model stale for the rest.
+        if segment_or_record_failure(conn, activity_id, dem_sampler=dem_sampler):
             segmented += 1
 
     db.set_meta(conn, "terrain_model_version", model_version_tag())
@@ -977,7 +991,7 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
 def record_snapshot(conn: sqlite3.Connection, as_of: date | None = None, window_days: int = ROLLING_WINDOW_DAYS) -> None:
     as_of = as_of or date.today()
     model = current_model(conn, window_days=window_days, as_of=as_of)
-    bins_payload = [asdict(b) for b in model.bins]
+    bins_payload = [b.to_dict() for b in model.bins]
     conn.execute(
         """
         INSERT INTO terrain_snapshots (
@@ -1026,25 +1040,8 @@ def backfill_snapshots(conn: sqlite3.Connection, window_days: int, since: date |
 # ---------------------------------------------------------------------------
 
 
-class TerrainProfileBin(TypedDict):
-    lo_pct: float
-    hi_pct: float
-    median_speed_mps: float | None
-    efficiency_median: float | None
-    walk_fraction: float | None
-    sample_count: int
-
-
-class TerrainProfile(TypedDict):
-    as_of: str
-    window_days: int
-    walk_onset_grade_pct: float
-    descent_comfort_grade_pct: float
-    confidence: str
-    bins: list[TerrainProfileBin]
-
-
-def get_terrain_profile(conn: sqlite3.Connection, window_days: int = ROLLING_WINDOW_DAYS) -> TerrainProfile:
+def get_terrain_profile(conn: sqlite3.Connection, window_days: int = ROLLING_WINDOW_DAYS) -> dict:
+    """The model's grade bins, thresholds, and confidence over the window."""
     model = current_model(conn, window_days=window_days)
     return {
         "as_of": model.as_of,
@@ -1052,7 +1049,7 @@ def get_terrain_profile(conn: sqlite3.Connection, window_days: int = ROLLING_WIN
         "walk_onset_grade_pct": model.walk_onset_grade_pct,
         "descent_comfort_grade_pct": model.descent_comfort_grade_pct,
         "confidence": model.confidence,
-        "bins": cast(list[TerrainProfileBin], [asdict(b) for b in model.bins]),
+        "bins": [b.to_dict() for b in model.bins],
     }
 
 
@@ -1099,7 +1096,8 @@ def get_terrain_trend(
         selected = [
             b[metric]
             for b in bins
-            if b["lo_pct"] >= lo and b["hi_pct"] <= hi and b[metric] is not None
+            if b["lo_pct"] is not None and b["hi_pct"] is not None
+            and b["lo_pct"] >= lo and b["hi_pct"] <= hi and b[metric] is not None
             and b["sample_count"] >= MIN_SAMPLES_FOR_BIN
         ]
         value = sum(selected) / len(selected) if selected else None
@@ -1113,8 +1111,8 @@ def get_terrain_trend(
 
 
 class RouteGapBin(TypedDict):
-    lo_pct: float
-    hi_pct: float
+    lo_pct: float | None
+    hi_pct: float | None
     course_share: float
     deficit: float | None
     weighted_deficit: float | None
@@ -1156,24 +1154,20 @@ def _gap_analysis(model: TerrainModel, grades_pct: Sequence[float]) -> RouteGapA
     deficit: how far a bin's grade-adjusted efficiency falls below their best
     bin."""
     total = len(grades_pct)
-    histogram: dict[tuple[float, float], int] = {}
-    for g in grades_pct:
-        key = _grade_bin_bounds(g)
-        histogram[key] = histogram.get(key, 0) + 1
+    histogram = Counter(_grade_bin(g) for g in grades_pct)
 
     efficiencies = [b.efficiency_median for b in model.bins if b.efficiency_median is not None]
     best_efficiency = max(efficiencies) if efficiencies else None
-    bins_by_range = {(b.lo_pct, b.hi_pct): b for b in model.bins}
 
     out: list[RouteGapBin] = []
-    for (lo, hi), count in sorted(histogram.items()):
+    for index, count in sorted(histogram.items()):
         share = count / total
-        bin_ = bins_by_range.get((lo, hi))
+        bin_ = model.bins[index]
         deficit: float | None = None
-        if best_efficiency and best_efficiency > 0 and bin_ is not None and bin_.efficiency_median is not None:
+        if best_efficiency and best_efficiency > 0 and bin_.efficiency_median is not None:
             deficit = max(0.0, (best_efficiency - bin_.efficiency_median) / best_efficiency)
         out.append({
-            "lo_pct": lo, "hi_pct": hi, "course_share": share,
+            "lo_pct": _json_bound(bin_.lo_pct), "hi_pct": _json_bound(bin_.hi_pct), "course_share": share,
             "deficit": deficit,
             "weighted_deficit": (deficit * share) if deficit is not None else None,
         })
@@ -1253,8 +1247,7 @@ class ActivityTerrainAnalysis(TypedDict):
 
 
 def _percentile_at_grade(conn: sqlite3.Connection, grade_pct: float, speed_mps: float, window_days: int) -> float | None:
-    lo, hi = _grade_bin_bounds(grade_pct)
-    lo_dpct, hi_dpct = round(lo * 10), round(hi * 10)
+    lo, hi = _bin_bounds(_grade_bin(grade_pct))
     start_date = (date.today() - timedelta(days=window_days)).isoformat()
     rows = conn.execute(
         """
@@ -1263,7 +1256,7 @@ def _percentile_at_grade(conn: sqlite3.Connection, grade_pct: float, speed_mps: 
         JOIN terrain_segment_dates d ON d.activity_id = ts.activity_id
         WHERE ts.grade_dpct >= ? AND ts.grade_dpct < ? AND d.start_date >= ? AND ts.speed_cms IS NOT NULL
         """,
-        [lo_dpct, hi_dpct, start_date],
+        [lo * 10, hi * 10, start_date],
     ).fetchall()
     speeds = [r["speed_mps"] for r in rows]
     if not speeds:
@@ -1278,7 +1271,7 @@ def analyze_activity_terrain(conn: sqlite3.Connection, activity_id: int) -> Acti
     percentile of the athlete's own history at that grade."""
     if not streams.has_cached_streams(activity_id):
         raise TerrainDataError(f"No current cached streams for activity {activity_id}")
-    stream_df = streams.fetch_and_cache_streams(activity_id)
+    stream_df = streams.get_stream_dataframe(activity_id)
     resampled = _resample_altitude(stream_df)
     if resampled is None:
         raise TerrainDataError(f"Activity {activity_id} has no usable elevation stream")

@@ -198,6 +198,81 @@ def way(way_id: int, nodes: list[int], tags: dict) -> dict:
     return {"type": "way", "id": way_id, "nodes": nodes, "tags": tags}
 
 
+def box_rings(south: float, west: float, north: float, east: float) -> list:
+    """The closed GeoJSON ring of a rectangle, in a list of rings."""
+    return [[[west, south], [east, south], [east, north], [west, north], [west, south]]]
+
+
+def region_polygon(south: float, west: float, north: float, east: float) -> dict:
+    return {"type": "Polygon", "coordinates": box_rings(south, west, north, east)}
+
+
+def region_feature(path: str | None, geometry: dict | None) -> dict:
+    """A Geofabrik index feature for the extract at `path` (none when path is
+    None) bounded by `geometry`."""
+    urls = {"pbf": f"https://download.geofabrik.de/{path}-latest.osm.pbf"} if path else {}
+    return {"type": "Feature", "properties": {"id": (path or "none").split("/")[-1], "urls": urls}, "geometry": geometry}
+
+
+def lerp(a: tuple[float, float], b: tuple[float, float], t: float) -> tuple[float, float]:
+    """The point a fraction t of the way from a to b."""
+    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+
+class WayBuilder:
+    """Accumulates Overpass-shaped nodes and ways, handing out fresh ids.
+    `elements` is what build_network takes as a payload."""
+
+    def __init__(self, first_node_id: int = 101, first_way_id: int = 1) -> None:
+        self._next_node = first_node_id
+        self._next_way = first_way_id
+        self.nodes: list[dict] = []
+        self.ways: list[dict] = []
+
+    @property
+    def elements(self) -> list[dict]:
+        return [*self.nodes, *self.ways]
+
+    def node(self, lat: float, lng: float, tags: dict | None = None, node_id: int | None = None) -> int:
+        if node_id is None:
+            node_id, self._next_node = self._next_node, self._next_node + 1
+        self.nodes.append(node(node_id, lat, lng, tags))
+        return node_id
+
+    def way(self, node_ids: list[int], tags: dict) -> int:
+        way_id, self._next_way = self._next_way, self._next_way + 1
+        self.ways.append(way(way_id, node_ids, tags))
+        return way_id
+
+    def path(
+        self,
+        a_id: int,
+        a_ll: tuple[float, float],
+        b_id: int,
+        b_ll: tuple[float, float],
+        *,
+        highway: str,
+        tags: dict | None = None,
+        pieces: int = 1,
+        interior: int = 0,
+    ) -> int:
+        """A straight run from node a to node b as `pieces` ways joined at
+        fresh nodes (each junction splits the network into its own edge), each
+        shaped by `interior` points that belong to no other way and so add
+        geometry without adding a junction. Returns the first way's id."""
+        way_tags = dict(tags or {}, highway=highway)
+        prev_id, first_way = a_id, None
+        for i in range(1, pieces + 1):
+            end_id = b_id if i == pieces else self.node(*lerp(a_ll, b_ll, i / pieces))
+            piece_from, piece_to = lerp(a_ll, b_ll, (i - 1) / pieces), lerp(a_ll, b_ll, i / pieces)
+            shape = [self.node(*lerp(piece_from, piece_to, k / (interior + 1))) for k in range(1, interior + 1)]
+            way_id = self.way([prev_id, *shape, end_id], way_tags)
+            first_way = way_id if first_way is None else first_way
+            prev_id = end_id
+        assert first_way is not None
+        return first_way
+
+
 class ImmediateThread:
     """Stand-in for threading.Thread that runs its target synchronously in the
     caller's thread, so a background job can be tested without concurrency."""

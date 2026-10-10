@@ -4,7 +4,7 @@ import pytest
 from helpers import FakeSampler, by_deg_lat, by_deg_lng, call_tool, climbing_sampler, node, none_sampler, way
 from mcp.server.fastmcp import FastMCP
 
-from miles import network, network_mcp
+from miles import network, routing_mcp, terrain
 
 
 # A small synthetic tile set: two contiguous "busy" secondary-road ways
@@ -72,7 +72,7 @@ def _build(conn: sqlite3.Connection, area_id: int = 1, sampler=None):
 
 def _score(conn: sqlite3.Connection, edge_ids: list[int], area_id: int = 1) -> dict:
     prefs = network.get_route_preferences(conn)
-    return network.score_path(conn, area_id, [(e, True) for e in edge_ids], prefs, network.default_runnability_scorer)
+    return network.score_path(conn, area_id, [(e, True) for e in edge_ids], prefs, terrain.default_model().score_profile)
 
 
 def test_build_network_dedupes_overlapping_tiles_excludes_private_ways_counts_every_node_and_sets_edge_attributes(conn: sqlite3.Connection):
@@ -103,7 +103,6 @@ def test_build_network_dedupes_overlapping_tiles_excludes_private_ways_counts_ev
     assert edge_a["maxspeed_mph"] == pytest.approx(45.0)
     assert edge_a["maxspeed_filled"] == 0
     assert edge_a["has_elevation"] == 1
-    assert edge_a["gain_fwd_m"] > 0
 
     # Way D is split into two edges at the drinking-water node, which sits
     # partway along it -- an amenity is spliced into the network, not just
@@ -456,7 +455,7 @@ def test_several_amenities_on_one_edge_chain_the_pieces_end_to_end(conn: sqlite3
 
 def test_the_preferences_tool_applies_a_patch_and_reports_a_rejected_one_as_an_error():
     server = FastMCP("test")
-    network_mcp.register_network_tools(server)
+    routing_mcp.register_routing_tools(server)
 
     assert call_tool(server, "set_route_preferences", {"patch": {"max_continuous_uncomfortable_m": 1000}})["max_continuous_uncomfortable_m"] == 1000
     assert call_tool(server, "set_route_preferences", {"patch": '{"max_continuous_uncomfortable_m": 900}'})["max_continuous_uncomfortable_m"] == 900

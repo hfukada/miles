@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from helpers import FakeClock, FakeResponse, http_error, urlopen_sequence
 
-from miles import db, events, health, health_api, http_client, metrics, outbound, strava_client, sync, terrain
+from miles import db, events, health, health_api, http_client, metrics, outbound, sync, terrain
 
 
 def _meta(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -59,18 +59,13 @@ def _failed_sync(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> N
     _meta(conn, sync.META_LAST_ERROR, "RuntimeError: boom")
 
 
-def _backfill_error(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
+def _history_error(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
     _healthy(conn)
-    conn.execute("UPDATE terrain_backfill_status SET status = 'error', error = 'boom' WHERE id = 1")
-    conn.commit()
+    _meta(conn, sync.META_HISTORY_ERROR, "boom")
 
 
 def _interrupted_by_a_restart(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch) -> None:
     _healthy(conn)
-    _queue_history(conn)
-    conn.execute(
-        "UPDATE terrain_backfill_status SET status = 'error', error = ? WHERE id = 1", (outbound.BACKFILL_INTERRUPTED_ERROR,)
-    )
     _area(conn, "cut off", outbound.IMPORT_INTERRUPTED_ERROR, _ago(days=1))
 
 
@@ -104,11 +99,11 @@ HEALTH_CASES = {
         ),
         (lambda c, m: _meta(c, sync.META_LAST_SUCCESS, _ago(hours=1)), []),
     ],
-    "a backfill error only while history work remains": [
-        (_backfill_error, []),
-        (lambda c, m: _queue_history(c), ["terrain backfill in error"]),
+    "a history pass error only while history work remains": [
+        (_history_error, []),
+        (lambda c, m: _queue_history(c), ["history pass in error"]),
     ],
-    "a run interrupted by a restart is not an alert": [(_interrupted_by_a_restart, [])],
+    "an import interrupted by a restart is not an alert": [(_interrupted_by_a_restart, [])],
     "a failed terrain rebuild only while the model is behind": [
         (lambda c, m: (_healthy(c), _meta(c, terrain.REBUILD_ERROR_META, "ValueError: bad")), ["terrain model rebuild failed"]),
         (lambda c, m: _meta(c, "terrain_model_version", terrain.model_version_tag()), []),
@@ -247,14 +242,6 @@ def test_time_spent_waiting_on_the_throttle_is_counted(clock: FakeClock, monkeyp
     assert metrics.REGISTRY.get_sample_value("miles_http_wait_seconds_total", {"service": "slow"}) == pytest.approx(2.0)
 
 
-def test_install_hooks_the_ledger_into_both_clients():
-    events.install()
-
-    assert http_client.request_sink is events.record_request
-    assert http_client.outcome_sink is events.record_outcome
-    assert strava_client.rate_sink is events.record_strava_rate
-
-
 @pytest.fixture
 def ledger(monkeypatch: pytest.MonkeyPatch):
     """The default (isolated) database, with the once-a-day prune reset."""
@@ -323,7 +310,7 @@ def test_recording_never_raises_when_the_database_is_unusable(monkeypatch: pytes
     events.record_strava_rate(1, 1)
 
 
-def test_the_outbound_endpoint_and_metrics_expose_the_ledger(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+def test_metrics_expose_the_ledger(client: TestClient, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(metrics.ENABLE_ENV, "1")
     conn = db.connect()
     day = datetime.now(timezone.utc).date().isoformat()
@@ -333,9 +320,6 @@ def test_the_outbound_endpoint_and_metrics_expose_the_ledger(client: TestClient,
     conn.commit()
     conn.close()
 
-    assert client.get("/api/outbound", params={"days": 7}).json() == [
-        {"day": day, "service": "osrm", "host": "router.example", "kind": "", "status": "200", "count": 7}
-    ]
     text = client.get("/metrics").text
     assert 'miles_outbound_requests_total{host="router.example",kind="",service="osrm",status="200"} 10.0' in text
     assert "miles_strava_daily_calls_remaining 600.0" in text

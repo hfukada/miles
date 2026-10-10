@@ -17,7 +17,7 @@ import requests
 from fastapi.testclient import TestClient
 from helpers import FakeStravaSession, insert_activity
 
-from miles import api, db, mcp_server, strava_client, terrain_api, terrain_backfill
+from miles import api, db, mcp_server, strava_budget, strava_client, sync
 from miles.sync import SyncProgress
 
 SECRET = "FAKE-SECRET-123"
@@ -86,20 +86,16 @@ def test_a_failing_strava_request_leaks_no_credential(
     assert "StravaUnavailableError" in sync_status["error"]
 
     conn = db.connect()
-    conn.execute("INSERT INTO terrain_backfill_queue (activity_id, start_date, queued_at) VALUES (1, '2026-01-05', 'x')")
-    conn.commit()
-    assert terrain_backfill.BackfillProgress(conn).try_start()
+    sync._pass_history(conn, 10, strava_budget.Gate(0), SyncProgress())
+    history_error = db.get_meta(conn, sync.META_HISTORY_ERROR)
     conn.close()
-    terrain_api._run_terrain_backfill_in_background()
-    backfill_status = client.get("/api/terrain/backfill/status").json()
-    assert backfill_status["status"] == "error"
+    assert history_error
 
     responses = [
         sync_status,
-        backfill_status,
+        history_error,
         client.get("/api/health", params={"verbose": 1}).json(),
         mcp_server.run_sql("SELECT key, value FROM meta"),
-        mcp_server.run_sql("SELECT * FROM terrain_backfill_status"),
     ]
     surfaces = [str(r) for r in responses] + [_every_stored_value(database), caplog.text, capsys.readouterr().out]
     for surface in surfaces:

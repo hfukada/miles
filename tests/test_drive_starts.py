@@ -28,7 +28,7 @@ from helpers import (
     way,
 )
 
-from miles import drive_starts, network
+from miles import drive_starts, http_client, network
 
 
 @pytest.fixture
@@ -193,18 +193,16 @@ def test_a_failed_osrm_request_falls_back_to_flagged_estimates_that_are_not_cach
     assert conn.execute("SELECT COUNT(*) FROM drive_time_cache").fetchone()[0] == 0
 
 
-def test_osrm_is_left_alone_for_ten_minutes_after_a_failure_then_tried_again(conn: sqlite3.Connection, osrm: FakeOsrm, monkeypatch: pytest.MonkeyPatch):
+def test_osrm_is_left_alone_for_ten_minutes_after_a_failure_then_tried_again(conn: sqlite3.Connection, osrm: FakeOsrm, clock):
     osrm.fail_with = urllib.error.URLError("connection refused")
-    now = [1000.0]
-    monkeypatch.setattr(drive_starts.time, "monotonic", lambda: now[0])
     _search(conn)
     assert len(osrm.calls) == 1
 
-    now[0] += drive_starts.OSRM_RETRY_COOLDOWN_S - 1
+    clock.sleep(drive_starts.OSRM_RETRY_COOLDOWN_S - 1)
     _search(conn)
     assert len(osrm.calls) == 1  # still cooling down: no request
 
-    now[0] += 2
+    clock.sleep(2)
     osrm.fail_with = None
     recovered = _search(conn)
     assert len(osrm.calls) == 2
@@ -272,3 +270,35 @@ def test_origins_in_one_row_agree_on_the_column_width(conn: sqlite3.Connection, 
     _search(conn, centre + by_deg_lat(40.0), ORIGIN_LNG)
 
     assert len(osrm.calls) == asked
+
+
+def test_an_unresponsive_osrm_is_given_up_on_within_seconds(conn: sqlite3.Connection, clock, monkeypatch: pytest.MonkeyPatch):
+    attempts: list[float] = []
+
+    def hang(req, timeout=None):
+        attempts.append(timeout)
+        clock.sleep(timeout)
+        raise TimeoutError()
+
+    monkeypatch.setattr(http_client.urllib.request, "urlopen", hang)
+    started = clock.now
+
+    results = _search(conn)
+
+    assert len(attempts) == http_client.OSRM.max_attempts
+    assert clock.now - started <= 10.0
+    assert all(r["drive_time_estimated"] for r in results[1:]) and TH1_ID in _ids(results)
+
+
+def test_rows_past_their_ttl_are_deleted_when_new_answers_are_stored(conn: sqlite3.Connection, osrm: FakeOsrm):
+    stale = (datetime.now(timezone.utc) - timedelta(days=drive_starts.DRIVE_TIME_CACHE_TTL_DAYS + 1)).isoformat()
+    stale_unreachable = (datetime.now(timezone.utc) - timedelta(days=drive_starts.UNREACHABLE_CACHE_TTL_DAYS + 1)).isoformat()
+    conn.executemany(
+        "INSERT INTO drive_time_cache (origin_lat_r, origin_lng_r, dest_node_id, drive_s, fetched_at) VALUES (?, ?, ?, ?, ?)",
+        [(1, 1, 1, 60.0, stale), (1, 1, 2, None, stale_unreachable), (1, 1, 3, 60.0, stale_unreachable)],
+    )
+
+    _search(conn)
+
+    left = {r["dest_node_id"] for r in conn.execute("SELECT dest_node_id FROM drive_time_cache WHERE origin_lat_r = 1")}
+    assert left == {3}  # a measured time outlives the unreachable TTL

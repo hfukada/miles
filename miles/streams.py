@@ -1,21 +1,17 @@
 """Per-second Strava stream data: fetch, store the raw response as ground
 truth, and derive GAP/lap medians and a DataFrame on read.
 
-Raw streams are stored verbatim -- type/data/series_type/original_size/
-resolution per stream, gzipped JSON, one file per activity under
-STREAMS_DIR/raw/<activity_id>.json.gz -- the way activities.raw_json and
-routes' raw GPX (adr/0002) are ground truth. A raw file is written once,
-atomically, and replaced only by a refetch. Every consumer (GAP/lap medians, terrain
-segmentation, activity-detail charts) derives its DataFrame from that file
-on read; there is no second stored form to go stale or need invalidating.
-STREAM_DERIVE_VERSION exists so a change to that derivation is a rebuild for
-anything that caches a result keyed to it (terrain.model_version_tag()),
-not a re-fetch from Strava.
+Raw streams are stored verbatim (type/data/series_type/original_size/
+resolution per stream), gzipped JSON, one file per activity under
+STREAMS_DIR/raw/<activity_id>.json.gz, as ground truth like activities.raw_json
+and routes' raw GPX (adr/0002). A raw file is written atomically and replaced
+only by a refetch; every consumer derives its DataFrame from it on read.
+STREAM_DERIVE_VERSION marks a change to that derivation, so results keyed to
+it (terrain.model_version_tag()) are re-derived from the raw file, not
+refetched.
 
-A *.parquet file from before raw storage existed is left on disk -- it's the
-athlete's data -- but ignored: has_cached_streams only checks for the raw
-file, since a legacy parquet discarded per-stream metadata and a shorter
-stream's true length, so it can't stand in for a real fetch.
+A *.parquet file cached by an earlier version is ignored: it lost per-stream
+metadata and a shorter stream's true length, so it can't stand in for a fetch.
 """
 
 import gzip
@@ -34,10 +30,7 @@ from . import strava_budget, strava_client
 
 STREAMS_DIR = Path(os.environ.get("MILES_STREAMS_DIR", Path(__file__).parent.parent / "data" / "streams"))
 
-# Bump when _build_dataframe's alignment/parsing logic changes -- a
-# consumer that caches a derived result keyed to this version (see
-# terrain.model_version_tag()) knows to re-derive from the raw file
-# rather than re-fetch it from Strava.
+# Bump when _build_dataframe's alignment or parsing changes.
 STREAM_DERIVE_VERSION = 1
 
 _STREAM_COLUMNS = [
@@ -157,13 +150,9 @@ def get_stream_dataframe(activity_id: int) -> pd.DataFrame:
 
 
 def cache_streams(activity_id: int, raw: Mapping[str, object]) -> pd.DataFrame:
-    """Persist Strava's stream response verbatim, gzipped, written atomically
-    (temp file + rename); an existing file is replaced whole, so callers fetch
-    only when has_cached_streams says there is none. Returns the DataFrame
-    derived from the same data in memory, without reading it back off disk.
-    Split out from fetch_and_cache_streams so a batch fetcher (the terrain
-    backfill job) can store each activity as it arrives without a redundant
-    per-activity API call."""
+    """Persist Strava's stream response verbatim, gzipped, written atomically;
+    an existing file is replaced whole. Returns the DataFrame derived from the
+    same data without reading it back."""
     raw_dict = _raw_to_dict(raw)
     _atomic_write_bytes(_raw_path(activity_id), gzip.compress(json.dumps(raw_dict).encode("utf-8")))
     return _build_dataframe(raw_dict)

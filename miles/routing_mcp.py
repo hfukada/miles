@@ -1,21 +1,22 @@
-"""MCP tools for route search (docs/design-terrain-and-route-search.md,
-section 5). Miles/feet are converted to and from route_search's meters only
-here."""
+"""MCP tools for route finding: trailhead search, the route-scoring preference
+profile and way overrides, and candidate route search. Distances are miles
+and feet, drive times minutes; the modules underneath work in meters and
+seconds, and the conversion happens only here."""
 
 import json
-from typing import cast
+from collections.abc import Mapping
+from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
 
-from . import db, route_search
+from . import db, drive_starts, network, route_search
 from .errors import reporting
-from .fitness import MILE_M
+from .fitness import FT_PER_M, MILE_M
 from .offload import threaded
 
-FT_PER_M = 3.28084
 
-
-def _start_summary(start: route_search.Start) -> dict:
+def _start_view(start: Mapping[str, Any]) -> dict:
+    """A start as the athlete reads it: its label and drive time in minutes."""
     drive_s = start.get("drive_s")
     return {
         "lat": start["lat"],
@@ -23,6 +24,15 @@ def _start_summary(start: route_search.Start) -> dict:
         "label": start.get("label"),
         "drive_minutes": drive_s / 60.0 if drive_s is not None else None,
         "drive_time_estimated": start.get("drive_time_estimated", False),
+    }
+
+
+def _trailhead_view(start: drive_starts.DriveStart) -> dict:
+    return {
+        **_start_view(start),
+        "kind": start["kind"],
+        "osm_node_id": start["osm_node_id"],
+        "trail_miles_nearby": start["trail_m_nearby"] / MILE_M,
     }
 
 
@@ -41,7 +51,7 @@ def _candidate_summary(candidate: route_search.RouteCandidateOut) -> dict:
     return {
         "candidate_id": candidate["candidate_id"],
         "shape": candidate["shape"],
-        "start": _start_summary(candidate["start"]),
+        "start": _start_view(candidate["start"]),
         "distance_mi": candidate["distance_m"] / MILE_M,
         "trail_mi": score["trail_distance_m"] / MILE_M,
         "unpaved_road_mi": score["unpaved_road_distance_m"] / MILE_M,
@@ -61,7 +71,58 @@ def _candidate_summary(candidate: route_search.RouteCandidateOut) -> dict:
     }
 
 
-def register_search_tools(mcp: FastMCP) -> None:
+def register_routing_tools(mcp: FastMCP) -> None:
+    @mcp.tool()
+    @threaded
+    @reporting(ValueError)
+    def find_trailheads(area_id: int, lat: float, lng: float, max_drive_minutes: float, k: int = 8) -> str:
+        """
+        Trailheads and trail-adjacent parking in an imported area within
+        max_drive_minutes (at most 90) of (lat, lng), best k first by drive
+        time and nearby trail. The point itself is always first, as a
+        zero-drive-time start.
+
+        Each result has lat/lng, label, drive_minutes, kind
+        ("origin"/"trailhead"/"parking"), the OSM id (null for the origin;
+        negated way id for an outline), trail_miles_nearby, and
+        drive_time_estimated (true when routing was unavailable and the time
+        is a straight-line estimate).
+        """
+        with db.connection() as conn:
+            starts = drive_starts.drive_starts(conn, area_id, lat, lng, max_drive_minutes, k=k)
+        return json.dumps([_trailhead_view(s) for s in starts])
+
+    @mcp.tool()
+    def get_route_preferences() -> str:
+        """
+        The route-scoring preference profile: road-comfort thresholds, maximum
+        continuous uncomfortable-road distance. Defaults apply until
+        set_route_preferences changes them.
+        """
+        with db.connection() as conn:
+            return json.dumps(network.get_route_preferences(conn))
+
+    @mcp.tool()
+    @reporting(ValueError)
+    def set_route_preferences(patch: dict[str, Any]) -> str:
+        """
+        Update the preference profile. patch is a JSON object with any subset
+        of get_route_preferences' top-level keys; dict-valued keys are merged
+        into the existing value. Returns the full profile.
+        """
+        with db.connection() as conn:
+            return json.dumps(network.set_route_preferences(conn, patch))
+
+    @mcp.tool()
+    @reporting(ValueError)
+    def set_way_override(way_id: int, verdict: str, note: str | None = None) -> str:
+        """
+        Mark an OSM way "comfortable" or "avoid" regardless of its tags; survives
+        network rebuilds.
+        """
+        with db.connection() as conn:
+            return json.dumps(network.set_way_override(conn, way_id, verdict, note))
+
     @mcp.tool()
     @threaded
     @reporting(ValueError)

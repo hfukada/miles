@@ -5,22 +5,9 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from helpers import FakeResponse, memory_db
+from helpers import FakeResponse, box_rings, memory_db, region_feature, region_polygon
 
 from miles import geofabrik
-
-
-def _box(south: float, west: float, north: float, east: float) -> list:
-    return [[[west, south], [east, south], [east, north], [west, north], [west, south]]]
-
-
-def _feature(path: str | None, geometry: dict | None) -> dict:
-    urls = {"pbf": f"https://download.geofabrik.de/{path}-latest.osm.pbf"} if path else {}
-    return {"type": "Feature", "properties": {"id": (path or "none").split("/")[-1], "urls": urls}, "geometry": geometry}
-
-
-def _polygon(south: float, west: float, north: float, east: float) -> dict:
-    return {"type": "Polygon", "coordinates": _box(south, west, north, east)}
 
 
 # Two states side by side inside a country, a country-sized parent, and a
@@ -28,19 +15,19 @@ def _polygon(south: float, west: float, north: float, east: float) -> dict:
 INDEX = {
     "type": "FeatureCollection",
     "features": [
-        _feature("world/land", _polygon(0, 0, 40, 40)),
-        _feature("world/land/west", _polygon(0, 0, 40, 20)),
-        _feature("world/land/east", _polygon(0, 20, 40, 40)),
-        _feature("world/other/ringed", {
+        region_feature("world/land", region_polygon(0, 0, 40, 40)),
+        region_feature("world/land/west", region_polygon(0, 0, 40, 20)),
+        region_feature("world/land/east", region_polygon(0, 20, 40, 40)),
+        region_feature("world/other/ringed", {
             "type": "Polygon",
-            "coordinates": _box(50, 0, 60, 10) + _box(54, 4, 56, 6),
+            "coordinates": box_rings(50, 0, 60, 10) + box_rings(54, 4, 56, 6),
         }),
-        _feature("world/other/islands", {
+        region_feature("world/other/islands", {
             "type": "MultiPolygon",
-            "coordinates": [_box(70, 0, 71, 1), _box(70, 5, 71, 6)],
+            "coordinates": [box_rings(70, 0, 71, 1), box_rings(70, 5, 71, 6)],
         }),
-        _feature(None, _polygon(0, 0, 90, 90)),
-        _feature("world/nogeometry", None),
+        region_feature(None, region_polygon(0, 0, 90, 90)),
+        region_feature("world/nogeometry", None),
     ],
 }
 
@@ -54,10 +41,13 @@ def test_parse_keeps_only_regions_with_an_extract_and_a_boundary():
     assert paths == ["world/land", "world/land/west", "world/land/east", "world/other/ringed", "world/other/islands"]
 
 
+def _cover(box) -> list[str] | None:
+    found = geofabrik.covering_set(geofabrik.parse_index(_raw()), box)
+    return [r.path for r in found] if found is not None else None
+
+
 def test_the_smallest_containing_region_wins():
-    regions = geofabrik.parse_index(_raw())
-    found = geofabrik.smallest_containing(regions, (10, 2, 12, 4))
-    assert found is not None and found.path == "world/land/west"
+    assert _cover((10, 2, 12, 4)) == ["world/land/west"]
 
 
 @pytest.mark.parametrize(
@@ -73,7 +63,7 @@ def test_the_smallest_containing_region_wins():
     ],
     ids=["inside", "straddling a border", "touching a border", "outside", "edge crossing the box", "equal", "inside the box"],
 )
-def test_a_region_intersects_a_box_that_shares_any_point_with_its_polygon(box, expected):
+def test_a_region_intersects_a_box_that_shares_any_point_with_itsregion_polygon(box, expected):
     regions = {r.path: r for r in geofabrik.parse_index(_raw())}
     assert geofabrik.intersects(regions["world/land/west"], box) is expected
 
@@ -87,17 +77,35 @@ def test_a_box_inside_a_hole_does_not_intersect_the_region():
 @pytest.mark.parametrize(
     ("box", "expected"),
     [
-        ((10, 18, 12, 22), "world/land"),  # straddling two regions walks up to their parent
+        ((10, 18, 12, 22), ["world/land"]),  # straddling two regions walks up to their parent
         ((-20, -20, -19, -19), None),  # outside every region
         ((54.5, 4.5, 55.5, 5.5), None),  # inside a hole
-        ((51, 1, 52, 2), "world/other/ringed"),  # beside the hole
-        ((70.2, 0.2, 70.8, 0.8), "world/other/islands"),  # inside one part of a multipolygon
+        ((51, 1, 52, 2), ["world/other/ringed"]),  # beside the hole
+        ((70.2, 0.2, 70.8, 0.8), ["world/other/islands"]),  # inside one part of a multipolygon
         ((70.2, 0.2, 70.8, 5.8), None),  # spanning two parts
     ],
 )
-def test_the_smallest_region_containing_a_box(box, expected):
-    found = geofabrik.smallest_containing(geofabrik.parse_index(_raw()), box)
-    assert (found.path if found else None) == expected
+def test_the_cheapest_cover_of_abox_rings(box, expected):
+    assert _cover(box) == expected
+
+
+def test_the_candidate_cap_never_drops_the_cheapest_region_that_covers_everything(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(geofabrik, "_MAX_COVER_CANDIDATES", 2)
+
+    def square(path: str, south: float, west: float, north: float, east: float) -> geofabrik.Region:
+        ring = [(south, west), (south, east), (north, east), (north, west), (south, west)]
+        return geofabrik.Region(path, (south, west, north, east), [[ring]])
+
+    regions = [
+        square("a", -0.5, -0.5, 0.5, 0.5),
+        square("b", -0.5, 9.5, 0.5, 10.5),
+        square("c", 9.5, -0.5, 10.5, 0.5),
+        square("whole", -1, -1, 11, 11),
+    ]
+
+    found = geofabrik.covering_set(regions, (0, 0, 10, 10))
+
+    assert [r.path for r in found or []] == ["whole"]
 
 
 class _Served:
@@ -206,14 +214,14 @@ def test_the_cached_choice_never_touches_the_network(monkeypatch: pytest.MonkeyP
 SPLIT_INDEX = {
     "type": "FeatureCollection",
     "features": [
-        _feature("example/big", _polygon(0, 0, 50, 100)),
-        _feature("example/big/part-a", _polygon(0, 0, 40, 20)),
-        _feature("example/big/part-b", _polygon(0, 20, 40, 40)),
-        _feature("example/big/part-c", _polygon(0, 40, 40, 100)),
-        _feature("example/tri/left", _polygon(50, 0, 60, 10)),
-        _feature("example/tri/mid", _polygon(50, 10, 60, 20)),
-        _feature("example/tri/right", _polygon(50, 20, 60, 30)),
-        _feature("example/tri", _polygon(50, 0, 60, 30)),
+        region_feature("example/big", region_polygon(0, 0, 50, 100)),
+        region_feature("example/big/part-a", region_polygon(0, 0, 40, 20)),
+        region_feature("example/big/part-b", region_polygon(0, 20, 40, 40)),
+        region_feature("example/big/part-c", region_polygon(0, 40, 40, 100)),
+        region_feature("example/tri/left", region_polygon(50, 0, 60, 10)),
+        region_feature("example/tri/mid", region_polygon(50, 10, 60, 20)),
+        region_feature("example/tri/right", region_polygon(50, 20, 60, 30)),
+        region_feature("example/tri", region_polygon(50, 0, 60, 30)),
     ],
 }
 

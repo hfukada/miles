@@ -4,8 +4,9 @@ import sqlite3
 
 import pytest
 from click.testing import CliRunner
+from helpers import FakeResponse, urlopen_sequence
 
-from miles import auth, db, outbound, terrain_backfill
+from miles import auth, db, events, http_client, outbound, strava_client
 
 
 def _insert_importing_area(conn: sqlite3.Connection) -> None:
@@ -16,16 +17,13 @@ def _insert_importing_area(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def test_claim_marks_jobs_left_running_as_interrupted():
+def test_claim_marks_imports_left_running_as_interrupted():
     conn = db.connect()
-    assert terrain_backfill.BackfillProgress(conn).try_start()
     _insert_importing_area(conn)
 
     outbound.claim()
 
-    assert terrain_backfill.BackfillProgress(conn).snapshot()["status"] == "error"
     assert conn.execute("SELECT status, status_error FROM areas").fetchone()["status_error"] == outbound.IMPORT_INTERRUPTED_ERROR
-    assert terrain_backfill.BackfillProgress(conn).try_start() is True
 
 
 def test_a_second_process_is_refused_while_the_first_holds_the_claim():
@@ -54,3 +52,18 @@ def test_an_unwritable_lock_file_is_reported_by_name():
         outbound.claim()
 
 
+
+
+def test_a_process_that_claims_records_its_requests(monkeypatch: pytest.MonkeyPatch):
+    urlopen_sequence(monkeypatch, [FakeResponse()])
+    http_client.request(http_client.OSRM, "http://maps.example/route")
+    assert not events.daily_counts(db.connect())
+
+    outbound.claim()
+    http_client.request(http_client.OSRM, "http://maps.example/route")
+
+    assert http_client.request_sink is events.record_request
+    assert http_client.outcome_sink is events.record_outcome
+    assert strava_client.rate_sink is events.record_strava_rate
+    counts = events.daily_counts(db.connect())
+    assert [(r["service"], r["host"], r["status"], r["count"]) for r in counts] == [("osrm", "maps.example", "200", 1)]
