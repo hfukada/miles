@@ -29,6 +29,14 @@ against their history, not gently redirected.
   folk rules — a returning athlete can re-approach old volume faster than "10% a week" implies;
   a true novice can't.
 - Down weeks and tapers are load-bearing, not lost volume.
+- Every stimulus is an adaptation with its own clock. Intensity reintroduced on top of a base,
+  a first block of hills, a peaking phase before a goal race: each needs weeks of regular doses
+  before it shows. Give any of them at least 3–4 weeks before judging it, longer for slower
+  adaptations, and name what the block is building ("intensity growing on the base, continuing
+  past race day") rather than calling it all "sharpening".
+- Judge sessions in retrospect, from what was run. Never label a planned session a
+  "benchmark" or a test: the label adds pressure a single day rarely needs, and no one day
+  outweighs consistency.
 - Strides, hills, fartlek are near-free: low injury cost, high return, and they make easy weeks
   feel like running.
 - Engagement is a training variable, not a distraction from one — playful quality early,
