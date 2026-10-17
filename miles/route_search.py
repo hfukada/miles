@@ -101,6 +101,7 @@ class RouteCandidateOut(TypedDict):
     score: dict
     missed_constraints: list[ConstraintMiss]
     geometry: list[list[float | None]]  # [lat, lng, ele_m|None] triples
+    ways: list[dict]  # consecutive runs of one OSM way: way_id, name, surface_class, length_m
 
 
 class RouteSearchResult(TypedDict):
@@ -594,6 +595,25 @@ def _geometry(edge_rows: Mapping[int, dict], segments: Sequence[tuple[int, bool]
     return points
 
 
+def _ways(edge_rows: Mapping[int, dict], segments: Sequence[tuple[int, bool]]) -> list[dict]:
+    """The route's ways in travel order, consecutive edges of one way merged."""
+    ways: list[dict] = []
+    for edge_id, _forward in segments:
+        row = edge_rows.get(edge_id)
+        if row is None:
+            continue
+        if ways and ways[-1]["way_id"] == row["way_id"]:
+            ways[-1]["length_m"] += row["length_m"]
+            continue
+        ways.append({
+            "way_id": row["way_id"],
+            "name": row["way_name"],
+            "surface_class": row["surface_class"],
+            "length_m": row["length_m"],
+        })
+    return ways
+
+
 # ---------------------------------------------------------------------------
 # Constraint checking
 # ---------------------------------------------------------------------------
@@ -860,6 +880,7 @@ def _persist_candidate(
         "score": candidate.score,
         "missed_constraints": candidate.missed,
         "geometry": [list(p) for p in _geometry(edge_rows, candidate.segments)],
+        "ways": _ways(edge_rows, candidate.segments),
     }
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=CANDIDATE_TTL_HOURS)).isoformat()
     conn.execute(

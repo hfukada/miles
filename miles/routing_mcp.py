@@ -64,11 +64,24 @@ def _candidate_summary(candidate: route_search.RouteCandidateOut) -> dict:
         "runnability": _runnability_summary(score["runnability"]),
         "road_exposure": {
             "max_continuous_uncomfortable_mi": exposure["max_continuous_uncomfortable_m"] / MILE_M,
-            "violation_count": len(exposure["violations"]),
             "totals_mi": {k: v / MILE_M for k, v in exposure["totals_m"].items()},
         },
         "missed_constraints": candidate["missed_constraints"],
     }
+
+
+def _candidate_detail(candidate: route_search.RouteCandidateOut) -> dict:
+    """The stored candidate with its ways reported in miles."""
+    ways = [
+        {
+            "way_id": w["way_id"],
+            "name": w["name"],
+            "surface_class": w["surface_class"],
+            "length_mi": w["length_m"] / MILE_M,
+        }
+        for w in candidate["ways"]
+    ]
+    return {**candidate, "ways": ways}
 
 
 def register_routing_tools(mcp: FastMCP) -> None:
@@ -78,9 +91,9 @@ def register_routing_tools(mcp: FastMCP) -> None:
     def find_trailheads(area_id: int, lat: float, lng: float, max_drive_minutes: float, k: int = 8) -> str:
         """
         Trailheads and trail-adjacent parking in an imported area within
-        max_drive_minutes (at most 90) of (lat, lng), best k first by drive
-        time and nearby trail. The point itself is always first, as a
-        zero-drive-time start.
+        max_drive_minutes (at most 90) of (lat, lng). Returns the point itself,
+        always first as a zero-drive-time start, followed by up to k starts
+        (k + 1 results at most), best first by drive time and nearby trail.
 
         Each result has lat/lng, label, drive_minutes, kind
         ("origin"/"trailhead"/"parking"), the OSM id (null for the origin;
@@ -118,7 +131,8 @@ def register_routing_tools(mcp: FastMCP) -> None:
     def set_way_override(way_id: int, verdict: str, note: str | None = None) -> str:
         """
         Mark an OSM way "comfortable" or "avoid" regardless of its tags; survives
-        network rebuilds.
+        network rebuilds. Way ids come from the ways list of
+        get_route_candidate.
         """
         with db.connection() as conn:
             return json.dumps(network.set_way_override(conn, way_id, verdict, note))
@@ -128,12 +142,12 @@ def register_routing_tools(mcp: FastMCP) -> None:
     @reporting(ValueError)
     def find_routes(
         area_id: int,
+        distance_mi_min: float,
+        distance_mi_max: float,
         start_lat: float | None = None,
         start_lng: float | None = None,
         max_drive_minutes: float | None = None,
         drive_k: int = 8,
-        distance_mi_min: float | None = None,
-        distance_mi_max: float | None = None,
         shape: str = "any",
         min_trail_mi: float | None = None,
         min_runnable_pct: float | None = None,
@@ -155,19 +169,31 @@ def register_routing_tools(mcp: FastMCP) -> None:
           estimates, flagged drive_time_estimated=true, when OSRM is down; tell
           the athlete and re-run later.
         - starts: a list of {"lat", "lng", "label"?, "drive_s"?} objects.
+          drive_s is drive time in seconds (find_trailheads reports
+          drive_minutes, so multiply by 60).
 
-        distance_mi_min/distance_mi_max bound the length. shape is "loop",
-        "out_and_back", "lollipop", or "any". min_trail_mi and min_runnable_pct
-        (run plus grind, i.e. not hiking) are soft floors; gain_ft_min/
-        gain_ft_max bound climbing. avoid_way_ids/include_way_ids are lists of
-        OSM way ids; a route touching an avoided way is never returned.
+        distance_mi_min and distance_mi_max (required) bound the length.
+        shape is "loop", "out_and_back", "lollipop", or "any".
+        avoid_way_ids/include_way_ids are lists of OSM way ids, which come
+        from the ways list of get_route_candidate.
+
+        Hard constraints are never violated by a returned candidate: avoided
+        ways (avoid_way_ids and ways marked "avoid" with set_way_override)
+        and the road-exposure limit in the route preferences. Everything else
+        is soft and reported in missed_constraints when a candidate misses it:
+        the distance range, min_trail_mi, min_runnable_pct (run plus grind,
+        i.e. not hiking), the gain_ft_min/gain_ft_max range, and
+        include_way_ids (so a candidate can still lack an included way).
 
         Returns up to n candidates (default 5): start, distance, trail/road
         mix, runnability, road exposure, and a candidate_id for
         get_route_candidate/save_route_candidate. When nothing meets every
-        constraint, the closest few come back with near_miss=true, each listing
-        what it misses. The same seed, request, and network reproduce the same
-        candidates; the seed used is always returned.
+        soft constraint, the closest few come back with near_miss=true, each
+        listing what it misses. budget_exceeded=true means the 10-second search
+        time budget ran out before n candidates qualified, so the result may
+        be thin; narrowing the request or a different seed can help. The same
+        seed, request, and network reproduce the same candidates; the seed
+        used is always returned.
         """
         with db.connection() as conn:
             start_list = route_search.resolve_starts(
@@ -178,8 +204,6 @@ def register_routing_tools(mcp: FastMCP) -> None:
                 max_drive_minutes=max_drive_minutes,
                 drive_k=drive_k,
             )
-            if distance_mi_min is None or distance_mi_max is None:
-                raise ValueError("find_routes needs distance_mi_min and distance_mi_max")
             if shape not in ("loop", "out_and_back", "lollipop", "any"):
                 raise ValueError(f"invalid shape: {shape!r}")
 
@@ -213,11 +237,15 @@ def register_routing_tools(mcp: FastMCP) -> None:
     @reporting(route_search.CandidateNotFoundError)
     def get_route_candidate(candidate_id: str) -> str:
         """
-        Full breakdown and geometry for a find_routes candidate. Candidates
+        Full breakdown and geometry for a find_routes candidate, plus its
+        ways in travel order: consecutive stretches of one OSM way, each with
+        way_id, name (may be null), surface_class, and length_mi. This is the
+        only place way ids come from; use them for find_routes'
+        avoid_way_ids/include_way_ids and for set_way_override. Candidates
         expire a day after their search.
         """
         with db.connection() as conn:
-            return json.dumps(route_search.get_route_candidate(conn, candidate_id))
+            return json.dumps(_candidate_detail(route_search.get_route_candidate(conn, candidate_id)))
 
     @mcp.tool()
     @reporting(route_search.CandidateNotFoundError)

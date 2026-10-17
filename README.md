@@ -56,7 +56,7 @@ Downloads your full Strava history into `data/activities.db`. Two things to expe
 first sync of a long history:
 
 - Strava rate-limits at 15-minute windows. When hit, `miles-sync` prints
-  `Rate limit hit — sleeping <n>s until next 15-min window...` and resumes automatically —
+  `Rate limit hit — waiting until <time>...` and resumes automatically —
   this is normal, not a hang. A decade of daily running can take several windows back to back.
 - Re-run the same command any time afterwards for an incremental sync (only new activities).
   Use `--full` to ignore the last sync date and re-fetch everything.

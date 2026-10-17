@@ -1,9 +1,10 @@
 # miles plugin
 
 Three coaching personas — `miles`, `miles-plan`, `marathon-analysis` — over a
-Strava-backed training record, a `route-finder` skill that searches open map
-data for runnable routes, and the `miles` MCP server they all read and write
-through.
+Strava-backed training record, a `training-log` skill that keeps the runner
+profile and the current block's log, a `route-finder` skill that searches open
+map data for runnable routes, and the `miles` MCP server they all read and
+write through.
 
 ## Setup
 

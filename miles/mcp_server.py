@@ -1272,7 +1272,7 @@ def get_race_splits(activity_id: int) -> str:
     """, [activity_id]).fetchall()
 
     if not laps:
-        return json.dumps({"error": "No laps synced for this race — run miles-sync."})
+        return json.dumps({"error": "No laps synced for this race yet — they arrive after the next sync."})
 
     lap_dicts: list[dict[str, object]] = []
     cumulative_s = 0
@@ -1487,7 +1487,7 @@ def get_activity_weather(activity_id: int) -> str:
     for each hour of the run — useful when understanding how conditions evolved
     during a long run (e.g. started cool but got hot by mile 18).
     Also returns summary stats: temp at start/end/max, avg humidity, total precip.
-    Returns null hourly field if weather hasn't been synced for this activity (run miles-sync).
+    Returns null hourly field if weather hasn't been synced for this activity (it arrives after the next sync).
     `attribution` credits the data source (Open-Meteo, CC BY 4.0); repeat it when quoting.
     activity_id comes from get_activities or get_build_snapshot.
     """
@@ -1913,7 +1913,7 @@ def set_draft_weeks(weeks: list[WeekInput]) -> str:
       target_miles_hi for a point week), target_long_run_miles?,
       target_long_run_minutes?, target_strength_days?, note?}.
 
-    Finishes by re-running the full derive pass so plan_adherence reflects
+    Finishes by re-running the incremental derive pass so plan_adherence reflects
     the edit immediately (see derive_all) — matters most for a revision that
     touches an already-elapsed week.
 
@@ -1963,7 +1963,7 @@ def set_draft_days(days: list[DayInput]) -> str:
       unresolved and freezes against a live fitness estimate at commit_plan
       time, not now.
 
-    Finishes by re-running the full derive pass (see derive_all).
+    Finishes by re-running the incremental derive pass (see derive_all).
 
     Returns the full draft state (see get_draft, including week_mileage —
     the program-computed day-mileage sum per week checked against this
@@ -1996,7 +1996,7 @@ def delete_draft_weeks(week_starts: list[str]) -> str:
     that fall inside them (no orphan day rows left behind). No-ops on
     week_starts not present in the draft.
 
-    Finishes by re-running the full derive pass (see derive_all).
+    Finishes by re-running the incremental derive pass (see derive_all).
 
     Returns the full draft state (see get_draft) plus `deleted_weeks: N` on
     success, or {"error": "..."} — no draft in progress.
@@ -2026,7 +2026,7 @@ def delete_draft_days(dates: list[str]) -> str:
     for that date is removed, so a double counts as one delete. No-ops on
     dates not present in the draft.
 
-    Finishes by re-running the full derive pass (see derive_all).
+    Finishes by re-running the incremental derive pass (see derive_all).
 
     Returns the full draft state (see get_draft) plus `deleted_days: N` on
     success, or {"error": "..."} — no draft in progress.
@@ -2086,7 +2086,7 @@ def commit_plan(note: str) -> str:
     active slot); revising the currently-active plan itself is always
     allowed.
 
-    Finishes by re-running the full derive pass, so plan_adherence rows
+    Finishes by re-running the incremental derive pass, so plan_adherence rows
     exist for any already-elapsed weeks immediately after this call (see
     derive_all) — the point of a mid-block import isn't a plan that scores
     nothing until the next sync.
@@ -2158,7 +2158,7 @@ def discard_draft() -> str:
     the plan row is deleted too — a never-committed plan simply disappears,
     same as it never existed.
 
-    Finishes by re-running the full derive pass — a no-op here since
+    Finishes by re-running the incremental derive pass — a no-op here since
     discarding never touches a committed version, kept only for consistency
     with the other write tools.
 
@@ -2493,7 +2493,7 @@ def run_sql(query: str) -> str:
       sessions regardless of naming" is
       WHERE dominant_intensity = 'threshold')
 
-    Table: laps  (one row per lap; only workout activities are synced)
+    Table: laps  (one row per lap; only workouts and races are synced)
       lap_id, activity_id, lap_index, distance_m, moving_time_s, average_speed_mps,
       average_heartrate, max_heartrate, average_cadence, total_elevation_gain_m, pace_zone,
       lap_type (derived, rebuilt each sync — warmup/work/recovery/float/cooldown/steady;
@@ -2524,6 +2524,21 @@ def run_sql(query: str) -> str:
       max_hr, long_run_floor_miles, updated_at — set via `miles-sync --max-hr` /
       `--long-run-floor`, or the one-time interactive prompt on first sync. Either
       field may be NULL if never set.
+
+    Route tables (routes, route_points, route_climbs, route_grade_bands,
+    route_legs): routes has route_id, name, source, kind, distance_m, gain_m,
+    loss_m and a bbox; the others are keyed by route_id and idx.
+
+    Area and network tables: areas (area_id, label, center_lat/lng, radius_km,
+    status, pinned), net_edges (area_id, way_id, way_name, highway,
+    surface_class, length_m), net_nodes (area_id, osm_node_id, kind, lat, lng),
+    net_way_overrides (way_id, verdict), net_candidates (candidate_id,
+    expires_at, data).
+
+    Terrain tables: terrain_segments (activity_id, idx, dist_m, grade_dpct,
+    speed_cms, is_walking: per-segment stream samples, grade in tenths of a
+    percent), terrain_snapshots (as_of, walk_onset_grade_pct,
+    descent_comfort_grade_pct, confidence, bins_json).
 
     Plan tables — athlete-authored ground truth, like activities: NOT derived,
     exempt from derive_all rebuilds. Write access is via start_plan_draft /
@@ -2763,15 +2778,15 @@ def update_route(
     pass an empty string to clear all tags), and/or elevation_source
     (one of "auto", "file", "dem"). Only fields passed are changed;
     omitted ones are left as they were. Everything else about a route
-    (stats, points, climbs) is derived from its raw GPX and the terrain
-    model, and isn't editable here.
+    (stats, points, climbs) is derived from its raw GPX and cached
+    elevation, and isn't editable here.
 
     elevation_source controls where a route's elevation comes from: "auto"
     (default) uses the GPX file's own elevation when it has one, else
-    drapes from the terrain model; "file" never drapes even when the file
+    drapes from cached elevation (DEM) tiles; "file" never drapes even when the file
     has no elevation; "dem" always drapes, ignoring any file elevation.
     Changing it re-derives the route immediately from the cached tile set
-    only -- if the terrain model doesn't cover this route yet, it comes
+    only -- if the cache doesn't cover this route yet, it comes
     back pending; use redrape_route to fetch the tiles now.
     """
     conn = _routes_conn()

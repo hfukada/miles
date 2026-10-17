@@ -13,21 +13,21 @@ Present results sorted fastest to slowest finish time. If any race name contains
 
 Columns: Race | Date | Time | Build mpw | Workouts (n / pace) | Long runs (n / pace) | Easy HR
 
-Format finish times as h:mm:ss. Workout and long run pace come from `by_type.workout.avg_pace_min_per_mile` and `by_type.long_run.avg_pace_min_per_mile`. If a run_type is absent from `by_type`, show `—`.
+Format finish times as h:mm:ss. Workout and long run pace come from `build.by_type.workout.avg_pace_min_per_mile` and `build.by_type.long_run.avg_pace_min_per_mile`. If a run_type is absent from `build.by_type`, show `—`.
 
 ## Analysis lenses (apply all, be specific with numbers)
 
-**Volume vs. quality.** Does avg_mpw predict the result? Call out where it does and where it breaks down — look for cases where the highest-mileage build didn't produce the best result, or where a moderate-mileage build outperformed expectations. High mileage is necessary but not sufficient.
+**Volume vs. quality.** Does `build.avg_mpw` predict the result? Call out where it does and where it breaks down — look for cases where the highest-mileage build didn't produce the best result, or where a moderate-mileage build outperformed expectations. High mileage is necessary but not sufficient.
 
-**Workout sharpness.** `by_type.workout.avg_pace_min_per_mile` is the clearest proxy for race readiness. Look for the pace band that separates result tiers. Note outliers — builds with very few workouts that ran them unusually fast, or many workouts at soft paces.
+**Workout sharpness.** `build.by_type.workout.avg_pace_min_per_mile` is the clearest proxy for race readiness. Look for the pace band that separates result tiers. Note outliers — builds with very few workouts that ran them unusually fast, or many workouts at soft paces.
 
-**Long run count.** Count `by_type.long_run.runs` across builds. Note whether the best results cluster around higher long run counts, and what the typical range looks like across the history.
+**Long run count.** Count `build.by_type.long_run.runs` across builds. Note whether the best results cluster around higher long run counts, and what the typical range looks like across the history.
 
 **Easy HR trend.** List easy HR values chronologically. Decreasing HR at similar effort is an aerobic fitness signal that accumulates over years, independent of any single build.
 
-**Undercooked builds.** Flag any build with avg_mpw < 25 or zero workout sessions — these typically explain the slowest results and are worth separating from structurally normal builds when drawing conclusions.
+**Undercooked builds.** Flag any build with `build.avg_mpw` < 25 or zero workout sessions — these typically explain the slowest results and are worth separating from structurally normal builds when drawing conclusions.
 
-**In-build marathons.** If `by_type.race` appears with distance ~26 miles, note it — it means a tune-up marathon was run during the build window, which affects how to read the training load.
+**In-build marathons.** If `build.by_type.race` appears with `avg_miles` ~26, note it — it means a tune-up marathon was run during the build window, which affects how to read the training load.
 
 ## Closing take
 

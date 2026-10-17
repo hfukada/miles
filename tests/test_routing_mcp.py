@@ -110,3 +110,24 @@ def test_find_routes_tool_takes_starts_and_way_ids_as_lists_or_json_text_and_a_s
     again = tool("find_routes", args)
     assert result["seed"] == again["seed"] == 3  # a seed makes the search reproducible
     assert [c["distance_mi"] for c in result["candidates"]] == [c["distance_mi"] for c in again["candidates"]]
+
+
+def test_get_route_candidate_lists_the_ways_in_travel_order_in_miles(tool):
+    args = {
+        "area_id": 1, "distance_mi_min": 0.1, "distance_mi_max": 0.5, "shape": "loop", "seed": 3,
+        "starts": [{"lat": TH_LAT, "lng": ORIGIN_LNG, "label": "Lot"}],
+    }
+    summary = tool("find_routes", args)["candidates"][0]
+    assert "ways" not in summary
+
+    detail = tool("get_route_candidate", {"candidate_id": summary["candidate_id"]})
+    ways = detail["ways"]
+    assert {w["way_id"] for w in ways} == {10, 11, 12}
+    assert all(a["way_id"] != b["way_id"] for a, b in zip(ways, ways[1:]))
+    assert all(set(w) == {"way_id", "name", "surface_class", "length_mi"} for w in ways)
+    assert sum(w["length_mi"] for w in ways) == pytest.approx(summary["distance_mi"], rel=0.01)
+
+
+def test_find_routes_requires_a_distance_range(tool):
+    with pytest.raises(Exception, match="distance_mi_min"):
+        tool("find_routes", {"area_id": 1, "starts": [{"lat": TH_LAT, "lng": ORIGIN_LNG}]})

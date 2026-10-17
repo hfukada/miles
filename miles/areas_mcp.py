@@ -15,26 +15,34 @@ def register_area_tools(mcp: FastMCP) -> None:
     @threaded
     @reporting(areas_service.AreaImportError, ValueError)
     def import_area(
+        label: str,
         place: str | None = None,
         lat: float | None = None,
         lng: float | None = None,
         radius_km: float | None = None,
         drive_minutes: float | None = None,
-        label: str = "",
         pinned: bool | None = None,
         region: str | None = None,
         refresh: bool = False,
         refresh_geocode: bool = False,
     ) -> str:
         """
-        Import the map-data and elevation cache for a region, keyed by label;
+        Import the map-data and elevation cache for a region. label (required)
+        is the area's name and its reuse key: a short name such as "home";
         the same label reuses the area and its cached data. Map data never
-        refreshes on its own: refresh=true re-fetches it (at most once a day
-        per region), and status reports data_as_of and refresh_suggested
-        (over ~180 days old). refresh_geocode=true re-looks-up `place`.
+        refreshes on its own. refresh=true asks Geofabrik whether a newer
+        extract exists (a conditional request) and downloads only if so;
+        within 24 hours of the last contact with the region it reuses the
+        extract without asking, and contacting the same region within an hour
+        of the last request is refused with an error. Status reports
+        data_as_of and refresh_suggested (over ~180 days old).
+        refresh_geocode=true re-looks-up `place`.
 
         Center on `place` (free text, geocoded) or lat/lng. Size with radius_km
-        (at most 60) or drive_minutes (rough 1 km/minute, not an isochrone).
+        (at most 60) or drive_minutes (rough 1 km/minute, capped at the same
+        60 km radius, and not an isochrone). Drive-time starts for find_routes
+        come only from the imported area, so the radius bounds how far a
+        drive budget can reach.
         pinned=true keeps the area indefinitely; unpinned areas are collected
         after 60 days unused. When refreshing, leave pinned and region unset
         to keep what the area has.
@@ -46,7 +54,12 @@ def register_area_tools(mcp: FastMCP) -> None:
 
         Returns immediately with status and an estimate while a background
         import runs; poll get_area_status(area_id), not in a tight loop (a
-        first import can take minutes). Geocoding is rate limited: reuse
+        first import can take minutes). estimate.estimated_seconds covers only
+        cutting the area from an already-downloaded extract; it is null while
+        the region's extract still has to download (always for a region's
+        first import), and the elevation fetch and network build come after it.
+        Imports queue server-side; do not start more than needed or re-issue
+        one that is queued. Geocoding is rate limited: reuse
         labels, pass lat/lng once known, and do not retry a failed place in
         a loop.
         """
@@ -77,9 +90,17 @@ def register_area_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     @reporting(areas_service.AreaNotFoundError)
     def get_area_status(area_id: int) -> str:
-        """Import status of one area: "new", "importing" (phase/done/total),
-        "ready", or "error" (with message), plus data_as_of and
-        refresh_suggested (re-run import_area with refresh=true)."""
+        """Import status of one area: "new", "importing", "ready", or "error"
+        (with message), plus data_as_of and refresh_suggested (re-run
+        import_area with refresh=true).
+
+        While "importing", phase with done/total gives progress. Phases, in
+        order: "waiting-for-download" (another import is downloading the same
+        extract), "downloading" (done is bytes received; total may be null),
+        "queued" (waiting for the one import slot, held by another import's
+        tile, elevation, or network work), "tiles" (cutting the area from the
+        extract), "elevation" (fetching elevation tiles), "network" (building
+        the route network). Some phases are skipped when the data is cached."""
         with db.connection() as conn:
             return json.dumps(areas_service.get_area_status(conn, area_id))
 

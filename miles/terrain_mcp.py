@@ -70,8 +70,11 @@ def register_terrain_tools(mcp: FastMCP) -> None:
         Each climb and descent of one activity against the current terrain
         model: actual vs. expected speed for that grade/fatigue/temperature,
         as a residual and a percentile of the athlete's own history at that
-        grade. Needs the activity's streams cached with an altitude stream
-        (see the terrain backfill), else returns an error. GPS is not needed.
+        grade. Needs the activity's streams (with an altitude stream), which
+        sync fetches: new runs right away, older runs through the history
+        pass. If they are missing the call errors; say the run hasn't been
+        processed yet. GPS is not needed. Speeds are in m/s and distances in
+        metres; convert to min/mi and miles or feet when quoting.
         """
         with db.connection(terrain.connect) as conn:
             return json.dumps(terrain.analyze_activity_terrain(conn, activity_id))
@@ -85,7 +88,9 @@ def register_terrain_tools(mcp: FastMCP) -> None:
         terrain model: percent run/grind/hike, longest continuous hike,
         steep-descent distance, and a gap analysis (grade histogram weighted
         by the athlete's per-bin efficiency deficit: the grades most worth
-        practicing). No elevation data returns has_elevation=false.
+        practicing). No elevation data returns has_elevation=false. Distances
+        (longest_hike_m, steep_descent_m) are metres; convert to miles or feet
+        when quoting.
         """
         with db.connection(terrain.connect) as conn:
             return json.dumps(terrain.score_route(conn, route_id))
