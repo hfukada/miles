@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from typing import cast
@@ -98,7 +98,21 @@ class _RateObservation:
     at: datetime
 
 
+@dataclass
+class _CallsSince:
+    """Requests sent since the last rate-limit reading whose responses carried
+    no rate-limit headers (stream responses never do). Each count belongs to
+    the UTC day or 15-minute window it was made in and restarts when that
+    rolls over."""
+
+    day: date
+    window: int
+    daily: int = 0
+    short: int = 0
+
+
 _observation: _RateObservation | None = None
+_calls_since: _CallsSince | None = None
 _rate_lock = threading.Lock()
 
 STRAVA_HOST = "www.strava.com"
@@ -152,19 +166,25 @@ def _on_response(response: requests.Response, **_: object) -> None:
     """Runs for every response from the Strava API, before its status is
     checked: counts it in the request ledger by endpoint kind and status,
     records the rate-limit headers, and drops the access token on a 401."""
-    global _observation
+    global _observation, _calls_since
     status = response.status_code
     _report(_kind_of(urlsplit(response.url).path), status)
     rate = get_rates_from_response_headers(
         dict(response.headers), cast(RequestMethod, (response.request.method or "GET").upper())
     )
-    if rate is not None:
-        daily = rate.long_limit - rate.long_usage
-        short = rate.short_limit - rate.short_usage
-        with _rate_lock:
-            _observation = _RateObservation(daily, short, rate.short_limit, _now())
-        if rate_sink is not None:
-            rate_sink(daily, short)
+    now = _now()
+    with _rate_lock:
+        if rate is not None:
+            _observation = _RateObservation(
+                rate.long_limit - rate.long_usage, rate.short_limit - rate.short_usage, rate.short_limit, now
+            )
+            _calls_since = _CallsSince(now.date(), _window(now))
+        else:
+            _count_call(now)
+    daily = daily_calls_remaining()
+    short = short_window_calls_remaining()
+    if rate_sink is not None and daily is not None and short is not None:
+        rate_sink(daily, short)
     if status == 401:
         _forget_access_token()
         http_client.report_outcome("strava", 401)
@@ -174,28 +194,48 @@ def _window(when: datetime) -> int:
     return int(when.timestamp() // WINDOW_S)
 
 
+def _count_call(now: datetime) -> None:
+    """Count one response that reported no allowance. Caller holds _rate_lock."""
+    global _calls_since
+    counts = _calls_since
+    if counts is None:
+        counts = _calls_since = _CallsSince(now.date(), _window(now))
+    if counts.day != now.date():
+        counts.day, counts.daily = now.date(), 0
+    if counts.window != _window(now):
+        counts.window, counts.short = _window(now), 0
+    counts.daily += 1
+    counts.short += 1
+
+
 def daily_calls_remaining() -> int | None:
-    """Daily Strava API calls left, per the most recent response headers seen.
-    None before any request, and once the UTC day has changed since they were
-    seen: the new day's figure is not known until a response reports it."""
+    """Daily Strava API calls left: the most recent response headers' figure
+    less the requests sent since without headers. None before any reading, and
+    once the UTC day has changed since it: the new day's figure is not known
+    until a response reports it."""
     with _rate_lock:
-        seen = _observation
-    if seen is None or seen.at.date() != _now().date():
-        return None
-    return seen.daily_remaining
+        seen, counts = _observation, _calls_since
+        now = _now()
+        if seen is None or seen.at.date() != now.date():
+            return None
+        spent = counts.daily if counts is not None and counts.day == now.date() else 0
+        return max(0, seen.daily_remaining - spent)
 
 
 def short_window_calls_remaining() -> int | None:
-    """Calls left in the current 15-minute window, per the most recent response
-    headers seen. A window that has ended since is whole again. None before any
-    request."""
+    """Calls left in the current 15-minute window: the latest reading less the
+    requests sent since without headers. A window that has ended since the
+    reading is whole again, less what was sent in the current one. None before
+    any reading."""
     with _rate_lock:
-        seen = _observation
-    if seen is None:
-        return None
-    if _window(seen.at) != _window(_now()):
-        return seen.short_limit
-    return seen.short_remaining
+        seen, counts = _observation, _calls_since
+        if seen is None:
+            return None
+        now = _now()
+        window = _window(now)
+        spent = counts.short if counts is not None and counts.window == window else 0
+        base = seen.short_remaining if _window(seen.at) == window else seen.short_limit
+        return max(0, base - spent)
 
 
 class _TimeoutAdapter(HTTPAdapter):

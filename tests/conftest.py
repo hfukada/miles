@@ -43,6 +43,7 @@ def _fresh_strava_token_state(monkeypatch):
     monkeypatch.setattr(strava_client, "_access_token", None)
     monkeypatch.setattr(strava_client, "_access_token_expires_at", 0.0)
     monkeypatch.setattr(strava_client, "_observation", None)
+    monkeypatch.setattr(strava_client, "_calls_since", None)
 
 
 @pytest.fixture(autouse=True)

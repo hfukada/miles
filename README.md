@@ -64,8 +64,8 @@ first sync of a long history:
   for new workouts and races and streams (for the terrain model) for new runs. Pass 3 fetches
   weather (Open-Meteo, not counted against Strava; paced under its published limits, and a failed request ends the pass until the next sync). Pass 4 trickles in history: laps for older
   runs, then streams and terrain segments, most valuable first, up to `--history-limit`
-  (default 900) of each per sync. A year of history takes a few syncs. Passes 2 and 4 read
-  Strava's rate-limit headers and stop while `--reserve` daily calls remain (default 12, or
+  (default 900) of each per sync. A year of history takes a few syncs. Passes 2 and 4 track
+  Strava's allowance (its rate-limit headers, plus a count of the calls that carry none, such as streams) and stop while `--reserve` daily calls remain (default 12, or
   `MILES_STRAVA_RESERVE`), so a sync later the same day can still pull new activities; none
   takes the last calls of the 15-minute window, waiting for the next one instead. Turn the
   history pass off with `--no-history` or `MILES_SYNC_HISTORY=0`. `--extra`, `--extra-limit`,

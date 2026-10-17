@@ -221,8 +221,15 @@ date, or the cut time of tiles uploaded from a local file) and `refresh_suggeste
   `MILES_STRAVA_RESERVE`), so a later sync the same day can still fetch new
   activities, and none takes the last calls of the 15-minute window.
 - **Policy:** <https://developers.strava.com/docs/rate-limits/>: a 15-minute and
-  a daily allowance, reported on every response. miles reads them from those
-  headers and waits out the window when it is nearly spent.
+  a daily allowance (by default 100 and 1,000 for reads; an app can have
+  higher limits, so miles takes the limits from the latest headers and assumes
+  none). Every endpoint but uploads counts against the read limit, which is the
+  only one miles uses. Windows reset at :00, :15, :30 and :45; the daily limit
+  at midnight UTC. Requests over the short limit get a 429 and still count
+  toward the daily one. The documentation says every response reports usage;
+  observed, stream responses carry no rate-limit headers, so miles counts every
+  request it sends between header readings. It waits out the window when it is
+  nearly spent.
 - **Credentials:** the token refresh sends the client secret and refresh token
   in the POST body, never the URL. stravalib puts the access token in each
   request's query string, and request-library errors repeat the URL, so every
@@ -232,9 +239,15 @@ date, or the cut time of tiles uploaded from a local file) and `refresh_suggeste
   out after 30 seconds.
 - **Allowance bookkeeping:** miles replaces stravalib's built-in rate limiter
   (which can sleep a request until the next UTC midnight) with one that has no
-  rules; a response hook on the API session records the headers. The reading is aged by the clock: a 15-minute window
-  that has ended counts as whole again, and the daily figure is dropped once
-  the UTC date changes. Every request passes one gate (`miles/strava_budget.py`)
+  rules; a response hook on the API session records the headers. Streams responses
+  (almost all of a history backfill) carry no rate-limit headers, so the hook also
+  counts each response without them, whatever its status (a 429 counts), and the
+  remaining figures are the last header reading less that count. A fresh reading
+  replaces both. The token endpoint is not on that session and is not counted.
+  The reading is aged by the clock: a 15-minute window that has ended counts as
+  whole again, less the calls made in the new one, and the daily figure is
+  dropped once the UTC date changes. With no reading yet, nothing is known and
+  nothing blocks; the activity list at the start of every sync supplies one. Every request passes one gate (`miles/strava_budget.py`)
   that checks the reading first. A 429 is waited out for one window; a second
   with nothing succeeding between, or one when the headers show the daily
   allowance spent, ends the pass ("Strava daily limit reached; resets 00:00

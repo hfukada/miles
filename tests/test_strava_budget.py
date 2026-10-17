@@ -286,3 +286,137 @@ def test_a_429_with_the_daily_limit_spent_or_on_an_interactive_request_is_final_
     assert outcomes == [("strava", 429), ("strava", 429)]
 
 
+
+
+# --- calls between readings ----------------------------------------------------
+
+
+def _streams(status: int = 200) -> None:
+    strava_client._on_response(_response(status, "/api/v3/activities/5/streams"))
+
+
+def test_responses_without_headers_are_counted_against_the_last_reading(monkeypatch: pytest.MonkeyPatch):
+    rates: list[tuple[int, int]] = []
+    monkeypatch.setattr(strava_client, "rate_sink", lambda daily, short: rates.append((daily, short)))
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=1, long_usage=5)
+
+    for status in (200, 404, 429, 401):
+        _streams(status)
+
+    assert strava_client.daily_calls_remaining() == 991
+    assert strava_client.short_window_calls_remaining() == 95
+    assert rates == [(995, 99), (994, 98), (993, 97), (992, 96), (991, 95)]
+
+
+def test_a_fresh_reading_replaces_the_baseline_and_the_count(monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=1, long_usage=5)
+    for _ in range(3):
+        _streams()
+
+    _observe(short_usage=10, long_usage=50)
+
+    assert strava_client.daily_calls_remaining() == 950
+    assert strava_client.short_window_calls_remaining() == 90
+
+
+def test_a_new_window_is_whole_less_only_the_calls_made_in_it(monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=1, long_usage=5)
+    _streams()
+    _at(monkeypatch, 2026, 3, 1, 10, 15)
+    assert strava_client.short_window_calls_remaining() == 100
+
+    _streams()
+    _streams()
+
+    assert strava_client.short_window_calls_remaining() == 98
+    assert strava_client.daily_calls_remaining() == 992
+
+
+def test_counts_do_not_carry_into_a_new_utc_day(monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 23, 58)
+    _observe(short_usage=1, long_usage=5)
+    _streams()
+    _at(monkeypatch, 2026, 3, 2, 0, 1)
+
+    assert strava_client.daily_calls_remaining() is None
+
+    _observe(short_usage=0, long_usage=0)
+    _streams()
+    assert strava_client.daily_calls_remaining() == 999
+
+
+def test_remaining_never_goes_below_zero(monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=98, long_usage=998)
+    for _ in range(5):
+        _streams()
+    assert strava_client.daily_calls_remaining() == 0
+    assert strava_client.short_window_calls_remaining() == 0
+
+
+def test_without_a_reading_nothing_is_known_and_nothing_is_sunk(monkeypatch: pytest.MonkeyPatch):
+    rates: list[tuple[int, int]] = []
+    monkeypatch.setattr(strava_client, "rate_sink", lambda daily, short: rates.append((daily, short)))
+
+    _streams()
+
+    assert strava_client.daily_calls_remaining() is None
+    assert strava_client.short_window_calls_remaining() is None
+    assert rates == []
+
+
+def test_the_token_endpoint_is_not_on_the_counted_session():
+    assert strava_client._http_session().hooks["response"] == []
+
+
+def test_a_header_less_run_stops_at_the_daily_reserve(monkeypatch: pytest.MonkeyPatch, slept: list[float]):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=0, long_usage=988)
+    monkeypatch.setattr(strava_budget.time, "sleep", lambda seconds: slept.append(seconds))
+    gate = strava_budget.Gate(12)
+    sent = 0
+
+    with pytest.raises(errors.StravaAllowanceLowError, match="reserve"):
+        while True:
+            gate.acquire("streams")
+            _streams()
+            sent += 1
+
+    assert sent == 0
+
+    _observe(short_usage=0, long_usage=900)
+    with pytest.raises(errors.StravaAllowanceLowError, match="reserve"):
+        while True:
+            gate.acquire("streams")
+            _streams()
+            sent += 1
+
+    assert sent == 88
+    assert slept == []
+
+
+def test_a_header_less_run_waits_at_the_short_window_floor_then_continues(monkeypatch: pytest.MonkeyPatch, slept: list[float]):
+    _at(monkeypatch, 2026, 3, 1, 10, 1)
+    _observe(short_usage=0, long_usage=0)
+    sent = 0
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        _at(monkeypatch, 2026, 3, 1, 10, 16)
+
+    monkeypatch.setattr(strava_budget.time, "sleep", sleep)
+    gate = strava_budget.Gate(12)
+
+    for _ in range(100):
+        gate.acquire("streams")
+        _streams()
+        sent += 1
+        if slept:
+            break
+
+    assert len(slept) == 1
+    assert sent == 91
+    assert strava_client.short_window_calls_remaining() == 99
