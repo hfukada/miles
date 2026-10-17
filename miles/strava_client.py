@@ -23,7 +23,7 @@ from stravalib.util.limiter import RateLimiter, get_rates_from_response_headers
 
 from . import envfile, http_client
 from .db import WORKOUT_TYPE_MAP, ActivityRow, LapRow
-from .errors import StravaUnavailableError
+from .errors import StravaNotConfiguredError, StravaUnavailableError
 
 ENV_FILE_VAR = "MILES_ENV_FILE"
 
@@ -268,11 +268,17 @@ def oauth_token_request(form: dict[str, str]) -> dict[str, object]:
 
 
 def _exchange_refresh_token() -> dict[str, object]:
-    """Trade the refresh token for an access token."""
+    """Trade the refresh token for an access token. Raises
+    StravaNotConfiguredError when a credential is missing or empty."""
+    client_id = os.environ.get("STRAVA_CLIENT_ID")
+    client_secret = os.environ.get("STRAVA_CLIENT_SECRET")
+    refresh_token = os.environ.get(REFRESH_TOKEN_KEY)
+    if not (client_id and client_secret and refresh_token):
+        raise StravaNotConfiguredError
     return oauth_token_request({
-        "client_id": os.environ["STRAVA_CLIENT_ID"],
-        "client_secret": os.environ["STRAVA_CLIENT_SECRET"],
-        "refresh_token": os.environ[REFRESH_TOKEN_KEY],
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
         "grant_type": "refresh_token",
     })
 

@@ -234,7 +234,8 @@ def init_db(conn: sqlite3.Connection) -> None:
     stamped with SCHEMA_VERSION (PRAGMA user_version) is left alone; changing
     any table or column definition means bumping SCHEMA_VERSION and adding
     the upgrade here so existing databases pick it up."""
-    if conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION:
+    previous_version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if previous_version >= SCHEMA_VERSION:
         return
     conn.execute("""
         CREATE TABLE IF NOT EXISTS activities (
@@ -643,9 +644,44 @@ def init_db(conn: sqlite3.Connection) -> None:
     init_network_schema(conn)
     init_drive_schema(conn)
     init_search_schema(conn)
+    if previous_version == 0:
+        _settle_routes_deleted_before_tombstones(conn)
 
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+
+
+def _settle_routes_deleted_before_tombstones(conn: sqlite3.Connection) -> None:
+    """Upgrade for databases written before route deletion was tombstoned.
+    Deleting a route then removed only its routes row: its child rows stayed
+    behind and its stored GPX file was re-derived into a new route. Every
+    upload was derived immediately, so a track of a stored file that has no
+    route was deleted; tombstone it, and drop the orphaned child rows.
+    Runs only on the unversioned-to-versioned upgrade: later, a file with no
+    route yet is just not derived yet."""
+    from .gpx_parse import GpxParseError, parse_gpx_bytes
+
+    for file_row in conn.execute("SELECT file_id, data FROM gpx_files").fetchall():
+        file_id = file_row["file_id"]
+        try:
+            tracks = parse_gpx_bytes(bytes(file_row["data"]))["tracks"]
+        except GpxParseError:
+            continue
+        have = {
+            r["track_index"] for r in conn.execute("SELECT track_index FROM routes WHERE file_id = ?", [file_id]).fetchall()
+        }
+        for track in tracks:
+            if track["track_index"] not in have:
+                conn.execute(
+                    "INSERT OR IGNORE INTO route_tombstones (file_id, track_index) VALUES (?, ?)",
+                    [file_id, track["track_index"]],
+                )
+    for table in ("route_points", "route_waypoints", "route_climbs", "route_grade_bands", "route_legs"):
+        conn.execute(f"DELETE FROM {table} WHERE route_id NOT IN (SELECT route_id FROM routes)")
+    conn.execute(
+        "UPDATE route_legs SET leg_route_id = NULL "
+        "WHERE leg_route_id IS NOT NULL AND leg_route_id NOT IN (SELECT route_id FROM routes)"
+    )
 
 
 def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:

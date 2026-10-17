@@ -173,3 +173,70 @@ def test_connections_use_wal_and_a_backup_taken_during_a_write_is_consistent(tmp
     keys = {row[0] for row in copy.execute("SELECT key FROM meta")}
     assert "before" in keys and "uncommitted" not in keys
     writer.commit()
+
+
+def _gpx(n_tracks: int = 1, lat0: float = 40.0) -> bytes:
+    tracks = "".join(
+        "<trk><trkseg>"
+        + "".join(f'<trkpt lat="{lat0 + i + j * 0.0002}" lon="-105.0"><ele>100</ele></trkpt>' for j in range(10))
+        + "</trkseg></trk>"
+        for i in range(n_tracks)
+    )
+    return f'<?xml version="1.0"?><gpx version="1.1" creator="t" xmlns="http://www.topografix.com/GPX/1/1">{tracks}</gpx>'.encode()
+
+
+_ROUTE_CHILD_TABLES = ("route_points", "route_waypoints", "route_climbs", "route_grade_bands", "route_legs")
+
+
+def _orphans(conn: sqlite3.Connection) -> int:
+    return sum(
+        conn.execute(f"SELECT COUNT(*) FROM {t} WHERE route_id NOT IN (SELECT route_id FROM routes)").fetchone()[0]
+        for t in _ROUTE_CHILD_TABLES
+    )
+
+
+def test_routes_deleted_by_the_first_release_stay_deleted_and_their_orphaned_rows_go(tmp_path: Path):
+    from miles import routes
+
+    old = _release_database(tmp_path / "release.db")
+    old.execute("CREATE TABLE route_tombstones (file_id INTEGER NOT NULL, track_index INTEGER NOT NULL, PRIMARY KEY (file_id, track_index))")
+    db.add_missing_columns(
+        old, "routes", "elevation_source TEXT NOT NULL DEFAULT 'auto'", "ele_source TEXT", "elevation_pending INTEGER NOT NULL DEFAULT 0"
+    )
+    kept = routes.upload_gpx(old, _gpx(lat0=10.0), "kept.gpx")[0]
+    whole_file = routes.upload_gpx(old, _gpx(lat0=20.0), "whole.gpx")[0]
+    multi = routes.upload_gpx(old, _gpx(3, lat0=30.0), "multi.gpx")
+    old.execute(
+        "INSERT INTO route_legs (route_id, idx, kind, leg_route_id) VALUES (?, 0, 'route', ?)", [kept, whole_file]
+    )
+    kept_points = old.execute("SELECT COUNT(*) FROM route_points WHERE route_id = ?", [kept]).fetchone()[0]
+    # The first release deleted only the routes row.
+    old.execute("DELETE FROM routes WHERE route_id IN (?, ?)", [whole_file, multi[1]])
+    old.execute("DROP TABLE route_tombstones")
+    for column in _ADDED_ROUTE_COLUMNS:
+        old.execute(f"ALTER TABLE routes DROP COLUMN {column}")
+    old.commit()
+    assert _orphans(old) > 0
+
+    db.init_db(old)
+    routes.derive_all_routes(old)
+
+    assert {r["route_id"] for r in old.execute("SELECT route_id FROM routes")} == {kept, multi[0], multi[2]}
+    assert _orphans(old) == 0
+    assert old.execute("SELECT leg_route_id FROM route_legs WHERE route_id = ?", [kept]).fetchone()["leg_route_id"] is None
+    assert old.execute("SELECT COUNT(*) FROM route_points WHERE route_id = ?", [kept]).fetchone()[0] == kept_points
+
+
+def test_a_file_stored_but_not_yet_derived_in_a_current_database_is_not_tombstoned(conn: sqlite3.Connection):
+    from miles import routes
+
+    conn.execute(
+        "INSERT INTO gpx_files (sha256, filename, data, uploaded_at) VALUES ('x', 'new.gpx', ?, '2026-01-01')", [_gpx()]
+    )
+    conn.commit()
+
+    db.init_db(conn)
+    routes.derive_all_routes(conn)
+
+    assert conn.execute("SELECT COUNT(*) FROM route_tombstones").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0] == 1

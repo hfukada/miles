@@ -28,6 +28,17 @@ class StravaUnavailableError(RuntimeError):
     class, never the URL."""
 
 
+class StravaNotConfiguredError(RuntimeError):
+    """The Strava application credentials or refresh token are missing from
+    the environment. The message names the variables, never their values."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Strava credentials are not configured: set STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, "
+            "STRAVA_REFRESH_TOKEN (see MILES_ENV_FILE)"
+        )
+
+
 class StravaAllowanceLowError(RuntimeError):
     """A fetch made on a user's behalf was not attempted because Strava's
     allowance is at its reserve; the data is "not fetched yet", not missing."""

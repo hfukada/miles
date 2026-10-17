@@ -203,6 +203,7 @@
     try {
       const streamsRes = await fetch(`/api/activity-streams?id=${activityId}`);
       streamsData = await streamsRes.json();
+      if (!streamsRes.ok) throw new Error(streamsData.detail || `HTTP ${streamsRes.status}`);
     } catch (e) {
       document.getElementById('chart-section').innerHTML =
         `<div class="error">Failed to load stream data: ${e.message}</div>`;

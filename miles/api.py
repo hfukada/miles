@@ -43,7 +43,7 @@ from .routes_api import router as routes_api_router
 from .terrain_api import router as terrain_api_router
 from .builds import Build, detect_builds
 from .derive import connect_derived as _conn, derive_all
-from .errors import StravaAllowanceLowError, describe_error
+from .errors import StravaAllowanceLowError, StravaNotConfiguredError, describe_error
 from .format import fmt_pace, fmt_time
 from .periods import Gap, Period, WeekAgg, is_active, monday_of, zero_fill, detect_periods
 from .mcp_server import mcp as _mcp_server
@@ -94,6 +94,11 @@ async def _terrain_rebuilding(request: Request, exc: terrain.TerrainRebuildingEr
 @app.exception_handler(StravaAllowanceLowError)
 async def _strava_allowance_low(request: Request, exc: StravaAllowanceLowError) -> JSONResponse:
     return JSONResponse(status_code=503, content={"detail": str(exc)}, headers={"Retry-After": "900"})
+
+
+@app.exception_handler(StravaNotConfiguredError)
+async def _strava_not_configured(request: Request, exc: StravaNotConfiguredError) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 _logger = logging.getLogger(__name__)

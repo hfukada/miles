@@ -16,7 +16,7 @@ from typing_extensions import TypedDict
 from . import db, elevation, outbound, plan, strava_budget, strava_client, streams, terrain, terrain_backfill, weather as weather_module
 from .classifier import classify_workout
 from .derive import derive_all
-from .errors import StravaAllowanceLowError, describe_error
+from .errors import StravaAllowanceLowError, StravaNotConfiguredError, describe_error
 from .races import run_sport_filter
 
 _logger = logging.getLogger(__name__)
@@ -575,7 +575,10 @@ def main(
     outbound.claim()
     progress = SyncProgress()
     progress.start()
-    new_count = run_sync(conn, full, history, history_limit, reserve, progress)
+    try:
+        new_count = run_sync(conn, full, history, history_limit, reserve, progress)
+    except StravaNotConfiguredError as e:
+        raise SystemExit(str(e)) from None
     progress.finish(new_count)
 
 
