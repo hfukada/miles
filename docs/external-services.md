@@ -245,8 +245,9 @@ date, or the cut time of tiles uploaded from a local file) and `refresh_suggeste
   remaining figures are the last header reading less that count. A fresh reading
   replaces both. The token endpoint is not on that session and is not counted.
   The reading is aged by the clock: a 15-minute window that has ended counts as
-  whole again, less the calls made in the new one, and the daily figure is
-  dropped once the UTC date changes. With no reading yet, nothing is known and
+  whole again, less the calls made in the new one, and likewise the daily
+  allowance after midnight UTC (the last reading's daily limit less the calls
+  made today). With no reading yet, nothing is known and
   nothing blocks; the activity list at the start of every sync supplies one. Every request passes one gate (`miles/strava_budget.py`)
   that checks the reading first. A 429 is waited out for one window; a second
   with nothing succeeding between, or one when the headers show the daily

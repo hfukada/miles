@@ -154,20 +154,13 @@ def test_short_window_usage_resets_after_a_window_boundary(monkeypatch: pytest.M
     assert strava_client.daily_calls_remaining() == 600
 
 
-def test_the_daily_figure_is_dropped_after_the_utc_date_changes_or_a_window_ends(monkeypatch: pytest.MonkeyPatch):
+def test_the_daily_allowance_is_whole_again_after_the_utc_date_changes(monkeypatch: pytest.MonkeyPatch):
     _at(monkeypatch, 2026, 3, 1, 23, 58)
     _observe(short_usage=1, long_usage=990)
     assert strava_client.daily_calls_remaining() == 10
     _at(monkeypatch, 2026, 3, 2, 0, 1)
-    assert strava_client.daily_calls_remaining() is None
+    assert strava_client.daily_calls_remaining() == 1000
     strava_budget.Gate(12).acquire("detail")
-
-    # A waited-out window does not carry yesterday's daily figure forward either.
-    _at(monkeypatch, 2026, 3, 1, 23, 50)
-    _observe(short_usage=95, long_usage=990)
-    _at(monkeypatch, 2026, 3, 2, 0, 5)
-    assert strava_client.short_window_calls_remaining() == 100
-    assert strava_client.daily_calls_remaining() is None
 
 
 # --- the gate -------------------------------------------------------------------
@@ -341,9 +334,8 @@ def test_counts_do_not_carry_into_a_new_utc_day(monkeypatch: pytest.MonkeyPatch)
     _streams()
     _at(monkeypatch, 2026, 3, 2, 0, 1)
 
-    assert strava_client.daily_calls_remaining() is None
+    assert strava_client.daily_calls_remaining() == 1000
 
-    _observe(short_usage=0, long_usage=0)
     _streams()
     assert strava_client.daily_calls_remaining() == 999
 
@@ -355,6 +347,30 @@ def test_remaining_never_goes_below_zero(monkeypatch: pytest.MonkeyPatch):
         _streams()
     assert strava_client.daily_calls_remaining() == 0
     assert strava_client.short_window_calls_remaining() == 0
+
+
+def test_a_run_crossing_midnight_utc_counts_against_the_full_daily_limit(monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 23, 59)
+    _observe(short_usage=0, long_usage=990)
+    clock = {"minute": 1}
+    _at(monkeypatch, 2026, 3, 2, 0, clock["minute"])
+
+    def sleep(seconds: float) -> None:
+        clock["minute"] += 15
+        _at(monkeypatch, 2026, 3, 2, clock["minute"] // 60, clock["minute"] % 60)
+
+    monkeypatch.setattr(strava_budget.time, "sleep", sleep)
+    gate = strava_budget.Gate(12)
+    sent = 0
+
+    with pytest.raises(errors.StravaAllowanceLowError, match="reserve"):
+        while True:
+            gate.acquire("streams")
+            _streams()
+            sent += 1
+
+    assert sent == 988
+    assert strava_client.daily_calls_remaining() == 12
 
 
 def test_without_a_reading_nothing_is_known_and_nothing_is_sunk(monkeypatch: pytest.MonkeyPatch):

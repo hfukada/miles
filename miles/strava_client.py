@@ -93,6 +93,7 @@ class _RateObservation:
     windows are fixed: 15 minutes aligned to the hour, and the UTC day."""
 
     daily_remaining: int
+    daily_limit: int
     short_remaining: int
     short_limit: int
     at: datetime
@@ -176,7 +177,7 @@ def _on_response(response: requests.Response, **_: object) -> None:
     with _rate_lock:
         if rate is not None:
             _observation = _RateObservation(
-                rate.long_limit - rate.long_usage, rate.short_limit - rate.short_usage, rate.short_limit, now
+                rate.long_limit - rate.long_usage, rate.long_limit, rate.short_limit - rate.short_usage, rate.short_limit, now
             )
             _calls_since = _CallsSince(now.date(), _window(now))
         else:
@@ -210,16 +211,18 @@ def _count_call(now: datetime) -> None:
 
 def daily_calls_remaining() -> int | None:
     """Daily Strava API calls left: the most recent response headers' figure
-    less the requests sent since without headers. None before any reading, and
-    once the UTC day has changed since it: the new day's figure is not known
-    until a response reports it."""
+    less the requests sent since without headers. The daily allowance is whole
+    again at midnight UTC, so once the day has changed since the reading it is
+    the reading's daily limit less the calls made today. None before any
+    reading."""
     with _rate_lock:
         seen, counts = _observation, _calls_since
-        now = _now()
-        if seen is None or seen.at.date() != now.date():
+        if seen is None:
             return None
-        spent = counts.daily if counts is not None and counts.day == now.date() else 0
-        return max(0, seen.daily_remaining - spent)
+        today = _now().date()
+        spent = counts.daily if counts is not None and counts.day == today else 0
+        base = seen.daily_remaining if seen.at.date() == today else seen.daily_limit
+        return max(0, base - spent)
 
 
 def short_window_calls_remaining() -> int | None:
