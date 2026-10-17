@@ -157,3 +157,23 @@ def test_slice_by_distance_interpolates_a_subrange_runs_backwards_and_keeps_miss
     assert rs.slice_by_distance([0.0, 10.0, 20.0], with_gap, 0.0, 20.0)[1][1] is None
 
 
+def test_simplify_polyline_drops_points_within_the_tolerance_and_keeps_the_ends_and_corners():
+    straight_with_noise = [(40.0 + i * 0.0001, -105.0 + (0.000002 if i % 2 else 0.0)) for i in range(50)]
+    far = -105.0 + 0.01
+    corner = [(40.0, -105.0), (40.0, far), (40.01, far)]
+
+    thinned = rs.simplify_polyline(straight_with_noise, 5.0)
+
+    assert thinned[0] == straight_with_noise[0] and thinned[-1] == straight_with_noise[-1] and len(thinned) < 5
+    assert rs.simplify_polyline(corner, 5.0) == corner
+    ring = [(40.0, -105.0), (40.0, far), (40.01, far), (40.01, -105.0), (40.0, -105.0)]
+    assert rs.simplify_polyline(ring, 5.0) == ring
+    assert rs.simplify_polyline([(40.0, -105.0)], 5.0) == [(40.0, -105.0)]
+
+
+def test_simplify_polyline_survives_a_very_long_ring():
+    ring = [(40.0 + 0.01 * (i % 2), -105.0 + i * 0.00005) for i in range(6000)]
+
+    thinned = rs.simplify_polyline(ring, 25.0)
+
+    assert thinned[0] == ring[0] and thinned[-1] == ring[-1] and len(thinned) <= len(ring)

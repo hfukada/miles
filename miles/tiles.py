@@ -49,7 +49,9 @@ def tiles_in_bbox(south: float, west: float, north: float, east: float) -> list[
 
 def assign_elements(elements: Sequence[dict], tile_ids: Iterable[tuple[int, int]]) -> dict[tuple[int, int], list[dict]]:
     """Bucket elements into the tile_ids they intersect: a way into every tile
-    its geometry's bbox overlaps, a node into the one containing it."""
+    its geometry's bbox overlaps, a node into the one containing it, and an
+    area or relation into every tile its `bounds` ([south, west, north, east])
+    overlap."""
     tile_id_list = list(tile_ids)
     bounds_by_tile = {t: tile_bounds(*t) for t in tile_id_list}
     buckets: dict[tuple[int, int], list[dict]] = {t: [] for t in tile_id_list}
@@ -75,6 +77,11 @@ def assign_elements(elements: Sequence[dict], tile_ids: Iterable[tuple[int, int]
                 continue
             wsouth = wnorth = lat
             wwest = weast = lon
+        elif el_type in ("area", "relation"):
+            bounds = el.get("bounds")
+            if not bounds:
+                continue
+            wsouth, wwest, wnorth, weast = bounds
         else:
             continue
 

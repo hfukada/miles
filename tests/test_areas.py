@@ -572,3 +572,98 @@ def test_a_way_running_past_the_area_keeps_its_elevation(conn: sqlite3.Connectio
 
     rows = conn.execute("SELECT has_elevation FROM net_edges WHERE area_id = ?", (status["area_id"],)).fetchall()
     assert rows and all(r["has_elevation"] for r in rows)
+
+
+def _old_tiles(conn: sqlite3.Connection, area_id: int, source: str, version: int = 1) -> None:
+    """The area's tiles as an earlier cut version left them."""
+    for gx, gy in tiles.tiles_in_bbox(*tiles.bbox_for_center_radius(LAT, LNG, 2.0)):
+        conn.execute("INSERT OR IGNORE INTO area_tiles (area_id, gx, gy) VALUES (?, ?, ?)", (area_id, gx, gy))
+        conn.execute(
+            "INSERT OR REPLACE INTO map_tiles (gx, gy, query_version, fetched_at, sha256, data, source) "
+            "VALUES (?, ?, ?, ?, 'x', ?, ?)",
+            (gx, gy, version, datetime.now(timezone.utc).isoformat(), gzip.compress(b'{"elements": []}'), source),
+        )
+    conn.commit()
+
+
+def _register_extract_file(conn: sqlite3.Connection, tmp_path, region: str = "test/region") -> extracts.ExtractRecord:
+    path = tmp_path / "region.osm.pbf"
+    path.write_bytes(b"x")
+    return extracts.register_local_extract(conn, path, region)
+
+
+def _forbid_downloads(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(*args, **kwargs):
+        raise AssertionError("an area rebuild must not fetch an extract")
+
+    monkeypatch.setattr(extracts, "download_extract", refuse)
+    monkeypatch.setattr(extracts, "select_extracts", refuse)
+
+
+def test_a_rebuild_re_cuts_tiles_left_by_an_older_cut_from_the_extract_on_disk_and_never_downloads(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    record = _register_extract_file(conn, tmp_path)
+    area_id = _insert_area(conn, "old")
+    _old_tiles(conn, area_id, "extract:test/region")
+    _forbid_downloads(monkeypatch)
+    cuts: list[tuple[list[str], tuple]] = []
+
+    def recording_cut(conn, extract_list, bbox):
+        cuts.append(([e["region"] for e in extract_list], bbox))
+        for gx, gy in tiles.tiles_in_bbox(*bbox):
+            conn.execute("INSERT OR IGNORE INTO area_tiles (area_id, gx, gy) VALUES (?, ?, ?)", (area_id, gx, gy))
+            conn.commit()
+            tilecache.store_tile_elements(conn, gx, gy, [], source="extract:test/region")
+        return tiles.tiles_in_bbox(*bbox)
+
+    monkeypatch.setattr(extracts, "cut_area", recording_cut)
+
+    areas_service._run_finish_only_job(area_id)
+
+    assert [regions for regions, _bbox in cuts] == [["test/region"]]
+    assert cuts[0][1] == tiles.bbox_for_center_radius(LAT, LNG, 2.0)
+    row = conn.execute("SELECT status, status_error FROM areas WHERE area_id = ?", [area_id]).fetchone()
+    assert (row["status"], row["status_error"]) == ("ready", None)
+    assert record["region"] == "test/region"
+
+
+@pytest.mark.parametrize("setup", ["current", "uploaded", "file missing", "unregistered"])
+def test_tiles_that_cannot_or_need_not_be_re_cut_are_left_alone(
+    conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path, setup: str
+):
+    source = "extract:cli" if setup == "uploaded" else "extract:test/region"
+    area_id = _insert_area(conn, "area")
+    _old_tiles(conn, area_id, source, version=tilecache.TILE_QUERY_VERSION if setup == "current" else 1)
+    if setup == "current":
+        _register_extract_file(conn, tmp_path)
+    elif setup == "file missing":
+        _register_extract_file(conn, tmp_path)
+        (tmp_path / "region.osm.pbf").unlink()
+    _forbid_downloads(monkeypatch)
+    cuts: list = []
+    monkeypatch.setattr(extracts, "cut_area", lambda *a: cuts.append(a))
+
+    areas_service._run_finish_only_job(area_id)
+
+    assert cuts == []
+
+
+def test_gc_drops_an_expired_areas_sections_and_what_was_matched_against_them(conn: sqlite3.Connection):
+    from miles import sections
+
+    stale_id = _insert_area(conn, "stale", used_days_ago=areas_service.UNPINNED_GC_DAYS + 1)
+    conn.execute(
+        "INSERT INTO net_sections (section_id, area_id, kind, name, length_m, centroid_lat, centroid_lng, south, west, north, east, data, edges) "
+        "VALUES (7, ?, 'trail_system', 'x', 1, 0, 0, 0, 0, 0, 0, '{}', X'')",
+        [stale_id],
+    )
+    conn.execute("INSERT INTO net_section_visits (section_id, activity_id, covered_m) VALUES (7, 1, 5)")
+    conn.execute("INSERT INTO net_section_matched (area_id, activity_id, built_at) VALUES (?, 1, 'x')", [stale_id])
+    conn.commit()
+
+    areas_service.gc_areas_and_tiles(conn)
+
+    assert sections.load_sections(conn, stale_id) == []
+    assert conn.execute("SELECT COUNT(*) FROM net_section_visits").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM net_section_matched").fetchone()[0] == 0

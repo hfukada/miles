@@ -1085,3 +1085,111 @@ def test_a_failing_progress_callback_does_not_stop_the_reporter():
     report(2, None)
 
     assert calls == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Scenery
+# ---------------------------------------------------------------------------
+
+# Around (0.02, 0.02), inside tile (0, 0).
+_SQUARE = [(0.020, 0.020), (0.020, 0.030), (0.030, 0.030), (0.030, 0.020)]
+
+
+def _scenery_pbf(path: Path) -> None:
+    corner_nodes = [(i, lat, lon, {}) for i, (lat, lon) in enumerate(_SQUARE, start=30)]
+    far_corner_nodes = [(i, lat + 5.0, lon + 5.0, {}) for i, (lat, lon) in enumerate(_SQUARE, start=40)]
+    write_pbf(
+        path,
+        nodes=[
+            (1, 0.010, 0.010, {}),
+            (2, 0.010, 0.040, {}),
+            (3, 0.015, 0.010, {}),
+            (4, 0.015, 0.040, {}),
+            (5, 0.012, 0.020, {"natural": "peak", "name": "Example Peak", "ele": "2000", "source": "x"}),
+            (6, 0.013, 0.021, {"tourism": "viewpoint"}),
+            (7, 0.014, 0.022, {"natural": "tree"}),
+            *corner_nodes,
+            *far_corner_nodes,
+        ],
+        ways=[
+            (100, [1, 2], {"highway": "path", "name": "Example Path"}),
+            (101, [3, 4], {"highway": "footway"}),
+            (200, [1, 2], {"waterway": "river", "name": "Example River", "boat": "yes"}),
+            (201, [3, 4], {"waterway": "drain"}),  # not a waterway of interest
+            (300, [30, 31, 32, 33, 30], {"natural": "water", "name": "Example Pond"}),
+            (301, [30, 31, 32, 33, 30], {"leisure": "park", "name": "Example Park"}),
+            (302, [40, 41, 42, 43, 40], {"leisure": "park"}),  # nowhere near the cut
+            (303, [30, 31, 32, 33, 30], {"building": "yes"}),
+        ],
+        relations=[
+            (400, [("w", 100, ""), ("w", 101, ""), ("w", 9999, "")], {"type": "route", "route": "hiking", "name": "Example Route", "network": "lwn"}),
+            (401, [("w", 100, "")], {"type": "route", "route": "bus"}),  # not a walking or cycling route
+            (402, [("w", 9999, "")], {"type": "route", "route": "foot"}),  # no member inside the cut
+            (500, [("w", 303, "outer")], {"type": "multipolygon", "boundary": "protected_area", "name": "Example Reserve"}),
+        ],
+    )
+
+
+@pytest.fixture
+def scenery_payload(conn: sqlite3.Connection, tmp_path: Path) -> dict:
+    path = tmp_path / "scenery.osm.pbf"
+    _scenery_pbf(path)
+    record = extracts.register_local_extract(conn, path, "test/scenery")
+    extracts.cut_area(conn, record, tiles.tile_bounds(0, 0))
+    payload = tilecache.get_tile_payload(conn, 0, 0)
+    assert payload is not None
+    return payload
+
+
+def _by_type(payload: dict, el_type: str) -> list[dict]:
+    return [el for el in payload["elements"] if el["type"] == el_type]
+
+
+def test_cut_area_keeps_waterways_with_only_their_scenery_tags(scenery_payload: dict):
+    rivers = [w for w in _by_type(scenery_payload, "way") if "waterway" in w["tags"]]
+
+    assert [w["id"] for w in rivers] == [200]
+    assert rivers[0]["tags"] == {"waterway": "river", "name": "Example River"}
+    assert len(rivers[0]["geometry"]) == 2
+
+
+def test_cut_area_keeps_peaks_and_viewpoints_but_not_other_natural_nodes(scenery_payload: dict):
+    nodes = {el["id"]: el["tags"] for el in _by_type(scenery_payload, "node")}
+
+    assert nodes[5] == {"natural": "peak", "name": "Example Peak", "ele": "2000"}
+    assert nodes[6] == {"tourism": "viewpoint"}
+    assert 7 not in nodes
+
+
+def test_cut_area_keeps_water_and_park_polygons_as_outer_rings_with_bounds(scenery_payload: dict):
+    areas = {el["tags"].get("name"): el for el in _by_type(scenery_payload, "area")}
+
+    assert set(areas) >= {"Example Pond", "Example Park"}
+    assert "Example Reserve" in areas  # a multipolygon relation assembled from its outer way
+    pond = areas["Example Pond"]
+    assert pond["tags"] == {"natural": "water", "name": "Example Pond"}
+    assert pond["bounds"] == pytest.approx([0.020, 0.020, 0.030, 0.030])
+    ring = pond["rings"][0]
+    assert ring[0] == ring[-1] and len(ring) == 5
+    assert all(el["id"] != 302 and "building" not in el["tags"] for el in _by_type(scenery_payload, "area"))
+    assert len(_by_type(scenery_payload, "area")) == 3  # the pond, the park, the reserve
+
+
+def test_cut_area_keeps_walking_route_relations_with_the_member_ways_that_were_cut(scenery_payload: dict):
+    relations = _by_type(scenery_payload, "relation")
+
+    assert [r["id"] for r in relations] == [400]
+    assert relations[0]["members"] == [100, 101]
+    assert relations[0]["tags"] == {"type": "route", "route": "hiking", "name": "Example Route", "network": "lwn"}
+    assert relations[0]["bounds"] == pytest.approx([0.010, 0.010, 0.015, 0.040])
+
+
+def test_tiles_cut_before_the_scenery_version_are_cut_again(conn: sqlite3.Connection, sample_pbf: Path):
+    record = extracts.register_local_extract(conn, sample_pbf, "test/sample")
+    extracts.cut_area(conn, record, tiles.tile_bounds(0, 0))
+    assert extracts.tiles_cut_from(conn, record, [(0, 0)])
+
+    conn.execute("UPDATE map_tiles SET query_version = ?", [tilecache.TILE_QUERY_VERSION - 1])
+    conn.commit()
+
+    assert not extracts.tiles_cut_from(conn, record, [(0, 0)])

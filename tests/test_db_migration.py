@@ -67,6 +67,7 @@ def test_backfill_rewrites_start_date_to_local_wall_time_once_and_leaves_rows_wi
 _SCHEMA_HASHES = {
     1: "aea5ae73e40fa9e1797a71628ba98d85203433a908c53572313b52db2ef83721",
     2: "026d105719904fe53a70183f867fca94de39b6f86128bb8fce245dda37931648",
+    3: "261b879550f49105a9791fb512e2a6e0b5000ae14353509b1f457083923ceef4",
 }
 
 
@@ -260,3 +261,27 @@ def test_a_file_stored_but_not_yet_derived_in_a_current_database_is_not_tombston
 
     assert conn.execute("SELECT COUNT(*) FROM route_tombstones").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0] == 1
+
+
+_SECTION_TABLES = (
+    "net_sections", "net_section_judgments", "net_section_judgment_ways", "net_section_visits", "net_section_matched",
+)
+
+
+def test_a_version_2_database_gains_the_section_tables_and_keeps_its_graphs(conn: sqlite3.Connection, tmp_path: Path):
+    old = _release_database(tmp_path / "v2.db")
+    db.init_db(old)  # a current database, then taken back to version 2
+    for table in _SECTION_TABLES:
+        old.execute(f"DROP TABLE {table}")
+    old.execute(
+        "INSERT INTO net_graphs (area_id, derive_version, built_at, node_count, edge_count, excluded_way_count) "
+        "VALUES (1, 8, 'then', 0, 0, 0)"
+    )
+    old.execute("PRAGMA user_version = 2")
+    old.commit()
+
+    db.init_db(old)
+
+    assert _layout(old) == _layout(conn)
+    assert old.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert old.execute("SELECT derive_version FROM net_graphs").fetchone()[0] == 8  # rebuilt later by the version gate

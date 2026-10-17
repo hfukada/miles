@@ -10,7 +10,10 @@ tilecache.py stores and merges them, so callers never need to know which
 extracts produced a tile.
 
 Parking is mostly mapped as a closed way, so cutting folds an amenity=parking
-way into a synthetic point amenity (_parking_center_element).
+way into a synthetic point amenity (_parking_center_element). Beside the
+network, a cut keeps the scenery sections are tagged with (tilecache.py):
+waterways, assembled water, park and protected-area polygons, summits and
+viewpoints, and walking or cycling route relations.
 """
 
 import hashlib
@@ -38,7 +41,7 @@ import osmium.filter
 import osmium.io
 import osmium.osm
 
-from . import db, geofabrik, http_client, metrics, tilecache, tiles
+from . import db, geofabrik, http_client, metrics, routes_spatial, tilecache, tiles
 
 GEOFABRIK_BASE_URL = geofabrik.GEOFABRIK_BASE_URL
 
@@ -708,9 +711,8 @@ def _way_bbox(obj: osmium.osm.Way) -> tuple[float, float, float, float] | None:
     return (south, west, north, east)
 
 
-def _way_element(obj: osmium.osm.Way, tags: dict[str, str]) -> dict | None:
-    if tags.get("highway") not in tilecache.HIGHWAY_VALUES:
-        return None
+def _located_geometry(obj: osmium.osm.Way) -> tuple[list[int], list[dict[str, float] | None]] | None:
+    """(node ids, geometry) of a way, None when none of its nodes is located."""
     node_ids: list[int] = []
     geometry: list[dict[str, float] | None] = []
     any_located = False
@@ -721,9 +723,73 @@ def _way_element(obj: osmium.osm.Way, tags: dict[str, str]) -> dict | None:
             any_located = True
         else:
             geometry.append(None)
-    if not any_located:
+    return (node_ids, geometry) if any_located else None
+
+
+def _way_element(obj: osmium.osm.Way, tags: dict[str, str]) -> dict | None:
+    if tags.get("highway") not in tilecache.HIGHWAY_VALUES:
         return None
-    return {"type": "way", "id": obj.id, "tags": tags, "nodes": node_ids, "geometry": geometry}
+    located = _located_geometry(obj)
+    if located is None:
+        return None
+    return {"type": "way", "id": obj.id, "tags": tags, "nodes": located[0], "geometry": located[1]}
+
+
+def _waterway_element(obj: osmium.osm.Way, tags: dict[str, str]) -> dict | None:
+    if tags.get("waterway") not in tilecache.WATERWAY_VALUES:
+        return None
+    located = _located_geometry(obj)
+    if located is None:
+        return None
+    return {
+        "type": "way", "id": obj.id, "tags": tilecache.scenery_tags(tags),
+        "nodes": located[0], "geometry": located[1],
+    }
+
+
+def _area_element(obj: osmium.osm.Area, tags: dict[str, str], bbox: tuple[float, float, float, float]) -> dict | None:
+    """A water body, park, or protected area as thinned outer rings of
+    [lat, lon] pairs plus their bounds; None when it misses bbox or is
+    too small to matter. Holes are not kept."""
+    rings: list[list[list[float]]] = []
+    south = west = math.inf
+    north = east = -math.inf
+    for ring in obj.outer_rings():
+        points = [(n.lat, n.lon) for n in ring if n.location.valid()]
+        if len(points) < 4:
+            continue
+        thinned = routes_spatial.simplify_polyline(points, tilecache.AREA_SIMPLIFY_TOLERANCE_M)
+        if len(thinned) < 4:
+            continue
+        rings.append([[lat, lon] for lat, lon in thinned])
+        south, north = min(south, min(p[0] for p in thinned)), max(north, max(p[0] for p in thinned))
+        west, east = min(west, min(p[1] for p in thinned)), max(east, max(p[1] for p in thinned))
+    if not rings:
+        return None
+    extent_m = routes_spatial.equirect_distance_m(south, west, north, east)
+    if extent_m < tilecache.AREA_MIN_EXTENT_M or not tiles.bbox_overlaps((south, west, north, east), bbox):
+        return None
+    return {
+        "type": "area", "id": obj.id, "tags": tilecache.scenery_tags(tags),
+        "rings": rings, "bounds": [south, west, north, east],
+    }
+
+
+def _route_relation_element(
+    obj: osmium.osm.Relation, tags: dict[str, str], way_bounds: dict[int, tuple[float, float, float, float]]
+) -> dict | None:
+    """A walking/cycling route relation reduced to the ids of its member ways
+    that were cut, plus the bounds of those ways; None when none was."""
+    if tags.get("type") != "route" or tags.get("route") not in tilecache.ROUTE_RELATION_VALUES:
+        return None
+    members = [m.ref for m in obj.members if m.type == "w" and m.ref in way_bounds]
+    if not members:
+        return None
+    boxes = [way_bounds[m] for m in members]
+    return {
+        "type": "relation", "id": obj.id, "tags": tilecache.scenery_tags(tags), "members": members,
+        "bounds": [min(b[0] for b in boxes), min(b[1] for b in boxes), max(b[2] for b in boxes), max(b[3] for b in boxes)],
+    }
 
 
 def _parking_center_element(obj: osmium.osm.Way, tags: dict[str, str]) -> dict | None:
@@ -753,6 +819,8 @@ def _parking_center_element(obj: osmium.osm.Way, tags: dict[str, str]) -> dict |
 def _node_element(obj: osmium.osm.Node, tags: dict[str, str]) -> dict | None:
     if not any(tags.get(k) == v for k, v in tilecache.NODE_TAGS):
         return None
+    if tags.get("tourism") == "viewpoint" or tags.get("natural") == "peak":
+        tags = {k: v for k, v in tags.items() if k in ("name", "ele", "tourism", "natural")}
     return {"type": "node", "id": obj.id, "lat": obj.location.lat, "lon": obj.location.lon, "tags": tags}
 
 
@@ -829,26 +897,52 @@ def cut_area(
     return tile_ids
 
 
+# Tag keys an object must carry to be looked at; the filter runs in C++, so
+# everything else is skipped before Python sees it.
+_CUT_KEYS = ("highway", "amenity", "waterway", "natural", "water", "leisure", "boundary", "tourism", "route")
+
+# Relations and closed ways assembled into areas only when they carry one of
+# these tags, so administrative boundaries and the like are never built.
+_AREA_TAGS = (
+    ("natural", "water"), ("waterway", "riverbank"), ("leisure", "park"), ("leisure", "nature_reserve"),
+    ("boundary", "protected_area"), ("boundary", "national_park"),
+)
+
+
 def _cut_elements(extract: ExtractRecord, bbox: tuple[float, float, float, float]) -> list[dict]:
     """The tile-payload elements of one extract's file that fall in bbox. The
-    KeyFilter keeps every highway/amenity way in the file, so tag and bbox
-    checks precede building elements; otherwise memory scales with the extract."""
+    filter keeps every object with a key of interest in the file, so tag and
+    bbox checks precede building elements; otherwise memory scales with the
+    extract. Relations follow their member ways in the file, so a route
+    relation lists the member ways cut here and no others."""
     path = Path(extract["path"])
     elements: list[dict] = []
+    way_bounds: dict[int, tuple[float, float, float, float]] = {}
 
     with _location_index(path) as storage:
-        fp = osmium.FileProcessor(str(path)).with_locations(storage).with_filter(
-            osmium.filter.KeyFilter("highway", "amenity")
+        fp = (
+            osmium.FileProcessor(str(path))
+            .with_locations(storage)
+            .with_areas(osmium.filter.TagFilter(*_AREA_TAGS))
+            .with_filter(osmium.filter.KeyFilter(*_CUT_KEYS))
         )
         for obj in fp:
             if isinstance(obj, osmium.osm.Way):
-                if obj.tags.get("highway") not in tilecache.HIGHWAY_VALUES and obj.tags.get("amenity") != "parking":
+                tags = dict(obj.tags)
+                is_highway = tags.get("highway") in tilecache.HIGHWAY_VALUES
+                is_waterway = tags.get("waterway") in tilecache.WATERWAY_VALUES
+                if not (is_highway or is_waterway or tags.get("amenity") == "parking"):
                     continue
                 way_bbox = _way_bbox(obj)
                 if way_bbox is None or not tiles.bbox_overlaps(way_bbox, bbox):
                     continue
-                tags = dict(obj.tags)
-                el = _parking_center_element(obj, tags) or _way_element(obj, tags)
+                if is_highway:
+                    way_bounds[obj.id] = way_bbox
+                    el = _parking_center_element(obj, tags) or _way_element(obj, tags)
+                elif is_waterway:
+                    el = _waterway_element(obj, tags)
+                else:
+                    el = _parking_center_element(obj, tags)
                 if el is not None:
                     elements.append(el)
             elif isinstance(obj, osmium.osm.Node):
@@ -856,6 +950,17 @@ def _cut_elements(extract: ExtractRecord, bbox: tuple[float, float, float, float
                 if not (bbox[0] <= lat <= bbox[2] and bbox[1] <= lon <= bbox[3]):
                     continue
                 el = _node_element(obj, dict(obj.tags))
+                if el is not None:
+                    elements.append(el)
+            elif isinstance(obj, osmium.osm.Area):
+                tags = dict(obj.tags)
+                if tilecache.scenery_area_kind(tags) is None:
+                    continue
+                el = _area_element(obj, tags, bbox)
+                if el is not None:
+                    elements.append(el)
+            elif isinstance(obj, osmium.osm.Relation):
+                el = _route_relation_element(obj, dict(obj.tags), way_bounds)
                 if el is not None:
                     elements.append(el)
     return elements

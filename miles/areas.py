@@ -12,6 +12,7 @@ unpinned area untouched for UNPINNED_GC_DAYS is deleted on the next
 import_area call, along with any tile no area references.
 """
 
+import logging
 import os
 import sqlite3
 import threading
@@ -21,8 +22,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Callable, cast
 from typing_extensions import NotRequired, TypedDict
 
-from . import db, elevation, extracts, geocode, geofabrik, metrics, network, tilecache, tiles
+from . import db, elevation, extracts, familiarity, geocode, geofabrik, metrics, network, sections, tilecache, tiles
 from .errors import describe_error
+
+_logger = logging.getLogger(__name__)
 
 # Rough throughput of a filtered pass over an extract; estimates only.
 EXTRACT_CUT_MB_PER_S = 13.7
@@ -312,6 +315,7 @@ def gc_areas_and_tiles(conn: sqlite3.Connection) -> None:
         conn.execute("DELETE FROM net_edges WHERE area_id = ?", (area_id,))
         conn.execute("DELETE FROM net_nodes WHERE area_id = ?", (area_id,))
         conn.execute("DELETE FROM net_graphs WHERE area_id = ?", (area_id,))
+        sections.delete_area_sections(conn, area_id)
         conn.execute("DELETE FROM areas WHERE area_id = ?", (area_id,))
     if stale_ids:
         conn.commit()
@@ -630,6 +634,15 @@ def _finish_import(conn: sqlite3.Connection, area_id: int, area: sqlite3.Row) ->
     network.build_network(conn, area_id, area_tile_payloads(conn, area_id), elevation.sampler_for(conn))
     _set_progress(conn, area_id, phase="network", done=1, total=1)
 
+    _set_progress(conn, area_id, phase="familiarity", done=0, total=1)
+    try:
+        familiarity.update(conn, area_id)
+    except Exception:
+        # Familiarity fills in later from a query; it never fails an import.
+        conn.rollback()
+        _logger.exception("matching activities to area %s failed", area_id)
+    _set_progress(conn, area_id, phase="familiarity", done=1, total=1)
+
 
 class TilePayload(TypedDict):
     gx: int
@@ -719,13 +732,49 @@ def _run_import_job(area_id: int, refresh: bool = False, force_extract: bool = F
     _run_job(area_id, body)
 
 
+def _recut_outdated_tiles(conn: sqlite3.Connection, area_id: int, area: sqlite3.Row) -> None:
+    """Re-cut the area's tiles from the extracts already on disk when any was
+    cut at an older tilecache.TILE_QUERY_VERSION. Nothing is fetched: the
+    area is left as it is unless every one of its tiles came from registered
+    extracts whose files are present (tiles uploaded already cut cannot be
+    re-cut, and cutting would replace them)."""
+    rows = conn.execute(
+        """
+        SELECT mt.query_version, mt.source FROM area_tiles atl
+        JOIN map_tiles mt ON mt.gx = atl.gx AND mt.gy = atl.gy
+        WHERE atl.area_id = ?
+        """,
+        (area_id,),
+    ).fetchall()
+    if not rows or all(r["query_version"] == tilecache.TILE_QUERY_VERSION for r in rows):
+        return
+    records: dict[str, extracts.ExtractRecord] = {}
+    for row in rows:
+        regions = extracts.regions_of_source(row["source"])
+        if not regions:
+            return
+        for region in regions:
+            record = extracts.get_extract(conn, region)
+            if record is None or not os.path.isfile(record["path"]):
+                return
+            records[region] = record
+    bbox = tiles.bbox_for_center_radius(area["center_lat"], area["center_lng"], area["radius_km"])
+    _set_progress(conn, area_id, phase="tiles", done=0, total=len(rows))
+    metrics.cache("map_tiles", "miss", len(rows))
+    extracts.cut_area(conn, list(records.values()), bbox)
+    _set_progress(conn, area_id, phase="tiles", done=len(rows), total=len(rows))
+
+
 def _run_finish_only_job(area_id: int) -> None:
-    """Thread target for import_tiles: the caller already stored the tiles,
-    so only the elevation + network-build tail runs here."""
+    """Thread target for import_tiles and for rebuilding a stale network: the
+    tiles are already stored, so only the elevation + network-build tail runs
+    here, after re-cutting tiles an older cut version left behind."""
 
     def body(conn: sqlite3.Connection, aid: int) -> None:
         with _import_slot(conn, aid):
-            _finish_import(conn, aid, _get_area_row(conn, aid))
+            area = _get_area_row(conn, aid)
+            _recut_outdated_tiles(conn, aid, area)
+            _finish_import(conn, aid, area)
 
     _run_job(area_id, body)
 

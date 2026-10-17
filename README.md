@@ -187,8 +187,9 @@ Opens a local web interface at `http://localhost:8000` with six pages:
 The tool descriptions the server publishes are the reference; ask Claude Code what a tool does.
 They cover training analysis (mileage, activities, blocks, periods, consistency), races and
 builds, fitness estimates, workouts and laps, weather, training plans (draft, commit, adherence),
-stored routes (compare, compose, junctions, proximity), the terrain model, area import and route
-search, outbound-request counts, and read-only SQL over every table.
+stored routes (compare, compose, junctions, proximity), the terrain model, area import, area
+surveys (the stretches worth running around a start, with the athlete's own adjustments and
+exclusions) and route search, outbound-request counts, and read-only SQL over every table.
 
 `run_type` reflects the label you set in Strava (`easy`, `workout`, `long_run`, `race`);
 untagged activities get an inferred type from name, distance, and pace history — your

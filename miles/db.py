@@ -207,7 +207,7 @@ def connection(opener: Callable[[], sqlite3.Connection] | None = None) -> Iterat
         conn.close()
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def add_missing_columns(conn: sqlite3.Connection, table: str, *columns: str) -> bool:
@@ -638,6 +638,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     from .extracts import init_extract_schema
     from .network import init_network_schema
     from .route_search import init_search_schema
+    from .sections import init_section_schema
     from .terrain import init_terrain_schema
     init_event_schema(conn)
     init_terrain_schema(conn)
@@ -646,6 +647,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     init_network_schema(conn)
     init_drive_schema(conn)
     init_search_schema(conn)
+    init_section_schema(conn)
     if previous_version == 0:
         _settle_routes_deleted_before_tombstones(conn)
 

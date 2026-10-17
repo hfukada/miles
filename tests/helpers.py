@@ -15,7 +15,7 @@ import osmium
 import pytest
 import requests
 from mcp.server.fastmcp import FastMCP
-from osmium.osm.mutable import Node, Way
+from osmium.osm.mutable import Node, Relation, Way
 from stravalib.exc import Fault
 
 from miles import db, extracts, http_client, routes, routes_spatial
@@ -407,14 +407,22 @@ def meadow_payload() -> dict:
     }
 
 
-def write_pbf(path: Path, nodes: list[tuple[int, float, float, dict]], ways: list[tuple[int, list[int], dict]]) -> None:
+def write_pbf(
+    path: Path,
+    nodes: list[tuple[int, float, float, dict]],
+    ways: list[tuple[int, list[int], dict]],
+    relations: list[tuple[int, list[tuple[str, int, str]], dict]] | None = None,
+) -> None:
     """A tiny synthetic .osm.pbf: nodes as (id, lat, lon, tags), ways as
-    (id, node_ids, tags). No bbox header, unlike a real Geofabrik extract."""
+    (id, node_ids, tags), relations as (id, [(member type, ref, role)], tags).
+    No bbox header, unlike a real Geofabrik extract."""
     writer = osmium.SimpleWriter(str(path))
     for node_id, lat, lon, tags in nodes:
         writer.add_node(Node(id=node_id, location=(lon, lat), tags=tags, version=1))
     for way_id, node_ids, tags in ways:
         writer.add_way(Way(id=way_id, nodes=node_ids, tags=tags, version=1))
+    for relation_id, members, tags in relations or []:
+        writer.add_relation(Relation(id=relation_id, members=members, tags=tags, version=1))
     writer.close()
 
 

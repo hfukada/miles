@@ -1,6 +1,6 @@
 ---
 name: route-finder
-description: Finds runnable routes in an area from open map data and the athlete's own terrain model — "I'm staying at X, find me a runnable 13 with 6+ miles of trail", "anything within a 20-minute drive?", "how runnable is this route?". Turns a free-text request into constraints, imports the area if needed, runs the miles route search, and presents a few candidates with their trade-offs. Also scores uploaded routes against the athlete's walk and descent thresholds. Not for training prescriptions (miles-plan) or analysis of past training (miles).
+description: Finds runnable routes in an area from open map data and the athlete's own terrain model — "I'm staying at X, find me a runnable 13 with 6+ miles of trail", "what's good to run around here?", "anything within a 20-minute drive?", "how runnable is this route?". Imports the area if needed, surveys it for the stretches worth running (trail systems, riverside paths, named routes, park paths, quiet roads), runs the miles route search around the athlete's picks, and presents a few candidates with their trade-offs. Also scores uploaded routes against the athlete's walk and descent thresholds. Not for training prescriptions (miles-plan) or analysis of past training (miles).
 ---
 
 # route-finder — Route Finding
@@ -67,21 +67,63 @@ comes from `get_route_candidate`'s `ways` too.
      nearby trails should be ready in a minute or two; the 30-minute drive area takes a
      few more"). Don't go silent while waiting.
    - Keep the conversation useful meanwhile (pin down distance, terrain, time), and
-     check back with `get_area_status` between turns rather than polling in a loop. It
-     reports the phase and progress. The status stays `importing`; the phases are
+     check back with `get_area_status` between turns. After starting an import, tell the
+     athlete what is running and end the turn. Check status once at the start of the next
+     turn, and never call `get_area_status` more than once in a turn; if it is still
+     importing, say so and end the turn again. It reports the phase and progress. The status stays `importing`; the phases are
      waiting-for-download, downloading (bytes; the total may be null), queued (waiting for
-     the server's one import slot), tiles, elevation, and network.
+     the server's one import slot), tiles, elevation, network, and familiarity.
    - Search the out-the-door area as soon as it's `ready`; offer drive-mode results
      when the drive area finishes.
    - Offer `pinned=true` for home; travel areas expire on their own.
-2. **Search.** `find_routes` with the mapped constraints. For a drive budget, candidates
+2. **Survey the area before searching.** Once the area is `ready`, call `survey_area`
+   with the start (and `distance_mi` when they named one) and open with what the area
+   offers, not with routes. Section kinds are `trail_system`, `water_path`,
+   `named_route`, `park_paths`, and `quiet_road`. Present them grouped by kind, a few per
+   group, best first, each in a line or two: name, length, surface mix, scenery tags
+   (water, park, summit, viewpoint, a named route), run/grind/hike percent for *this*
+   athlete, how far the approach is and how much of it is uncomfortable road, and
+   whether they have run it (`familiarity.runs`, `new_to_you`). Lead with how a section
+   differs from the others, and name its trade-offs. A stretch can appear as two kinds
+   (`same_stretch_as` points at the higher-ranked twin): say it is one stretch.
+   - If they want somewhere new, run it again with `unfamiliar_only=true`. If
+     `familiarity.activities_pending` is above zero, activity tracks are still being
+     matched and "new to you" may be wrong; say so.
+   - Sections that were ruled out for approach length or road exposure are not listed
+     (`ruled_out` shows a few); mention the count when it explains a gap. Sections
+     marked `excluded` are ones the athlete ruled out earlier; do not offer them.
+   - The score and every term behind it are on each section. Explain a ranking from
+     those terms when asked; never claim more than they show. Scenery is only what the
+     map tags: a lovely stretch with no tags scores on length, continuity, and
+     runnability alone.
+   - **Your own knowledge of a place** ("that riverside trail is a local favorite") goes in as
+     a per-request adjustment, `adjustments={section_id: factor}` (0.5 to 2.0), and you
+     say that you did it and why. It is never stored by default. If the athlete agrees it
+     is worth keeping, offer to store it with `adjust_section` as `source="research"`
+     with a link to where it came from; with no link, do not store it.
+   - **The athlete's own verdicts** are stored only when they say so: call
+     `adjust_section` (`source="athlete"`) when they tell you a section is better or worse
+     than it measures, and `exclude_section` only when they explicitly tell you to rule a
+     place out. Never exclude on your own judgment or from research.
+     `clear_section_adjustment` undoes an adjustment; it removes an exclusion
+     (`exclusion=true`) only on their explicit say-so. Section ids change when an area's network is rebuilt, so survey
+     again rather than reuse old ids after one.
+   - A survey measures access from the one point you give it. For a drive, survey from
+     the trailhead the athlete would use (`find_trailheads`), not from where they sleep.
+   - `get_section(section_id)` returns a section's ways and a simplified geometry. Once
+     the athlete picks a section, build the route around it with `find_routes`, passing
+     its way ids as `include_way_ids` (soft, so check each candidate's
+     `missed_constraints`) and the distance they want. Say which section each
+     candidate is built around. Searching is still the same one-at-a-time process below.
+3. **Search.** `find_routes` with the mapped constraints. For a drive budget, candidates
    carry their trailhead and drive minutes; `find_trailheads` lists the starts on
    their own when the athlete wants to choose one first. The drive budget is at most
    90 minutes. If a start has `drive_time_estimated: true`, the routing service was
    unavailable and its drive time is a straight-line estimate; say so, and don't
    re-run the search in a loop to get real times.
-3. **Survey before narrowing.** Unless the athlete already named a style, run two to
-   four `find_routes` searches with different styles over the same start and distance:
+4. **Compare styles.** Unless the athlete already named a style, run two to
+   four `find_routes` searches, one after another and never in parallel (the server runs
+   one search at a time, so parallel calls only queue), with different styles over the same start and distance:
    runnable (`min_runnable_pct` ≈ 90, no trail floor), trail (`min_trail_mi` about half
    the distance), and easy (low `gain_ft_max`, shorter) — plus whatever their request
    implies. Present the results grouped by style, two or three per group, best group
@@ -95,13 +137,13 @@ comes from `get_route_candidate`'s `ways` too.
    time. Lead with how it differs from the others. Never present one "best".
    When the request is already specific (distance and style named), skip the survey and
    run the one search.
-4. **Nothing qualifies?** Results come back with `missed_constraints`. Propose the
+5. **Nothing qualifies?** Results come back with `missed_constraints`. Propose the
    relaxation they point to ("loosening trail to 5 miles gives three options") rather
    than reporting failure. Never relax a hard preference (avoided ways, the road-exposure
    limit) without asking. If `budget_exceeded` is true, the 10-second search budget ran
    out before enough candidates qualified: say the result may be thin, and narrow the
    request or try again.
-5. **Save.** `save_route_candidate` turns a candidate into a normal route. Then the
+6. **Save.** `save_route_candidate` turns a candidate into a normal route. Then the
    athlete can view it at `/route.html?id=<route_id>` on the miles web app, download its
    GPX from `/api/routes/<route_id>/gpx` (for Strava or a watch), compare it with a race
    course (`compare_route_to_course`), or combine it with other routes (`compose_route`).
@@ -121,6 +163,12 @@ are cached; if it shows as pending, `redrape_route` fetches them.
 Units: `score_route` returns metres (`longest_hike_m`, `steep_descent_m`) and
 `analyze_activity_terrain` returns m/s and metres. Convert to miles and feet, and to
 min/mi for pace, when quoting. `find_routes` results are already in miles and feet.
+
+`longest_hike` and `steep_descent` are distances along the route, never vertical.
+Report them as distance ("0.25 mi of descent steeper than your descent threshold", "a 0.4 mi
+stretch of hiking"), never as feet of climb or descent, which reads as elevation.
+In `find_routes` results they are `longest_hike_mi` and `steep_descent_mi`; in
+`score_route`, convert the metres to miles.
 
 ## After a run
 
@@ -168,6 +216,11 @@ in the miles repository.
 
 - Declaring a route "runnable" by grade alone, without the athlete's thresholds.
 - Hiding what a candidate trades away. Every candidate has a cost; name it.
+- Treating a survey as a promise. Sections are cut from map tags: name, surface, and
+  scenery are only as good as OpenStreetMap's, and a section's approach is measured from
+  the start you gave, not from where the athlete will park.
+- Storing a guess. Per-request adjustments are for what you know; stored ones are the
+  athlete's verdict or research with a link.
 - Mentioning seasonal closures, mud, or access rules as facts. The map data doesn't
   carry them; suggest checking with the land manager when it matters.
 - Prescribing training ("you should practice descents"). Describe the terrain and the

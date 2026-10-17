@@ -94,6 +94,9 @@ data doesn't carry them reliably), and measured traffic volume.
   shared with those already chosen. A time budget bounds the search, and when
   nothing qualifies the closest few come back with the constraints they miss.
   Results are reproducible per request.
+  **2026-10-17 amendment:** ADR 0004 makes search section-first: stored,
+  scored sections are surveyed before a search and routes are assembled
+  around them; the randomized walk becomes the fallback.
 - **Candidates are ephemeral until saved.** They live in a TTL'd table; saving
   one writes a GPX and a normal route, so everything in ADR 0002 applies.
 - **Drive-to starts** are trailheads and trail-adjacent public parking, timed

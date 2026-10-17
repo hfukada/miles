@@ -201,7 +201,7 @@ def connect() -> sqlite3.Connection:
 # ---------------------------------------------------------------------------
 
 
-def _grade_bin(grade_pct: float) -> int:
+def grade_bin(grade_pct: float) -> int:
     if grade_pct < GRADE_BIN_MIN_PCT:
         return 0
     if grade_pct >= GRADE_BIN_MAX_PCT:
@@ -217,7 +217,7 @@ def _bin_bounds(index: int) -> tuple[float, float]:
     return lo, hi
 
 
-def _bin_center(index: int) -> float:
+def bin_center(index: int) -> float:
     lo, hi = _bin_bounds(index)
     if math.isinf(lo):
         return hi - GRADE_BIN_WIDTH_PCT / 2
@@ -297,7 +297,7 @@ class TerrainModel:
         return "run"
 
     def expected_speed_mps(self, grade_pct: float, elapsed_s: float = 0.0, temp_c: float | None = None) -> float:
-        median_speed = self.bins[_grade_bin(grade_pct)].median_speed_mps
+        median_speed = self.bins[grade_bin(grade_pct)].median_speed_mps
         if median_speed is not None:
             base = median_speed
         else:
@@ -338,7 +338,7 @@ def default_model() -> TerrainModel:
     follows the Minetti cost curve from a ~9:00/mi flat pace."""
     bins: list[GradeBinStats] = []
     for index in range(N_GRADE_BINS):
-        center = _bin_center(index)
+        center = bin_center(index)
         speed = _DEFAULT_FLAT_SPEED_MPS / streams.minetti_cost_ratio(center)
         walk_fraction = 0.0 if center < _DEFAULT_WALK_ONSET_PCT else 1.0
         bins.append(GradeBinStats(index, speed, None, walk_fraction, 0))
@@ -432,7 +432,7 @@ _segment_generation = 0
 
 
 def _grade_bins(grades_pct: pd.Series) -> np.ndarray:
-    """_grade_bin over a column."""
+    """grade_bin over a column."""
     inner = 1 + np.floor((grades_pct.to_numpy(dtype=float) - GRADE_BIN_MIN_PCT) / GRADE_BIN_WIDTH_PCT)
     inner = np.where(grades_pct < GRADE_BIN_MIN_PCT, 0, inner)
     return np.where(grades_pct >= GRADE_BIN_MAX_PCT, N_GRADE_BINS - 1, inner).astype(int)
@@ -1216,7 +1216,7 @@ def _gap_analysis(model: TerrainModel, grades_pct: Sequence[float]) -> RouteGapA
     deficit: how far a bin's grade-adjusted efficiency falls below their best
     bin."""
     total = len(grades_pct)
-    histogram = Counter(_grade_bin(g) for g in grades_pct)
+    histogram = Counter(grade_bin(g) for g in grades_pct)
 
     efficiencies = [b.efficiency_median for b in model.bins if b.efficiency_median is not None]
     best_efficiency = max(efficiencies) if efficiencies else None
@@ -1309,7 +1309,7 @@ class ActivityTerrainAnalysis(TypedDict):
 
 
 def _percentile_at_grade(conn: sqlite3.Connection, grade_pct: float, speed_mps: float, window_days: int) -> float | None:
-    lo, hi = _bin_bounds(_grade_bin(grade_pct))
+    lo, hi = _bin_bounds(grade_bin(grade_pct))
     start_date = (date.today() - timedelta(days=window_days)).isoformat()
     rows = conn.execute(
         """

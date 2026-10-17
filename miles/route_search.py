@@ -18,12 +18,13 @@ import threading
 import time
 import uuid
 from collections import ChainMap, OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Collection, Iterable, Literal, Mapping, MutableMapping, Sequence, cast
+from typing import Collection, Iterable, Iterator, Literal, Mapping, MutableMapping, Sequence, cast
 from typing_extensions import NotRequired, TypedDict
 
-from . import areas, drive_starts, network, routes, routes_spatial, terrain
+from . import areas, drive_starts, network, routes, routes_spatial, sections, terrain
 
 Shape = Literal["loop", "out_and_back", "lollipop", "any"]
 
@@ -225,6 +226,13 @@ def _built_at(conn: sqlite3.Connection, area_id: int) -> str | None:
     row = conn.execute("SELECT built_at FROM net_graphs WHERE area_id = ?", [area_id]).fetchone()
     return row["built_at"] if row is not None else None
 
+
+# Candidate generation is CPU-bound against a wall-clock budget, so concurrent
+# searches would each get a fraction of their budget's computation. One runs at
+# a time per process and the others queue; each budget starts on acquisition.
+# Graph loading happens before the lock is taken and no loader ever takes it,
+# so the lock cannot take part in a cycle with the cache locks below.
+_search_lock = threading.Lock()
 
 # Searches run on worker threads. The first lock guards the cache and the build
 # locks and is never held during a load; a build lock lets concurrent searches
@@ -738,6 +746,60 @@ def resolve_starts(
     raise ValueError(f"find_routes needs start_lat/start_lng or a starts list")
 
 
+def require_searchable(conn: sqlite3.Connection, area_id: int) -> None:
+    """Raise ValueError unless the area's current network can be searched; an
+    outdated one starts rebuilding."""
+    area_status = conn.execute("SELECT status FROM areas WHERE area_id = ?", [area_id]).fetchone()
+    if area_status is not None and area_status["status"] != "ready":
+        # A failed or interrupted refresh leaves the committed graph searchable.
+        has_graph = conn.execute("SELECT 1 FROM net_graphs WHERE area_id = ?", [area_id]).fetchone()
+        if has_graph is None:
+            raise ValueError(
+                f"area {area_id} is not ready (status: {area_status['status']}); "
+                "check get_area_status and search again when it is ready"
+            )
+
+    if areas.rebuild_stale_network(conn, area_id):
+        raise ValueError(
+            f"area {area_id} is being rebuilt for a newer network model; "
+            "check get_area_status and search again when it is ready"
+        )
+
+
+@contextmanager
+def search_slot() -> Iterator[None]:
+    """Hold the process-wide search lock, for work that competes with a
+    search for CPU (a survey's shortest-path pass)."""
+    with _search_lock:
+        yield
+
+
+def load_search_graph(conn: sqlite3.Connection, area_id: int) -> tuple[SearchGraph, dict[int, dict]]:
+    """The area's cached graph and edge rows, loading them if needed. Load
+    before search_slot: a load must never wait on, or be waited on by, the
+    search lock."""
+    return _cached_base_graph(conn, area_id)
+
+
+def start_graph(
+    loaded: tuple[SearchGraph, dict[int, dict]], lat: float, lng: float, radius_m: float, remove_way_ids: set[int]
+) -> tuple[SearchGraph, MutableMapping[int, dict], int | None]:
+    """A request-local copy of a load_search_graph result without
+    remove_way_ids' edges and with nothing farther than radius_m from
+    (lat, lng), plus that point spliced in. Returns the graph, its edge rows
+    (the shared cache layered under the splice's own), and the start's node
+    id (None when no edge lies within START_SNAP_RADIUS_M). Call it inside
+    search_slot."""
+    base_graph, cached_edge_rows = loaded
+    graph = _copy_graph(base_graph)
+    _remove_ways(graph, cached_edge_rows, remove_way_ids)
+    edge_rows: MutableMapping[int, dict] = ChainMap({}, cached_edge_rows)
+    _bound_graph(graph, [(lat, lng)], radius_m)
+    ids = itertools.count(-1, -1)
+    node_id = _splice_start(graph, edge_rows, _edge_index(edge_rows, graph.edges_by_key), lat, lng, ids)
+    return graph, edge_rows, node_id
+
+
 def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteSearchResult:
     starts_in = request["starts"]
     if not starts_in:
@@ -760,94 +822,83 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         seed = _default_seed(request)
     rng = random.Random(seed)
 
-    area_status = conn.execute("SELECT status FROM areas WHERE area_id = ?", [area_id]).fetchone()
-    if area_status is not None and area_status["status"] != "ready":
-        # A failed or interrupted refresh leaves the committed graph searchable.
-        has_graph = conn.execute("SELECT 1 FROM net_graphs WHERE area_id = ?", [area_id]).fetchone()
-        if has_graph is None:
-            raise ValueError(
-                f"area {area_id} is not ready (status: {area_status['status']}); "
-                "check get_area_status and search again when it is ready"
-            )
-
-    if areas.rebuild_stale_network(conn, area_id):
-        raise ValueError(
-            f"area {area_id} is being rebuilt for a newer network model; "
-            "check get_area_status and search again when it is ready"
-        )
+    require_searchable(conn, area_id)
 
     prefs = network.get_route_preferences(conn)
     model = terrain.current_model(conn)
     runnability = model.score_profile
 
     base_graph, cached_edge_rows = _cached_base_graph(conn, area_id)
-    graph = _copy_graph(base_graph)
-    # Avoided ways leave the graph entirely, so no candidate can touch one.
-    avoid_way_ids = set(request.get("avoid_way_ids") or []) | network.avoided_way_ids(conn)
-    _remove_ways(graph, cached_edge_rows, avoid_way_ids)
-    # Layered so splicing's synthetic rows stay request-local, off the shared cache.
-    edge_rows: MutableMapping[int, dict] = ChainMap({}, cached_edge_rows)
-    target_m = (request["distance_m_min"] + request["distance_m_max"]) / 2.0
-    radius_m = request["distance_m_max"] / 2.0
-    _bound_graph(graph, [(s["lat"], s["lng"]) for s in starts_in], radius_m)
+    with _search_lock:
+        graph = _copy_graph(base_graph)
+        # Avoided ways leave the graph entirely, so no candidate can touch one.
+        avoid_way_ids = (
+            set(request.get("avoid_way_ids") or []) | network.avoided_way_ids(conn) | sections.excluded_way_ids(conn)
+        )
+        _remove_ways(graph, cached_edge_rows, avoid_way_ids)
+        # Layered so splicing's synthetic rows stay request-local, off the shared cache.
+        edge_rows: MutableMapping[int, dict] = ChainMap({}, cached_edge_rows)
+        target_m = (request["distance_m_min"] + request["distance_m_max"]) / 2.0
+        radius_m = request["distance_m_max"] / 2.0
+        _bound_graph(graph, [(s["lat"], s["lng"]) for s in starts_in], radius_m)
 
-    ids = itertools.count(-1, -1)
-    start_index = _edge_index(edge_rows, graph.edges_by_key)
-    start_nodes: list[tuple[int, Start]] = []
-    for s in starts_in:
-        node_id = _splice_start(graph, edge_rows, start_index, s["lat"], s["lng"], ids)
-        if node_id is not None:
-            start_nodes.append((node_id, s))
-    if not start_nodes:
-        raise ValueError("no network found near any given start")
+        ids = itertools.count(-1, -1)
+        start_index = _edge_index(edge_rows, graph.edges_by_key)
+        start_nodes: list[tuple[int, Start]] = []
+        for s in starts_in:
+            node_id = _splice_start(graph, edge_rows, start_index, s["lat"], s["lng"], ids)
+            if node_id is not None:
+                start_nodes.append((node_id, s))
+        if not start_nodes:
+            raise ValueError("no network found near any given start")
 
-    contract_degree2_chains(graph, ids, protected=[node_id for node_id, _ in start_nodes])
-    ctx = _SearchContext(graph=graph)
+        contract_degree2_chains(graph, ids, protected=[node_id for node_id, _ in start_nodes])
+        ctx = _SearchContext(graph=graph)
 
-    # Handed to score_path as extra_edges so it never re-queries net_edges.
-    extra_edges = edge_rows
-    shapes_to_try: list[str] = [shape] if shape != "any" else ["loop", "out_and_back", "lollipop"]
+        # Handed to score_path as extra_edges so it never re-queries net_edges.
+        extra_edges = edge_rows
+        shapes_to_try: list[str] = [shape] if shape != "any" else ["loop", "out_and_back", "lollipop"]
 
-    deadline = time.monotonic() + time_budget_s
-    qualifying: dict[frozenset[int], _Candidate] = {}
-    near_misses: dict[frozenset[int], _Candidate] = {}
-    budget_exceeded = False
-    attempts = 0
-    # Generate well past n so diversification has a pool to choose from.
-    pool_target = n * POOL_FACTOR
-    attempts_since_new = 0
-    while len(qualifying) < pool_target and attempts < MAX_GENERATION_ATTEMPTS:
-        if len(qualifying) >= n and attempts_since_new >= STAGNATION_ATTEMPTS:
-            break
-        if time.monotonic() > deadline:
-            budget_exceeded = len(qualifying) < n
-            break
-        attempts += 1
-        attempts_since_new += 1
-        gen_shape = rng.choice(shapes_to_try)
-        start_node, start_info = rng.choice(start_nodes)
-        traversal = _GENERATORS[gen_shape](ctx, start_node, target_m, rng)
-        if not traversal:
-            continue
-        segments = _flatten(traversal)
-        if not segments:
-            continue
-        try:
-            score = cast(dict, network.score_path(conn, area_id, segments, prefs, runnability, extra_edges=extra_edges))
-        except ValueError:
-            continue
-        if score["road_exposure"]["violations"]:
-            continue
-        touched_way_ids = {edge_rows[eid]["way_id"] for eid, _ in segments if eid in edge_rows}
-        misses = _soft_misses(score, request, touched_way_ids)
-        candidate = _Candidate(gen_shape, start_info, segments, score, misses)
-        # The same set of edges walked in either direction is one route.
-        identity = frozenset(eid for eid, _ in segments)
-        pool = near_misses if misses else qualifying
-        if identity not in pool:
-            pool[identity] = candidate
-            if not misses:
-                attempts_since_new = 0
+        deadline = time.monotonic() + time_budget_s
+        qualifying: dict[frozenset[int], _Candidate] = {}
+        near_misses: dict[frozenset[int], _Candidate] = {}
+        budget_exceeded = False
+        attempts = 0
+        # Generate well past n so diversification has a pool to choose from.
+        pool_target = n * POOL_FACTOR
+        attempts_since_new = 0
+        while len(qualifying) < pool_target and attempts < MAX_GENERATION_ATTEMPTS:
+            if len(qualifying) >= n and attempts_since_new >= STAGNATION_ATTEMPTS:
+                break
+            if time.monotonic() > deadline:
+                budget_exceeded = len(qualifying) < n
+                break
+            attempts += 1
+            attempts_since_new += 1
+            gen_shape = rng.choice(shapes_to_try)
+            start_node, start_info = rng.choice(start_nodes)
+            traversal = _GENERATORS[gen_shape](ctx, start_node, target_m, rng)
+            if not traversal:
+                continue
+            segments = _flatten(traversal)
+            if not segments:
+                continue
+            try:
+                score = cast(dict, network.score_path(conn, area_id, segments, prefs, runnability, extra_edges=extra_edges))
+            except ValueError:
+                continue
+            if score["road_exposure"]["violations"]:
+                continue
+            touched_way_ids = {edge_rows[eid]["way_id"] for eid, _ in segments if eid in edge_rows}
+            misses = _soft_misses(score, request, touched_way_ids)
+            candidate = _Candidate(gen_shape, start_info, segments, score, misses)
+            # The same set of edges walked in either direction is one route.
+            identity = frozenset(eid for eid, _ in segments)
+            pool = near_misses if misses else qualifying
+            if identity not in pool:
+                pool[identity] = candidate
+                if not misses:
+                    attempts_since_new = 0
 
     if qualifying:
         selected = _diversify(list(qualifying.values()), edge_rows, target_m, n)

@@ -500,7 +500,7 @@ def test_a_request_during_a_rebuild_is_turned_away_not_queued(conn: sqlite3.Conn
     ],
 )
 def test_grades_fall_into_numbered_bins_with_open_ends(grade: float, index: int, bounds: tuple[float, float]):
-    assert terrain._grade_bin(grade) == index
+    assert terrain.grade_bin(grade) == index
     assert terrain._bin_bounds(index) == bounds
 
 
@@ -541,7 +541,7 @@ def _reference_model(conn: sqlite3.Connection, window_days: int, as_of: date) ->
             terrain.pd.DataFrame, "from_records",
             classmethod(lambda cls, rows, columns: pd.DataFrame([dict(zip(columns, r)) for r in rows])),
         )
-        patch.setattr(terrain, "_grade_bins", lambda grades: grades.map(terrain._grade_bin).to_numpy())
+        patch.setattr(terrain, "_grade_bins", lambda grades: grades.map(terrain.grade_bin).to_numpy())
         return terrain._build_model(conn, window_days, as_of)
 
 
@@ -568,7 +568,7 @@ def test_the_vectorized_grade_bin_matches_the_scalar_one_at_every_edge():
     edges = [terrain.GRADE_BIN_MIN_PCT + i * terrain.GRADE_BIN_WIDTH_PCT for i in range(terrain.N_GRADE_BINS)]
     grades = sorted({g + d for g in edges for d in (-1e-9, 0.0, 1e-9, 0.1)} | {-80.0, -30.1, 29.9, 30.0, 30.1, 90.0})
     series = pd.Series(grades)
-    assert list(terrain._grade_bins(series)) == [terrain._grade_bin(g) for g in grades]
+    assert list(terrain._grade_bins(series)) == [terrain.grade_bin(g) for g in grades]
 
 
 def test_current_model_matches_the_row_at_a_time_build_across_every_bin_edge(conn: sqlite3.Connection):

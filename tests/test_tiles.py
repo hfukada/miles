@@ -38,3 +38,13 @@ def test_assign_elements_puts_a_way_in_every_tile_it_crosses_and_a_node_in_its_o
     assert tiles.assign_elements(unplaceable, [(0, 0)])[(0, 0)] == []
 
 
+def test_assign_elements_places_areas_and_relations_by_their_bounds():
+    (lat0, lng0), (lat1, lng1) = _middle_of(0, 0), _middle_of(1, 0)
+    across = {"type": "area", "id": 7, "tags": {"leisure": "park"}, "rings": [], "bounds": [lat0, lng0, lat1, lng1]}
+    within = {"type": "relation", "id": 8, "tags": {}, "members": [1], "bounds": [lat0, lng0, lat0 + 0.001, lng0 + 0.001]}
+    boundless = {"type": "area", "id": 9, "tags": {}, "rings": []}
+
+    buckets = tiles.assign_elements([across, within, boundless], [(0, 0), (1, 0)])
+
+    assert buckets[(0, 0)] == [across, within]
+    assert buckets[(1, 0)] == [across]

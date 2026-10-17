@@ -89,8 +89,8 @@ def register_terrain_tools(mcp: FastMCP) -> None:
         steep-descent distance, and a gap analysis (grade histogram weighted
         by the athlete's per-bin efficiency deficit: the grades most worth
         practicing). No elevation data returns has_elevation=false. Distances
-        (longest_hike_m, steep_descent_m) are metres; convert to miles or feet
-        when quoting.
+        (longest_hike_m, steep_descent_m) are metres along the route, not
+        vertical; quote them in miles.
         """
         with db.connection(terrain.connect) as conn:
             return json.dumps(terrain.score_route(conn, route_id))

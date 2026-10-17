@@ -15,8 +15,10 @@ from datetime import datetime, timezone
 from typing import NamedTuple
 
 # Bumped whenever the cut changes what a tile holds; gates a full re-cut.
-# v2 folds amenity=parking ways into point amenities.
-TILE_QUERY_VERSION = 2
+# v2 folds amenity=parking ways into point amenities. v3 adds scenery
+# (waterways, water bodies, parks and protected areas, peaks and viewpoints,
+# route relations).
+TILE_QUERY_VERSION = 3
 
 # highway values relevant to a runner: every foot/trail and road class.
 # Motorways are included only to measure how close a trail runs to one; they
@@ -35,7 +37,42 @@ NODE_TAGS = [
     ("amenity", "parking"),
     ("amenity", "drinking_water"),
     ("amenity", "toilets"),
+    ("tourism", "viewpoint"),
+    ("natural", "peak"),
 ]
+
+# Scenery kept beside the network, for sections' scenery tags. Waterways are
+# ways; water bodies, parks and protected areas are assembled polygons
+# ("area" elements: outer rings only, thinned); route relations list their
+# member ways.
+WATERWAY_VALUES = frozenset({"river", "stream", "canal"})
+ROUTE_RELATION_VALUES = frozenset({"hiking", "foot", "walking", "bicycle", "running"})
+PROTECTED_BOUNDARY_VALUES = frozenset({"protected_area", "national_park"})
+
+# Tags carried by scenery elements; the rest of an element's tags are dropped.
+SCENERY_TAG_KEYS = (
+    "name", "ref", "waterway", "natural", "water", "leisure", "boundary", "tourism", "route", "type", "network",
+)
+
+# Area polygons are thinned to this tolerance, and a body smaller than
+# AREA_MIN_EXTENT_M across is dropped.
+AREA_SIMPLIFY_TOLERANCE_M = 25.0
+AREA_MIN_EXTENT_M = 40.0
+
+
+def scenery_area_kind(tags: dict[str, str]) -> str | None:
+    """"water", "park", or "protected" for a polygon worth keeping, else None."""
+    if tags.get("natural") == "water" or tags.get("waterway") == "riverbank":
+        return "water"
+    if tags.get("boundary") in PROTECTED_BOUNDARY_VALUES or tags.get("leisure") == "nature_reserve":
+        return "protected"
+    if tags.get("leisure") == "park":
+        return "park"
+    return None
+
+
+def scenery_tags(tags: dict[str, str]) -> dict[str, str]:
+    return {k: v for k, v in tags.items() if k in SCENERY_TAG_KEYS}
 
 
 @contextmanager

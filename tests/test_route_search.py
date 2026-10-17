@@ -7,7 +7,7 @@ import time
 import pytest
 from helpers import FakeSampler, ImmediateThread, WayBuilder, climbing_sampler, lerp, none_sampler
 
-from miles import areas, network, route_search, routes as routes_service
+from miles import areas, db, network, route_search, routes as routes_service
 
 
 # A diamond-shaped trail ring (corners N/E/S/W, each side split into six
@@ -457,3 +457,49 @@ def test_budget_exceeded_is_reported_only_when_fewer_than_n_qualified(conn: sqli
     assert result["budget_exceeded"] is False
 
 
+
+
+def test_concurrent_searches_run_one_at_a_time_and_each_gets_its_full_budget(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    path = tmp_path / "search.db"
+    setup = db.connect(path)
+    db.init_db(setup)
+    _build_diamond_area(setup)
+    perimeter = _perimeter_length_m(setup, 1)
+    setup.close()
+
+    budget_s = 0.25
+    spans: list[tuple[int, float, float]] = []
+    record_lock = threading.Lock()
+
+    def slow_generator(ctx, start_node, target_m, rng):
+        started = time.monotonic()
+        time.sleep(0.01)
+        with record_lock:
+            spans.append((threading.get_ident(), started, time.monotonic()))
+        return None
+
+    monkeypatch.setattr(route_search, "_GENERATORS", {"loop": slow_generator})
+    monkeypatch.setattr(route_search, "MAX_GENERATION_ATTEMPTS", 10_000)
+    results: list[route_search.RouteSearchResult] = []
+
+    def search() -> None:
+        with db.connection(lambda: db.connect(path)) as conn:
+            results.append(route_search.find_routes(conn, _base_request(1, perimeter * 0.9, perimeter * 1.1, time_budget_s=budget_s)))
+
+    threads = [threading.Thread(target=search) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads)
+    assert len(results) == 2
+
+    spans.sort(key=lambda s: s[1])
+    for (_, _, previous_end), (_, next_start, _) in zip(spans, spans[1:]):
+        assert next_start >= previous_end
+    by_search: dict[int, list[tuple[float, float]]] = {}
+    for ident, started, ended in spans:
+        by_search.setdefault(ident, []).append((started, ended))
+    assert len(by_search) == 2
+    for calls in by_search.values():
+        assert calls[-1][1] - calls[0][0] >= budget_s * 0.8

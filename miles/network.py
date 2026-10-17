@@ -14,7 +14,8 @@ tier is computed from the current preference profile at score time, so a
 preference edit changes future scores with no graph rebuild.
 
 Rebuilt wholesale per area, gated by NETWORK_DERIVE_VERSION; the raw tile
-payloads (owned by area import) are the ground truth, not these tables.
+payloads (owned by area import) are the ground truth, not these tables. The
+area's sections (sections.py) are rebuilt in the same transaction.
 """
 
 import copy
@@ -26,13 +27,16 @@ import sqlite3
 import struct
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable, Hashable, Iterable, Mapping, MutableMapping, Sequence, cast
+from typing import TYPE_CHECKING, Callable, Hashable, Iterable, Mapping, MutableMapping, Sequence, cast
 from typing_extensions import TypedDict
 
 from . import gpx_parse, routes_spatial
 from .elevation import ElevationSampler
 
-NETWORK_DERIVE_VERSION = 8
+if TYPE_CHECKING:
+    from . import sections
+
+NETWORK_DERIVE_VERSION = 9
 
 # Paths with no vehicle traffic: they carry no road-comfort tier.
 TRAIL_HIGHWAYS = frozenset({"path", "footway", "bridleway", "steps", "cycleway"})
@@ -462,7 +466,7 @@ def _amenity_kind(tags: dict) -> str | None:
 _SEPARATION_LIFT = {"uncomfortable": "tolerable", "tolerable": "comfortable", "comfortable": "comfortable"}
 
 
-def _road_comfort_tier(
+def road_comfort_tier(
     highway: str,
     surface_class: str,
     maxspeed_mph: float,
@@ -711,10 +715,18 @@ def build_network(
     payloads: Iterable[dict],
     sampler: ElevationSampler,
 ) -> NetworkStats:
-    """Rebuild an area's graph wholesale from raw tile payloads in one
-    transaction; a failure rolls back to the previous graph."""
+    """Rebuild an area's graph and its sections wholesale from raw tile
+    payloads in one transaction; a failure rolls back to the previous ones."""
+    # sections imports this module, so it can only be imported here.
+    from . import sections
+
     try:
-        return _build_network(conn, area_id, payloads, sampler)
+        scenery = sections.Scenery()
+        stats = _build_network(conn, area_id, payloads, sampler, scenery)
+        # After _build_network returns, so its working set is already freed.
+        sections.rebuild_sections(conn, area_id, scenery)
+        conn.commit()
+        return stats
     except BaseException:
         conn.rollback()
         raise
@@ -725,15 +737,18 @@ def _build_network(
     area_id: int,
     payloads: Iterable[dict],
     sampler: ElevationSampler,
+    scenery: "sections.Scenery",
 ) -> NetworkStats:
-    """Tiles overlap, so a way can appear in several payloads; ways are deduped
-    by OSM id first."""
+    """Write the graph, uncommitted, and collect the payloads' scenery into
+    `scenery`. Tiles overlap, so a way can appear in several payloads; ways
+    are deduped by OSM id first."""
     ways: dict[int, dict] = {}
     node_coords: dict[int, tuple[float, float]] = {}
     amenity_nodes: dict[int, tuple[str, float, float, str | None]] = {}
 
     for payload in payloads:
         for el in payload.get("elements", []):
+            scenery.add(el)
             el_type = el.get("type")
             if el_type == "way":
                 way_id = el.get("id")
@@ -933,7 +948,7 @@ _EDGE_COLUMNS = (*_WAY_COLUMNS, "length_m", "has_elevation", "points_blob")
 def _replace_area_graph(
     conn: sqlite3.Connection, area_id: int, nodes: dict[int, dict], edges: list[dict], excluded_count: int
 ) -> None:
-    """Swap an area's nodes and edges for the given ones and commit."""
+    """Swap an area's nodes and edges for the given ones; the caller commits."""
     conn.execute("DELETE FROM net_edges WHERE area_id = ?", [area_id])
     conn.execute("DELETE FROM net_nodes WHERE area_id = ?", [area_id])
     first_id = conn.execute("SELECT COALESCE(MAX(node_id), 0) + 1 FROM net_nodes").fetchone()[0]
@@ -962,7 +977,6 @@ def _replace_area_graph(
         """,
         [area_id, NETWORK_DERIVE_VERSION, datetime.now(timezone.utc).isoformat(), len(nodes), len(edges), excluded_count],
     )
-    conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -1084,7 +1098,7 @@ def score_path(
         tier: str | None = None
         avoided_way_id: int | None = way_id if override == "avoid" else None
         if row["maxspeed_mph"] is not None:
-            tier = _road_comfort_tier(
+            tier = road_comfort_tier(
                 row["highway"], surface_class, row["maxspeed_mph"], row["lanes"], bool(row["has_separation"]), prefs
             )
             if override == "comfortable":

@@ -345,3 +345,56 @@ def _interp(a: float | None, b: float | None, frac: float) -> float | None:
     if a is None or b is None:
         return None
     return a + (b - a) * frac
+
+
+# Douglas-Peucker is quadratic on a pathologically jagged line, so a long one
+# is thinned in runs of this many points.
+_SIMPLIFY_RUN_POINTS = 500
+
+
+def simplify_polyline(points: list[tuple[float, float]], tolerance_m: float) -> list[tuple[float, float]]:
+    """Douglas-Peucker thinning of a (lat, lng) polyline: every dropped point
+    lies within tolerance_m of the kept line. Endpoints are always kept, so a
+    closed ring stays closed. Iterative, so a very long ring cannot overflow
+    the stack, and run by run, so a jagged one cannot take quadratic time."""
+    if len(points) <= _SIMPLIFY_RUN_POINTS:
+        return _simplify_run(points, tolerance_m)
+    out: list[tuple[float, float]] = []
+    for start in range(0, len(points) - 1, _SIMPLIFY_RUN_POINTS):
+        run = _simplify_run(points[start:start + _SIMPLIFY_RUN_POINTS + 1], tolerance_m)
+        out.extend(run if not out else run[1:])
+    return out
+
+
+def _simplify_run(points: list[tuple[float, float]], tolerance_m: float) -> list[tuple[float, float]]:
+    n = len(points)
+    if n <= 2:
+        return list(points)
+    ref_lat = points[0][0]
+    m_lng = meters_per_deg_lng(ref_lat)
+    xy = [((lng - points[0][1]) * m_lng, (lat - ref_lat) * METERS_PER_DEG_LAT) for lat, lng in points]
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        lo, hi = stack.pop()
+        if hi <= lo + 1:
+            continue
+        x0, y0 = xy[lo]
+        dx, dy = xy[hi][0] - x0, xy[hi][1] - y0
+        seg_len_sq = dx * dx + dy * dy
+        worst, worst_d = -1, tolerance_m
+        for i in range(lo + 1, hi):
+            px, py = xy[i][0] - x0, xy[i][1] - y0
+            if seg_len_sq == 0.0:
+                d = math.hypot(px, py)
+            else:
+                t = max(0.0, min(1.0, (px * dx + py * dy) / seg_len_sq))
+                d = math.hypot(px - t * dx, py - t * dy)
+            if d > worst_d:
+                worst, worst_d = i, d
+        if worst >= 0:
+            keep[worst] = True
+            stack.append((lo, worst))
+            stack.append((worst, hi))
+    return [p for p, k in zip(points, keep) if k]
