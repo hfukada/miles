@@ -9,6 +9,11 @@ ENV GIT_HASH=${GIT_HASH} \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy
 
+# The osmium wheel links the system expat, which the slim base image lacks.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-install-project --no-dev
 
