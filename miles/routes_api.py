@@ -9,7 +9,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
-from . import db, elevation, gpx_parse, routes as routes_service
+from . import db, elevation, gpx_parse, route_locations, routes as routes_service
 
 router = APIRouter()
 
@@ -122,6 +122,20 @@ def get_route(route_id: int) -> routes_service.RouteDetail:
         return routes_service.get_route(conn, route_id)
 
 
+class RouteLocation(BaseModel):
+    location: str | None
+
+
+@router.get("/api/routes/{route_id}/location")
+def get_route_location(route_id: int) -> RouteLocation:
+    """The route's place label, looked up from its start point the first time
+    it is asked for (a blocking call, so a plain def: FastAPI runs it on a
+    worker thread)."""
+    with db.connection(routes_service.connect) as conn:
+        routes_service.get_route(conn, route_id)
+        return RouteLocation(location=route_locations.resolve_location(conn, route_id))
+
+
 @router.get("/api/routes/{route_id}/gpx")
 def get_route_gpx(route_id: int) -> Response:
     with db.connection(routes_service.connect) as conn:
@@ -150,6 +164,7 @@ class RouteUpdateBody(BaseModel):
     notes: str | None = None
     tags: list[str] | None = None
     elevation_source: str | None = None
+    location: str | None = None
 
 
 @router.patch("/api/routes/{route_id}")
@@ -158,7 +173,7 @@ def patch_route(route_id: int, body: RouteUpdateBody) -> routes_service.RouteDet
         try:
             return routes_service.update_route(
                 conn, route_id, name=body.name, notes=body.notes, tags=body.tags,
-                elevation_source=body.elevation_source,
+                elevation_source=body.elevation_source, location=body.location,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

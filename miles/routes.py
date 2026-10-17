@@ -22,7 +22,7 @@ from typing import Literal, NamedTuple, cast
 from typing_extensions import NotRequired, TypedDict
 from xml.sax.saxutils import escape as xml_escape
 
-from . import db, elevation, gpx_parse, routes_spatial
+from . import db, elevation, gpx_parse, route_locations, routes_spatial
 from .fitness import FT_PER_M, MILE_M
 
 # Bumped for DEM draping (elevation_source preference, ele_source,
@@ -70,6 +70,7 @@ class RouteSummary(TypedDict):
     elevation_source: str
     ele_source: str | None
     elevation_pending: bool
+    location: str | None  # athlete-set, or looked up from the start point; an imported area's label stands in until then
     distance_m: float | None
     gain_m: float | None
     loss_m: float | None
@@ -462,7 +463,7 @@ def _apply_derived(
 # ---------------------------------------------------------------------------
 
 
-def _row_to_summary(row: sqlite3.Row) -> RouteSummary:
+def _row_to_summary(conn: sqlite3.Connection, row: sqlite3.Row) -> RouteSummary:
     return {
         "route_id": row["route_id"],
         "name": row["name"],
@@ -474,6 +475,7 @@ def _row_to_summary(row: sqlite3.Row) -> RouteSummary:
         "elevation_source": row["elevation_source"],
         "ele_source": row["ele_source"],
         "elevation_pending": bool(row["elevation_pending"]),
+        "location": route_locations.stored_or_area_label(conn, row),
         "distance_m": row["distance_m"],
         "gain_m": row["gain_m"],
         "loss_m": row["loss_m"],
@@ -521,7 +523,7 @@ def list_routes(
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY created_at DESC"
-    summaries = [_row_to_summary(r) for r in conn.execute(sql, params).fetchall()]
+    summaries = [_row_to_summary(conn, r) for r in conn.execute(sql, params).fetchall()]
 
     if tag:
         summaries = [s for s in summaries if tag in s["tags"]]
@@ -602,7 +604,7 @@ def get_route(conn: sqlite3.Connection, route_id: int) -> RouteDetail:
     if row["bbox_south"] is not None:
         bbox = [row["bbox_south"], row["bbox_west"], row["bbox_north"], row["bbox_east"]]
 
-    summary = _row_to_summary(row)
+    summary = _row_to_summary(conn, row)
     return {
         **summary,
         "file_id": row["file_id"],
@@ -655,10 +657,14 @@ def update_route(
     notes: str | None = None,
     tags: list[str] | None = None,
     elevation_source: str | None = None,
+    location: str | None = None,
 ) -> RouteDetail:
     """Partial update: only fields passed as non-None are changed. There is
     no way to blank out name/notes back to NULL through this call -- pass a
     new value instead; tags can be cleared with an empty list.
+
+    A non-empty location is the athlete's and is never replaced by a lookup;
+    an empty string clears it, so the next view looks the place up again.
 
     Changing elevation_source (auto/file/dem) re-derives the route's
     elevation at once from cached tiles only; a route that needs an uncached
@@ -676,6 +682,12 @@ def update_route(
     if tags is not None:
         sets.append("tags_json = ?")
         params.append(json.dumps(tags))
+    if location is not None:
+        label = location.strip()
+        sets.append("location = ?")
+        params.append(label or None)
+        sets.append("location_source = ?")
+        params.append(route_locations.SOURCE_ATHLETE if label else None)
     if elevation_source is not None:
         if elevation_source not in ELEVATION_SOURCE_PREFS:
             raise ValueError(f"elevation_source must be one of {ELEVATION_SOURCE_PREFS}, got {elevation_source!r}")

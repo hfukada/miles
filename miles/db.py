@@ -207,7 +207,7 @@ def connection(opener: Callable[[], sqlite3.Connection] | None = None) -> Iterat
         conn.close()
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def add_missing_columns(conn: sqlite3.Connection, table: str, *columns: str) -> bool:
@@ -556,6 +556,8 @@ def init_db(conn: sqlite3.Connection) -> None:
         "elevation_source TEXT NOT NULL DEFAULT 'auto'",
         "ele_source TEXT",
         "elevation_pending INTEGER NOT NULL DEFAULT 0",
+        "location TEXT",
+        "location_source TEXT",
     )
     conn.execute("""
         CREATE TABLE IF NOT EXISTS route_points (

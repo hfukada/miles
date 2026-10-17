@@ -67,10 +67,23 @@ date, or the cut time of tiles uploaded from a local file) and `refresh_suggeste
   until someone refreshes. A refresh of a place looked up less than a day ago
   returns the cached answer with a note, and one that fails leaves the cached
   answer in place. An unparseable response is an error and is not cached.
+- **Reverse geocoding:** one lookup (`/reverse`, zoom 14) of a route's start
+  point, made the first time its location is shown (the route page, or the
+  `get_route` tool) when it has none stored. The answer becomes a short label
+  (a named park or protected area, else the locality, then the state or
+  region) saved on the route as automatic; an athlete-set location is never
+  replaced. Answers, and "nothing there", are cached forever in
+  `reverse_geocode_cache`, keyed by the point rounded to three decimals
+  (about 100 m), so nearby routes share a lookup. Listing routes never calls
+  it, nothing runs in the background, and nothing geocodes in bulk. It uses
+  the same throttle as place lookups. Without `MILES_CONTACT`, or when
+  Nominatim fails, the label of an imported area containing the start point
+  stands in and nothing is stored, so the next view asks again.
 - **Attribution:** `import_area` returns the place's display name and
   "© OpenStreetMap contributors, ODbL" with the geocode, for whoever shows the
   result.
-- **Volume:** a handful of requests per new place; none for a repeat.
+- **Volume:** a handful of requests per new place, and one per route the first
+  time it is viewed; none for a repeat.
 - **Self-hosting:** `MILES_NOMINATIM_URL` (default
   `https://nominatim.openstreetmap.org/search`); another instance needs no
   contact setting.

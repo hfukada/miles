@@ -1,7 +1,9 @@
 """Nominatim geocoding, cached by normalized query text. Answers, and "no
 match", never expire; refresh=True looks a place up again, at most once a day.
-Requests go through http_client (rate cap and User-Agent); the public instance
-is refused until MILES_CONTACT is set. See docs/external-services.md.
+Reverse geocoding (a short place label for a point) is cached the same way,
+keyed by the point rounded to three decimals. Requests go through http_client
+(rate cap and User-Agent); the public instance is refused until MILES_CONTACT
+is set. See docs/external-services.md.
 """
 
 import json
@@ -33,6 +35,10 @@ class NoMatchError(GeocodeError):
     """Nominatim answered, and had nothing for the query."""
 
 
+class NotIdentifiedError(GeocodeError):
+    """The public Nominatim instance is refused until MILES_CONTACT is set."""
+
+
 class GeocodeResult(TypedDict):
     lat: float
     lng: float
@@ -50,7 +56,7 @@ def normalize_query(query: str) -> str:
 def _require_identification() -> None:
     host = urllib.parse.urlsplit(NOMINATIM_URL).hostname
     if host == PUBLIC_HOST and not os.environ.get(http_client.CONTACT_ENV, "").strip():
-        raise GeocodeError(
+        raise NotIdentifiedError(
             f"The public Nominatim instance requires an identifying contact: set {http_client.CONTACT_ENV} "
             "(an email address or URL) in the operator's environment, or point MILES_NOMINATIM_URL at "
             "another instance. Coordinates (lat and lng) work without it."
@@ -184,3 +190,94 @@ def geocode(conn: sqlite3.Connection, query: str, *, refresh: bool = False) -> t
     """(lat, lng) of lookup(): for callers that need only the coordinates."""
     result = lookup(conn, query, refresh=refresh)
     return (result["lat"], result["lng"])
+
+
+# ---------------------------------------------------------------------------
+# Reverse geocoding
+# ---------------------------------------------------------------------------
+
+# Address parts that name a protected area or park, most specific kind first.
+_PARK_KEYS = ("national_park", "protected_area", "nature_reserve", "park")
+_LOCALITY_KEYS = ("city", "town", "village", "hamlet", "suburb", "neighbourhood", "municipality")
+_REGION_KEYS = ("state", "region", "province", "state_district")
+
+
+def _reverse_url() -> str:
+    return NOMINATIM_URL.rsplit("/", 1)[0] + "/reverse"
+
+
+def reverse_key(lat: float, lng: float) -> str:
+    """The reverse cache key: the point rounded to three decimals (~100 m)."""
+    return f"{lat:.3f},{lng:.3f}"
+
+
+def format_location(address: dict[str, object]) -> str | None:
+    """A short label from a Nominatim address object: a named park or
+    protected area, else the locality, then the state or region; with neither
+    place, the county and region; None when nothing usable is present."""
+
+    def first(keys: tuple[str, ...]) -> str | None:
+        for key in keys:
+            value = address.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    place = first(_PARK_KEYS) or first(_LOCALITY_KEYS) or first(("county",))
+    region = first(_REGION_KEYS) or first(("country",))
+    parts = [part for part in (place, region) if part]
+    return ", ".join(parts) if parts else None
+
+
+def _fetch_reverse(lat: float, lng: float) -> str | None:
+    """The label for a point, or None when Nominatim has nothing there."""
+    _require_identification()
+    params = urllib.parse.urlencode(
+        {"lat": f"{lat:.5f}", "lon": f"{lng:.5f}", "format": "jsonv2", "zoom": 14, "addressdetails": 1}
+    )
+    try:
+        body = http_client.request(http_client.NOMINATIM, f"{_reverse_url()}?{params}")
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+        raise GeocodeError(f"Nominatim request failed: {e}") from e
+    try:
+        answer = json.loads(body)
+        if not isinstance(answer, dict):
+            raise TypeError("not an object")
+        if "error" in answer:
+            return None
+        address = answer.get("address") or {}
+        if not isinstance(address, dict):
+            raise TypeError("address is not an object")
+        return format_location(address)
+    except (ValueError, TypeError, AttributeError) as e:
+        raise GeocodeError(f"Nominatim returned an unusable response ({type(e).__name__})") from e
+
+
+def _cached_label(conn: sqlite3.Connection, key: str) -> tuple[bool, str | None]:
+    row = conn.execute("SELECT label FROM reverse_geocode_cache WHERE point = ?", (key,)).fetchone()
+    return (row is not None, row["label"] if row is not None else None)
+
+
+def reverse(conn: sqlite3.Connection, lat: float, lng: float) -> str | None:
+    """A short human label ("Example Town, Colorado") for a point, from cache
+    when present. None when Nominatim has no usable answer there, which is
+    cached too. Raises GeocodeError when it cannot be asked or fails; failures
+    are not cached."""
+    key = reverse_key(lat, lng)
+    found, label = _cached_label(conn, key)
+    if found:
+        metrics.cache("geocode", "hit")
+        return label
+    with _lock_for("reverse:" + key):
+        found, label = _cached_label(conn, key)
+        if found:
+            metrics.cache("geocode", "hit")
+            return label
+        metrics.cache("geocode", "miss")
+        label = _fetch_reverse(lat, lng)
+        conn.execute(
+            "INSERT OR REPLACE INTO reverse_geocode_cache (point, label, fetched_at) VALUES (?, ?, ?)",
+            (key, label, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        return label

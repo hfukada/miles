@@ -135,6 +135,13 @@ def init_area_schema(conn: sqlite3.Connection) -> None:
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS reverse_geocode_cache (
+            point      TEXT PRIMARY KEY,
+            label      TEXT,
+            fetched_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS areas (
             area_id            INTEGER PRIMARY KEY,
             label              TEXT NOT NULL,

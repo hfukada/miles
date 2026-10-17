@@ -66,6 +66,7 @@ def test_backfill_rewrites_start_date_to_local_wall_time_once_and_leaves_rows_wi
 # upgrade for existing databases written in init_db, and the new hash recorded.
 _SCHEMA_HASHES = {
     1: "aea5ae73e40fa9e1797a71628ba98d85203433a908c53572313b52db2ef83721",
+    2: "026d105719904fe53a70183f867fca94de39b6f86128bb8fce245dda37931648",
 }
 
 
@@ -91,7 +92,7 @@ _DEPLOYED_TABLES = {
     "plan_weeks", "plan_days", "plan_log", "plan_adherence", "gpx_files", "routes", "route_points",
     "route_waypoints", "route_climbs", "route_grade_bands", "route_legs",
 }
-_ADDED_ROUTE_COLUMNS = ("elevation_source", "ele_source", "elevation_pending")
+_ADDED_ROUTE_COLUMNS = ("elevation_source", "ele_source", "elevation_pending", "location", "location_source")
 
 
 def _layout(conn: sqlite3.Connection) -> dict[str, list[tuple[object, ...]]]:
@@ -131,6 +132,24 @@ def test_a_database_from_the_first_release_upgrades_to_the_schema_a_fresh_one_ge
     assert _start_date(old) == "2026-01-04T22:00:00"
     assert old.execute("SELECT committed_at FROM plan_versions").fetchone()["committed_at"] is None  # a draft stays a draft
     assert old.execute("SELECT elevation_source FROM routes").fetchall() == []
+
+
+def test_a_version_1_database_upgrades_to_the_schema_a_fresh_one_gets(conn: sqlite3.Connection, tmp_path: Path):
+    old = _release_database(tmp_path / "v1.db")
+    old.execute("ALTER TABLE routes ADD COLUMN elevation_source TEXT NOT NULL DEFAULT 'auto'")
+    old.execute("ALTER TABLE routes ADD COLUMN ele_source TEXT")
+    old.execute("ALTER TABLE routes ADD COLUMN elevation_pending INTEGER NOT NULL DEFAULT 0")
+    old.execute("INSERT INTO gpx_files (file_id, sha256, filename, data, uploaded_at) VALUES (1, 'x', 'a.gpx', x'00', '2026-01-01')")
+    old.execute("INSERT INTO routes (route_id, file_id, track_index, kind, name, created_at) VALUES (7, 1, 0, 'track', 'Ridge', '2026-01-01')")
+    old.execute("PRAGMA user_version = 1")
+    old.commit()
+
+    db.init_db(old)
+
+    assert _layout(old) == _layout(conn)
+    assert old.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    row = old.execute("SELECT name, location, location_source FROM routes WHERE route_id = 7").fetchone()
+    assert (row["name"], row["location"], row["location_source"]) == ("Ridge", None, None)
 
 
 class _RacingConnection:
@@ -201,7 +220,8 @@ def test_routes_deleted_by_the_first_release_stay_deleted_and_their_orphaned_row
     old = _release_database(tmp_path / "release.db")
     old.execute("CREATE TABLE route_tombstones (file_id INTEGER NOT NULL, track_index INTEGER NOT NULL, PRIMARY KEY (file_id, track_index))")
     db.add_missing_columns(
-        old, "routes", "elevation_source TEXT NOT NULL DEFAULT 'auto'", "ele_source TEXT", "elevation_pending INTEGER NOT NULL DEFAULT 0"
+        old, "routes", "elevation_source TEXT NOT NULL DEFAULT 'auto'", "ele_source TEXT", "elevation_pending INTEGER NOT NULL DEFAULT 0",
+            "location TEXT", "location_source TEXT",
     )
     kept = routes.upload_gpx(old, _gpx(lat0=10.0), "kept.gpx")[0]
     whole_file = routes.upload_gpx(old, _gpx(lat0=20.0), "whole.gpx")[0]

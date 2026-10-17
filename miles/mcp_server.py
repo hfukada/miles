@@ -7,7 +7,7 @@ from typing import Literal, Sequence, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import areas_mcp, db, elevation, outbound, outbound_mcp, routing_mcp
+from . import areas_mcp, db, elevation, outbound, outbound_mcp, route_locations, routing_mcp
 from . import routes as routes_service
 from .terrain_mcp import register_terrain_tools
 from .weather import ATTRIBUTION as WEATHER_ATTRIBUTION
@@ -2647,8 +2647,11 @@ def list_routes(
     has_elevation, elevation_source (the athlete's auto/file/dem
     preference), ele_source (which one is actually populating this route's
     elevation: file/dem/null), elevation_pending (a dem drape is still
-    waiting on tile coverage), distance_m, gain_m, loss_m, ft_per_mi,
-    shape, start_lat/start_lng for each match.
+    waiting on tile coverage), location (a short place label such as
+    "Example Town, Colorado": the stored one, else the label of an imported
+    area containing the start; never looked up here, so it can be null),
+    distance_m, gain_m, loss_m, ft_per_mi, shape, start_lat/start_lng for
+    each match.
     """
     conn = _routes_conn()
     rows = routes_service.list_routes(
@@ -2666,16 +2669,22 @@ def list_routes(
 
 
 @mcp.tool()
+@threaded
 @reporting(routes_service.RouteNotFoundError)
 def get_route(route_id: int) -> str:
     """
-    Full detail for one route: metadata (name, source, notes, tags),
-    derived stats (distance, gain/loss, ft_per_mi, bbox, shape), the
-    climb/descent segment list, the grade-band histogram, snapped
-    waypoints, and (for a composed route) its leg definition.
+    Full detail for one route: metadata (name, source, notes, tags,
+    location), derived stats (distance, gain/loss, ft_per_mi, bbox, shape),
+    the climb/descent segment list, the grade-band histogram, snapped
+    waypoints, and (for a composed route) its leg definition. A route with
+    no location yet gets one from a single reverse lookup of its start
+    point (cached; skipped when the operator has not configured a contact
+    for the geocoder).
     """
-    conn = _routes_conn()
-    return json.dumps(routes_service.get_route(conn, route_id))
+    with db.connection(routes_service.connect) as conn:
+        routes_service.get_route(conn, route_id)
+        route_locations.resolve_location(conn, route_id)
+        return json.dumps(routes_service.get_route(conn, route_id))
 
 
 @mcp.tool()
@@ -2772,11 +2781,13 @@ def update_route(
     notes: str | None = None,
     tags: str | None = None,
     elevation_source: str | None = None,
+    location: str | None = None,
 ) -> str:
     """
     Update a route's athlete-facing name, notes, tags (comma-separated;
-    pass an empty string to clear all tags), and/or elevation_source
-    (one of "auto", "file", "dem"). Only fields passed are changed;
+    pass an empty string to clear all tags), location (a short place label;
+    an empty string clears it so it is looked up again from the start
+    point), and/or elevation_source (one of "auto", "file", "dem"). Only fields passed are changed;
     omitted ones are left as they were. Everything else about a route
     (stats, points, climbs) is derived from its raw GPX and cached
     elevation, and isn't editable here.
@@ -2793,7 +2804,8 @@ def update_route(
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags is not None else None
     return json.dumps(
         routes_service.update_route(
-            conn, route_id, name=name, notes=notes, tags=tag_list, elevation_source=elevation_source
+            conn, route_id, name=name, notes=notes, tags=tag_list, elevation_source=elevation_source,
+            location=location,
         )
     )
 
