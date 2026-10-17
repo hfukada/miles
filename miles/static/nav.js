@@ -244,6 +244,7 @@ function chartTheme() {
     surface: v("--surface"),
     accent: v("--accent"),
     series: [1, 2, 3, 4, 5, 6, 7, 8].map((i) => v(`--series-${i}`)),
+    route: { run: v("--route-run"), grind: v("--route-grind"), hike: v("--route-hike"), neutral: v("--route-neutral") },
   };
 }
 

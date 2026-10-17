@@ -10,8 +10,17 @@
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
   <style>
-    .route-view .subtitle { margin-bottom: 0.75rem; }
+    .route-view .subtitle { margin-bottom: 0.25rem; }
+    .route-view .location { font-size: 0.8125rem; color: var(--text-secondary); margin-bottom: 0.75rem; min-height: 1.1rem; }
+    .route-view .location .skeleton { display: inline-block; width: 10rem; height: 0.8rem; vertical-align: -1px; }
+    .route-view .route-notes { font-size: 0.8125rem; color: var(--text-secondary); margin-bottom: 1rem; white-space: pre-wrap; }
     .route-view .note { font-size: 0.75rem; color: var(--muted); font-style: italic; margin-bottom: 1rem; }
+    .route-view .note button {
+      font: inherit; font-style: normal; margin-left: 0.5rem; padding: 0.1875rem 0.625rem;
+      color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+    }
+    .route-view .note button:disabled { color: var(--muted); cursor: default; }
+    .route-view .note .error { display: inline; padding: 0; margin-left: 0.5rem; font-style: normal; color: var(--series-6); }
 
     .route-view .chart-panel {
       background: var(--surface);
@@ -21,20 +30,23 @@
       margin-bottom: 1.25rem;
     }
     .route-view .chart-panel-title { font-size: 0.8125rem; font-weight: 600; color: var(--text); margin-bottom: 0.5rem; }
-    .route-view #map-route { height: 380px; border-radius: 6px; background: var(--bg); }
+    .route-view #map-route { height: 380px; border-radius: 6px; }
     .route-view #chart-elevation { height: 180px; }
+    .route-view #gap-body { min-height: 9rem; }
+    .route-view .stat .skeleton { height: 1.1rem; width: 2.75rem; margin-top: 0.125rem; }
     .route-view .leaflet-tile-pane { filter: saturate(0.85); }
 
-    .route-view .legend { display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-secondary); }
+    .route-view .legend { display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-secondary); min-height: 1rem; }
+    .route-view .legend .skeleton { width: 10rem; height: 0.75rem; }
     .route-view .legend .swatch {
       display: inline-block;
-      width: 0.625rem;
-      height: 0.625rem;
+      width: 1.25rem;
+      height: 0.25rem;
       border-radius: 2px;
       margin-right: 0.3125rem;
-      vertical-align: -1px;
+      vertical-align: 2px;
     }
-  </style>
+    </style>
 </head>
 <body>
 <script src="/nav.js"></script>
@@ -50,17 +62,40 @@
   const routeId = params.get('id');
   const root = document.getElementById('root');
   let routeMap = null;
+  let routeLayer = null;
   let elevChart = null;
+  let showId = 0;
+  let state = null;
 
   // Runnability classes read through the athlete's own terrain thresholds
   // (see terrain.py's classify_grade) — not a fixed grade-band scheme.
   const CLASS_LABEL = { run: 'Run', grind: 'Grind', hike: 'Hike' };
 
   function classColor(theme, cls) {
-    if (cls === 'run') return theme.series[3]; // green
-    if (cls === 'grind') return theme.series[2]; // amber
-    if (cls === 'hike') return theme.series[5]; // red
-    return theme.muted;
+    return theme.route[cls] ?? theme.route.neutral;
+  }
+
+  function esc(text) {
+    return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  async function failure(res) {
+    try {
+      const body = await res.json();
+      if (typeof body.detail === 'string') return body.detail;
+    } catch (e) { /* not JSON */ }
+    return `HTTP ${res.status}`;
+  }
+
+  // {data} or {error}: a failed fetch never throws, so each panel decides
+  // for itself what a failure means.
+  async function getJson(url) {
+    try {
+      const res = await fetch(url);
+      return res.ok ? { data: await res.json() } : { error: await failure(res) };
+    } catch (e) {
+      return { error: 'Network error.' };
+    }
   }
 
   async function main() {
@@ -68,93 +103,173 @@
       root.innerHTML = '<div class="error">No route id given. Use route.html?id=&lt;route_id&gt;.</div>';
       return;
     }
-
-    let route, profilePoints, terrainPoints, score;
-    try {
-      const [routeRes, profileRes, pointsRes, scoreRes] = await Promise.all([
-        fetch(`/api/routes/${routeId}`),
-        fetch(`/api/routes/${routeId}/profile`),
-        fetch(`/api/terrain/routes/${routeId}/points`),
-        fetch(`/api/terrain/routes/${routeId}`),
-      ]);
-      if (!routeRes.ok) throw new Error(routeRes.status === 404 ? 'Route not found.' : 'Failed to load route.');
-      route = await routeRes.json();
-      profilePoints = profileRes.ok ? await profileRes.json() : [];
-      terrainPoints = pointsRes.ok ? await pointsRes.json() : [];
-      score = scoreRes.ok ? await scoreRes.json() : null;
-    } catch (e) {
-      root.innerHTML = `<div class="error">${e.message}</div>`;
+    const profileP = getJson(`/api/routes/${routeId}/profile`);
+    const routeRes = await getJson(`/api/routes/${routeId}`);
+    if (routeRes.error) {
+      root.innerHTML = `<div class="error">${esc(routeRes.error === 'HTTP 404' || /^No route/.test(routeRes.error) ? 'Route not found.' : 'Failed to load route.')}</div>`;
       return;
     }
-
-    render(route, profilePoints, terrainPoints, score);
+    show(routeRes.data, profileP);
   }
 
-  function render(route, profilePoints, terrainPoints, score) {
+  // Draws the header and a skeleton for every panel at once, then fills each
+  // panel as its own request arrives.
+  function show(route, profileP = getJson(`/api/routes/${route.route_id}/profile`)) {
+    const id = ++showId;
+    const live = () => id === showId;
+    const hasElevation = !!route.has_elevation;
+    state = { route, profile: null, points: null, pointsError: null };
+    if (routeMap) { routeMap.remove(); routeMap = null; routeLayer = null; }
+    if (elevChart) { elevChart.dispose(); elevChart = null; }
+
     const distMi = route.distance_m != null ? (route.distance_m / MILE_METERS).toFixed(2) : '—';
     const gainFt = route.gain_m != null ? Math.round(route.gain_m * FT_PER_METER) : null;
     const lossFt = route.loss_m != null ? Math.round(route.loss_m * FT_PER_METER) : null;
-    const hasElevation = !!route.has_elevation;
+    const skeletonTile = (label) => `<div class="stat" data-pending><div class="stat-label">${label}</div><div class="skeleton"></div></div>`;
 
     root.innerHTML = `
-      <h1>${route.name ?? route.gpx_name ?? 'Untitled route'}</h1>
-      <div class="subtitle">${distMi} mi${route.shape ? ` · ${route.shape.replace(/_/g, ' ')}` : ''}${route.source ? ` · ${route.source}` : ''}</div>
-      ${!hasElevation ? '<div class="note">No elevation data for this route — runnability coloring is unavailable.</div>' : ''}
-      <div class="stat-strip" id="stat-strip"></div>
+      <h1>${esc(route.name ?? route.gpx_name ?? 'Untitled route')}</h1>
+      <div class="subtitle">${distMi} mi${route.shape ? ` · ${esc(route.shape.replace(/_/g, ' '))}` : ''}${route.source ? ` · ${esc(route.source)}` : ''}</div>
+      <div class="location" id="location"><span class="skeleton"></span></div>
+      ${route.notes ? `<div class="route-notes">${esc(route.notes)}</div>` : ''}
+      <div class="note" id="elev-note" ${hasElevation ? 'hidden' : ''}></div>
+      <div class="stat-strip" id="stat-strip">
+        ${statTile('Gain', gainFt != null ? gainFt : '—', 'ft')}
+        ${statTile('Loss', lossFt != null ? lossFt : '—', 'ft')}
+        ${hasElevation ? ['Run', 'Grind', 'Hike', 'Longest Hike', 'Steep Descent'].map(skeletonTile).join('') : ''}
+      </div>
       <div class="chart-panel">
         <div class="chart-panel-title">Route</div>
-        <div id="map-route"></div>
-        ${hasElevation ? legendHtml() : ''}
+        <div id="map-route" class="skeleton"></div>
+        ${hasElevation ? '<div class="legend" id="legend"><span class="skeleton"></span></div>' : ''}
       </div>
       <div class="chart-panel">
         <div class="chart-panel-title">Elevation</div>
-        <div id="chart-elevation"></div>
+        <div id="chart-elevation" class="skeleton"></div>
       </div>
-      <div id="gap-analysis"></div>
+      ${hasElevation ? `
+        <div class="chart-panel" id="gap-panel">
+          <div class="chart-panel-title">Course gap analysis</div>
+          <div id="gap-body" class="skeleton"></div>
+        </div>` : ''}
     `;
+    renderElevationNote(route);
 
-    renderStats(route, gainFt, lossFt, score);
-    const runs = classRuns(profilePoints, new Map(terrainPoints.map(p => [p.idx, p.cls])));
-    renderMap(runs);
-    renderElevation(profilePoints, runs);
-    if (score?.gap_analysis) renderGapAnalysis(score.gap_analysis);
+    getJson(`/api/routes/${route.route_id}/location`).then(res => {
+      if (!live()) return;
+      const text = res.data?.location ?? route.location;
+      const el = document.getElementById('location');
+      if (text) el.textContent = text;
+      else el.remove();
+    });
+
+    profileP.then(res => {
+      if (!live()) return;
+      if (res.error) {
+        panelError('map-route', `Could not load the route line: ${res.error}`);
+        panelError('chart-elevation', `Could not load the elevation profile: ${res.error}`);
+        return;
+      }
+      state.profile = res.data;
+      drawMap();
+      drawElevation();
+    });
+
+    if (!hasElevation) return;
+
+    getJson(`/api/terrain/routes/${route.route_id}/points`).then(res => {
+      if (!live()) return;
+      if (res.error) {
+        state.pointsError = res.error;
+      } else {
+        state.points = new Map(res.data.map(p => [p.idx, p.cls]));
+      }
+      renderLegend();
+      drawMap();
+      drawElevation();
+    });
+
+    getJson(`/api/terrain/routes/${route.route_id}`).then(res => {
+      if (!live()) return;
+      renderScore(res);
+    });
   }
 
-  function legendHtml() {
-    const theme = chartTheme();
-    return `
-      <div class="legend">
-        ${['run', 'grind', 'hike'].map(cls => `
-          <span><span class="swatch" style="background:${classColor(theme, cls)}"></span>${CLASS_LABEL[cls]}</span>
-        `).join('')}
-      </div>
-    `;
+  function panelError(id, message) {
+    const el = document.getElementById(id);
+    el.classList.remove('skeleton');
+    el.style.height = 'auto';
+    el.innerHTML = `<div class="error">${esc(message)}</div>`;
   }
 
-  function renderStats(route, gainFt, lossFt, score) {
+  // A route whose elevation tiles are not cached yet can fetch them on
+  // request; a route whose file simply has none cannot.
+  function renderElevationNote(route) {
+    const note = document.getElementById('elev-note');
+    if (route.has_elevation) return;
+    if (!route.elevation_pending) {
+      note.textContent = 'No elevation data for this route — runnability coloring is unavailable.';
+      return;
+    }
+    note.innerHTML = 'Elevation for this route has not been fetched yet — runnability coloring needs it. <button type="button">Fetch elevation</button><span id="redrape-error"></span>';
+    const button = note.querySelector('button');
+    button.addEventListener('click', async () => {
+      button.disabled = true;
+      button.textContent = 'Fetching elevation…';
+      document.getElementById('redrape-error').innerHTML = '';
+      try {
+        const res = await fetch(`/api/routes/${route.route_id}/redrape`, { method: 'POST' });
+        if (!res.ok) throw new Error(await failure(res));
+        show(await res.json());
+      } catch (e) {
+        button.disabled = false;
+        button.textContent = 'Fetch elevation';
+        document.getElementById('redrape-error').innerHTML = `<span class="error">${esc(e.message || 'Could not fetch elevation.')}</span>`;
+      }
+    });
+  }
+
+  function legendHtml(theme) {
+    return ['run', 'grind', 'hike'].map(cls => `
+      <span><span class="swatch" style="background:${classColor(theme, cls)}"></span>${CLASS_LABEL[cls]}</span>
+    `).join('');
+  }
+
+  function renderLegend() {
+    const legend = document.getElementById('legend');
+    if (!legend) return;
+    legend.innerHTML = state.points
+      ? legendHtml(chartTheme())
+      : `<span>Runnability colors unavailable: ${esc(state.pointsError)}</span>`;
+  }
+
+  function renderScore(res) {
     const strip = document.getElementById('stat-strip');
-    const tiles = [
-      statTile('Gain', gainFt != null ? gainFt : '—', 'ft'),
-      statTile('Loss', lossFt != null ? lossFt : '—', 'ft'),
-    ];
-    if (score?.runnability) {
+    strip.querySelectorAll('[data-pending]').forEach(el => el.remove());
+    const score = res.data;
+    if (res.error || !score?.runnability) {
+      if (res.error) strip.insertAdjacentHTML('beforeend', statTile('Runnability', '—', '', `Unavailable: ${esc(res.error)}`));
+    } else {
       const r = score.runnability;
-      tiles.push(
+      strip.insertAdjacentHTML('beforeend', [
         statTile('Run', r.run_pct.toFixed(0), '%'),
         statTile('Grind', r.grind_pct.toFixed(0), '%'),
         statTile('Hike', r.hike_pct.toFixed(0), '%'),
         statTile('Longest Hike', (r.longest_hike_m / MILE_METERS).toFixed(2), 'mi'),
         statTile('Steep Descent', (r.steep_descent_m / MILE_METERS).toFixed(2), 'mi'),
-      );
+      ].join(''));
     }
-    strip.innerHTML = tiles.join('');
+    if (res.error) panelError('gap-body', `Could not load the gap analysis: ${res.error}`);
+    else if (score?.gap_analysis) renderGapAnalysis(score.gap_analysis);
+    else document.getElementById('gap-panel').remove();
   }
 
-  // Runs of consecutive profile points sharing a terrain class.
+  // Runs of consecutive profile points sharing a terrain class; every point
+  // is one run of class null until the classes arrive.
   function classRuns(points, clsByIdx) {
     const runs = [];
     for (const p of points) {
-      const cls = clsByIdx.get(p.idx) ?? null;
+      const cls = clsByIdx?.get(p.idx) ?? null;
       const last = runs[runs.length - 1];
       if (last && last.cls === cls) last.points.push(p);
       else runs.push({ cls, points: [p] });
@@ -173,25 +288,30 @@
       .filter(g => g.latlngs.length > 1);
   }
 
-  function renderMap(runs) {
-    if (!runs.length) return;
+  function drawMap() {
+    if (!state.profile?.length) return;
+    const el = document.getElementById('map-route');
     if (typeof L === 'undefined') {
-      document.getElementById('map-route').innerHTML = '<div class="error">The map library did not load.</div>';
+      panelError('map-route', 'The map library did not load.');
       return;
     }
     const theme = chartTheme();
-    if (routeMap) { routeMap.remove(); routeMap = null; }
-    routeMap = L.map('map-route', { scrollWheelZoom: false });
-
-    addBaseLayer(routeMap, { withTerrainData: true });
-
-    const groups = groupByClass(runs);
-    const allLatLngs = [];
-    for (const g of groups) {
-      L.polyline(g.latlngs, { color: classColor(theme, g.cls), weight: 4, opacity: 0.9 }).addTo(routeMap);
-      allLatLngs.push(...g.latlngs);
+    const first = !routeMap;
+    if (first) {
+      el.classList.remove('skeleton');
+      routeMap = L.map('map-route', { scrollWheelZoom: false });
+      addBaseLayer(routeMap, { withTerrainData: true });
+      routeLayer = L.layerGroup().addTo(routeMap);
     }
+    routeLayer.clearLayers();
+
+    const groups = groupByClass(classRuns(state.profile, state.points));
+    const allLatLngs = groups.flatMap(g => g.latlngs);
     if (!allLatLngs.length) return;
+
+    // White casings first, so a neighboring segment never covers another's color.
+    for (const g of groups) L.polyline(g.latlngs, { color: '#ffffff', weight: 7, opacity: 0.9, lineCap: 'round' }).addTo(routeLayer);
+    for (const g of groups) L.polyline(g.latlngs, { color: classColor(theme, g.cls), weight: 4, opacity: 1, lineCap: 'round' }).addTo(routeLayer);
 
     const dotIcon = (fill) => L.divIcon({
       className: '',
@@ -199,40 +319,43 @@
       iconSize: [16, 16],
       iconAnchor: [8, 8],
     });
-    L.marker(allLatLngs[0], { icon: dotIcon('#22c55e') }).addTo(routeMap);
-    L.marker(allLatLngs[allLatLngs.length - 1], { icon: dotIcon('#111') }).addTo(routeMap);
+    L.marker(allLatLngs[0], { icon: dotIcon('#22c55e'), zIndexOffset: 1000 }).addTo(routeLayer);
+    L.marker(allLatLngs[allLatLngs.length - 1], { icon: dotIcon('#111'), zIndexOffset: 1000 }).addTo(routeLayer);
 
-    routeMap.fitBounds(L.latLngBounds(allLatLngs), { padding: [16, 16] });
+    if (first) routeMap.fitBounds(L.latLngBounds(allLatLngs), { padding: [16, 16] });
   }
 
-  function renderElevation(profilePoints, runs) {
-    const withEle = profilePoints.filter(p => p.ele_m != null);
-    if (withEle.length < 2) {
-      document.getElementById('chart-elevation').innerHTML = '<div class="error">No elevation profile available.</div>';
+  function drawElevation() {
+    const profilePoints = state.profile;
+    if (!profilePoints) return;
+    const el = document.getElementById('chart-elevation');
+    if (profilePoints.filter(p => p.ele_m != null).length < 2) {
+      panelError('chart-elevation', 'No elevation profile available.');
       return;
     }
+    el.classList.remove('skeleton');
     const theme = chartTheme();
     const data = profilePoints.map(p => [p.dist_m / MILE_METERS, p.ele_m != null ? p.ele_m * FT_PER_METER : null]);
 
     // markArea bands colored by class, spanning each contiguous run's
     // distance range, drawn under a single neutral elevation line.
-    const distBands = runs.map((run, i) => {
-      const last = run.points[run.points.length - 1];
-      return {
-        cls: run.cls,
-        start: run.points[0].dist_m / MILE_METERS,
-        end: (runs[i + 1] ? runs[i + 1].points[0] : last).dist_m / MILE_METERS,
-      };
-    });
-
-    const markAreaData = distBands
+    const runs = classRuns(profilePoints, state.points);
+    const markAreaData = runs
+      .map((run, i) => {
+        const last = run.points[run.points.length - 1];
+        return {
+          cls: run.cls,
+          start: run.points[0].dist_m / MILE_METERS,
+          end: (runs[i + 1] ? runs[i + 1].points[0] : last).dist_m / MILE_METERS,
+        };
+      })
       .filter(b => b.cls != null)
       .map(b => [
-        { xAxis: b.start, itemStyle: { color: classColor(theme, b.cls), opacity: 0.18 } },
+        { xAxis: b.start, itemStyle: { color: classColor(theme, b.cls), opacity: 0.22 } },
         { xAxis: b.end },
       ]);
 
-    if (!elevChart) elevChart = echarts.init(document.getElementById('chart-elevation'));
+    if (!elevChart) elevChart = echarts.init(el);
     elevChart.setOption({
       animation: false,
       grid: { top: 12, right: 24, bottom: 32, left: 56 },
@@ -247,7 +370,7 @@
         axisLine: { lineStyle: { color: theme.gridline } },
         splitLine: { show: false },
       }),
-      yAxis: chartValueAxis(theme, { name: 'ft' }),
+      yAxis: chartValueAxis(theme, { name: 'ft', scale: true }),
       series: [{
         name: 'Elevation',
         type: 'line',
@@ -257,12 +380,11 @@
         lineStyle: { width: 1.25, color: theme.text },
         markArea: markAreaData.length ? { silent: true, data: markAreaData } : undefined,
       }],
-    });
+    }, true);
   }
 
   function renderGapAnalysis(gap) {
-    const bins = gap.bins;
-    const rows = bins.map(b => `
+    const rows = gap.bins.map(b => `
       <tr>
         <td>${gradeBinLabel(b)}</td>
         <td class="r">${(b.course_share * 100).toFixed(1)}%</td>
@@ -270,25 +392,24 @@
         <td class="r">${b.weighted_deficit != null ? `${(b.weighted_deficit * 100).toFixed(1)}%` : '—'}</td>
       </tr>
     `).join('');
-    document.getElementById('gap-analysis').innerHTML = `
-      <div class="chart-panel">
-        <div class="chart-panel-title">Course gap analysis</div>
-        <div class="desc" style="margin-bottom:0.5rem">
-          This course's grade histogram weighted by the athlete's own per-bin efficiency deficit — the grades most worth practicing.
-        </div>
-        <div class="scroll dense">
-          <table>
-            <thead>
-              <tr>
-                <th>Grade</th>
-                <th class="r">Share of course</th>
-                <th class="r">Deficit</th>
-                <th class="r">Weighted deficit</th>
-              </tr>
-            </thead>
-            <tbody>${rows}</tbody>
-          </table>
-        </div>
+    const body = document.getElementById('gap-body');
+    body.classList.remove('skeleton');
+    body.innerHTML = `
+      <div class="desc" style="margin-bottom:0.5rem">
+        This course's grade histogram weighted by the athlete's own per-bin efficiency deficit — the grades most worth practicing.
+      </div>
+      <div class="scroll dense">
+        <table>
+          <thead>
+            <tr>
+              <th>Grade</th>
+              <th class="r">Share of course</th>
+              <th class="r">Deficit</th>
+              <th class="r">Weighted deficit</th>
+            </tr>
+          </thead>
+          <tbody>${rows}</tbody>
+        </table>
       </div>
     `;
   }
