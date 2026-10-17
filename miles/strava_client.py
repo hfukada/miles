@@ -89,38 +89,48 @@ WINDOW_S = 900
 
 @dataclass(frozen=True)
 class _RateObservation:
-    """What the most recent rate-limit headers said, and when. Strava's
-    windows are fixed: 15 minutes aligned to the hour, and the UTC day."""
+    """What the most recent rate-limit headers said, and when, alongside how
+    many calls the tally had counted by then (the reading's own response
+    included). Strava's windows are fixed: 15 minutes aligned to the hour, and
+    the UTC day."""
 
     daily_remaining: int
-    daily_limit: int
     short_remaining: int
-    short_limit: int
     at: datetime
+    daily_counted: int
+    short_counted: int
 
 
 @dataclass
-class _CallsSince:
-    """Requests sent since the last rate-limit reading whose responses carried
-    no rate-limit headers (stream responses never do). Each count belongs to
-    the UTC day or 15-minute window it was made in and restarts when that
-    rolls over."""
+class _Tally:
+    """Every response this process, or an earlier one sharing the database,
+    has had from Strava in the current UTC day and 15-minute window, headers
+    or not (stream responses carry none, and Strava's header usage appears
+    not to include them). Each count restarts when its day or window rolls
+    over. The limits are those of the latest reading."""
 
     day: date
     window: int
     daily: int = 0
     short: int = 0
+    daily_limit: int | None = None
+    short_limit: int | None = None
 
 
 _observation: _RateObservation | None = None
-_calls_since: _CallsSince | None = None
+_tally: _Tally | None = None
+_seeded = False
 _rate_lock = threading.Lock()
 
 STRAVA_HOST = "www.strava.com"
 
-# Called with (daily_remaining, short_window_remaining) after each response
-# that carried rate-limit headers; outbound.claim() points it at the database.
-rate_sink: Callable[[int, int], None] | None = None
+# Called with (daily_remaining, short_window_remaining, counts) after each
+# response once a limit is known, where counts is what rate_source returns;
+# outbound.claim() points it at the database.
+rate_sink: Callable[[int, int, dict[str, object]], None] | None = None
+# Returns the counts rate_sink last stored, so a new process resumes the
+# tally of the window and day it starts in. Read once per process.
+rate_source: Callable[[], dict[str, object] | None] | None = None
 
 
 def _now() -> datetime:
@@ -166,8 +176,9 @@ def _transport_errors(kind: str) -> Iterator[None]:
 def _on_response(response: requests.Response, **_: object) -> None:
     """Runs for every response from the Strava API, before its status is
     checked: counts it in the request ledger by endpoint kind and status,
-    records the rate-limit headers, and drops the access token on a 401."""
-    global _observation, _calls_since
+    tallies it against the allowance, records the rate-limit headers, and
+    drops the access token on a 401."""
+    global _observation
     status = response.status_code
     _report(_kind_of(urlsplit(response.url).path), status)
     rate = get_rates_from_response_headers(
@@ -175,17 +186,17 @@ def _on_response(response: requests.Response, **_: object) -> None:
     )
     now = _now()
     with _rate_lock:
+        _seed()
+        tally = _count_call(now)
         if rate is not None:
             _observation = _RateObservation(
-                rate.long_limit - rate.long_usage, rate.long_limit, rate.short_limit - rate.short_usage, rate.short_limit, now
+                rate.long_limit - rate.long_usage, rate.short_limit - rate.short_usage, now, tally.daily, tally.short
             )
-            _calls_since = _CallsSince(now.date(), _window(now))
-        else:
-            _count_call(now)
-    daily = daily_calls_remaining()
-    short = short_window_calls_remaining()
-    if rate_sink is not None and daily is not None and short is not None:
-        rate_sink(daily, short)
+            tally.daily_limit, tally.short_limit = rate.long_limit, rate.short_limit
+        left = _remaining(now)
+        counts = _persisted(tally)
+    if rate_sink is not None and left is not None:
+        rate_sink(left[0], left[1], counts)
     if status == 401:
         _forget_access_token()
         http_client.report_outcome("strava", 401)
@@ -195,50 +206,116 @@ def _window(when: datetime) -> int:
     return int(when.timestamp() // WINDOW_S)
 
 
-def _count_call(now: datetime) -> None:
-    """Count one response that reported no allowance. Caller holds _rate_lock."""
-    global _calls_since
-    counts = _calls_since
-    if counts is None:
-        counts = _calls_since = _CallsSince(now.date(), _window(now))
-    if counts.day != now.date():
-        counts.day, counts.daily = now.date(), 0
-    if counts.window != _window(now):
-        counts.window, counts.short = _window(now), 0
-    counts.daily += 1
-    counts.short += 1
+def _count_call(now: datetime) -> _Tally:
+    """Count one response. Caller holds _rate_lock."""
+    global _tally
+    tally = _roll(now)
+    tally.daily += 1
+    tally.short += 1
+    return tally
+
+
+def _roll(now: datetime) -> _Tally:
+    """The tally, started or restarted for the day and window `now` is in.
+    Caller holds _rate_lock."""
+    global _tally
+    tally = _tally
+    if tally is None:
+        tally = _tally = _Tally(now.date(), _window(now))
+    if tally.day != now.date():
+        tally.day, tally.daily = now.date(), 0
+    if tally.window != _window(now):
+        tally.window, tally.short = _window(now), 0
+    return tally
+
+
+def _persisted(tally: _Tally) -> dict[str, object]:
+    return {
+        "day": tally.day.isoformat(),
+        "daily": tally.daily,
+        "daily_limit": tally.daily_limit,
+        "window": tally.window,
+        "short": tally.short,
+        "short_limit": tally.short_limit,
+    }
+
+
+def _seed() -> None:
+    """Once per process, resume the counts an earlier process stored. Counts
+    from another day or window are dropped; the limits are kept. Caller holds
+    _rate_lock."""
+    global _tally, _seeded
+    if _seeded:
+        return
+    _seeded = True
+    if rate_source is None:
+        return
+    try:
+        stored = rate_source()
+        if not stored:
+            return
+        now = _now()
+        tally = _Tally(
+            now.date(),
+            _window(now),
+            daily_limit=_optional_int(stored.get("daily_limit")),
+            short_limit=_optional_int(stored.get("short_limit")),
+        )
+        if stored.get("day") == tally.day.isoformat():
+            tally.daily = max(0, int(cast(int, stored["daily"])))
+        if stored.get("window") == tally.window:
+            tally.short = max(0, int(cast(int, stored["short"])))
+    except (KeyError, TypeError, ValueError):
+        _logger.warning("ignoring a malformed stored Strava tally")
+        return
+    _tally = tally
+
+
+def _optional_int(value: object) -> int | None:
+    return None if value is None else int(cast(int, value))
+
+
+def _remaining(now: datetime) -> tuple[int, int] | None:
+    """(daily, short-window) calls left, None while no limit is known. Each is
+    the smaller of the limit less the calls tallied in the current day or
+    window, and the latest reading's figure less the calls tallied since it
+    (a reading from an earlier day or window no longer applies). A reading
+    therefore never lifts the figure above what the tally says remains.
+    Caller holds _rate_lock."""
+    tally = _tally
+    if tally is None or tally.daily_limit is None or tally.short_limit is None:
+        return None
+    daily_limit, short_limit = tally.daily_limit, tally.short_limit
+    tally = _roll(now)
+    daily = daily_limit - tally.daily
+    short = short_limit - tally.short
+    seen = _observation
+    if seen is not None:
+        if seen.at.date() == now.date():
+            daily = min(daily, seen.daily_remaining - (tally.daily - seen.daily_counted))
+        if _window(seen.at) == tally.window:
+            short = min(short, seen.short_remaining - (tally.short - seen.short_counted))
+    return max(0, daily), max(0, short)
 
 
 def daily_calls_remaining() -> int | None:
-    """Daily Strava API calls left: the most recent response headers' figure
-    less the requests sent since without headers. The daily allowance is whole
-    again at midnight UTC, so once the day has changed since the reading it is
-    the reading's daily limit less the calls made today. None before any
-    reading."""
+    """Daily Strava API calls left: the smaller of the daily limit less the
+    calls made today and the latest response headers' figure less the calls
+    since. None until a limit is known (from a response, or an earlier
+    process's stored tally)."""
     with _rate_lock:
-        seen, counts = _observation, _calls_since
-        if seen is None:
-            return None
-        today = _now().date()
-        spent = counts.daily if counts is not None and counts.day == today else 0
-        base = seen.daily_remaining if seen.at.date() == today else seen.daily_limit
-        return max(0, base - spent)
+        _seed()
+        left = _remaining(_now())
+        return None if left is None else left[0]
 
 
 def short_window_calls_remaining() -> int | None:
-    """Calls left in the current 15-minute window: the latest reading less the
-    requests sent since without headers. A window that has ended since the
-    reading is whole again, less what was sent in the current one. None before
-    any reading."""
+    """Calls left in the current 15-minute window, by the same rule as
+    daily_calls_remaining. None until a limit is known."""
     with _rate_lock:
-        seen, counts = _observation, _calls_since
-        if seen is None:
-            return None
-        now = _now()
-        window = _window(now)
-        spent = counts.short if counts is not None and counts.window == window else 0
-        base = seen.short_remaining if _window(seen.at) == window else seen.short_limit
-        return max(0, base - spent)
+        _seed()
+        left = _remaining(_now())
+        return None if left is None else left[1]
 
 
 class _TimeoutAdapter(HTTPAdapter):

@@ -252,15 +252,25 @@ date, or the cut time of tiles uploaded from a local file) and `refresh_suggeste
   out after 30 seconds.
 - **Allowance bookkeeping:** miles replaces stravalib's built-in rate limiter
   (which can sleep a request until the next UTC midnight) with one that has no
-  rules; a response hook on the API session records the headers. Streams responses
-  (almost all of a history backfill) carry no rate-limit headers, so the hook also
-  counts each response without them, whatever its status (a 429 counts), and the
-  remaining figures are the last header reading less that count. A fresh reading
-  replaces both. The token endpoint is not on that session and is not counted.
-  The reading is aged by the clock: a 15-minute window that has ended counts as
-  whole again, less the calls made in the new one, and likewise the daily
-  allowance after midnight UTC (the last reading's daily limit less the calls
-  made today). With no reading yet, nothing is known and
+  rules; a response hook on the API session records the headers and tallies
+  every response, whatever its status (a 429 counts). Streams responses (almost
+  all of a history backfill) carry no rate-limit headers, and Strava's header
+  usage appears not to include them, so a header reading alone would show a
+  nearly untouched allowance after a restart. The rule is therefore: remaining =
+  min(limit less the calls tallied in the current window or UTC day, the latest
+  reading's figure less the calls tallied since it). A reading can lower the
+  figure or supply the limits, never raise it above the tally. The token endpoint
+  is not on that session and is not counted. A window or day that has ended
+  restarts its tally at zero, so it reads as whole less the calls made in the new
+  one (the daily limit is that of the last reading).
+  The tally persists in the same `meta` row as the allowance
+  (`strava_rate_remaining`), written once per response:
+  `{"daily", "short", "at", "counts": {"day", "daily", "daily_limit", "window",
+  "short", "short_limit"}}`, where `window` is the epoch second divided by 900.
+  A new process reads it on first use and resumes the counts if their window or
+  day is the current one (stale counts are dropped, the limits kept), so a
+  restart mid-window continues the same window's spend. With no reading and
+  nothing stored, nothing is known and
   nothing blocks; the activity list at the start of every sync supplies one. Every request passes one gate (`miles/strava_budget.py`)
   that checks the reading first. A 429 is waited out for one window; a second
   with nothing succeeding between, or one when the headers show the daily

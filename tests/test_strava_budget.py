@@ -4,7 +4,7 @@ import pytest
 import requests
 from helpers import strava_fault
 
-from miles import errors, metrics, strava_budget, strava_client
+from miles import errors, events, metrics, strava_budget, strava_client
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +65,7 @@ def _observe(*, short_usage: int, long_usage: int) -> None:
 
 def test_daily_remaining_comes_from_the_latest_response_headers(monkeypatch: pytest.MonkeyPatch):
     rates: list[tuple[int, int]] = []
-    monkeypatch.setattr(strava_client, "rate_sink", lambda daily, short: rates.append((daily, short)))
+    monkeypatch.setattr(strava_client, "rate_sink", lambda daily, short, counts: rates.append((daily, short)))
     assert strava_client.daily_calls_remaining() is None
 
     _get(_response(headers=_headers(30, 400)))
@@ -290,7 +290,7 @@ def _streams(status: int = 200) -> None:
 
 def test_responses_without_headers_are_counted_against_the_last_reading(monkeypatch: pytest.MonkeyPatch):
     rates: list[tuple[int, int]] = []
-    monkeypatch.setattr(strava_client, "rate_sink", lambda daily, short: rates.append((daily, short)))
+    monkeypatch.setattr(strava_client, "rate_sink", lambda daily, short, counts: rates.append((daily, short)))
     _at(monkeypatch, 2026, 3, 1, 10, 5)
     _observe(short_usage=1, long_usage=5)
 
@@ -375,7 +375,7 @@ def test_a_run_crossing_midnight_utc_counts_against_the_full_daily_limit(monkeyp
 
 def test_without_a_reading_nothing_is_known_and_nothing_is_sunk(monkeypatch: pytest.MonkeyPatch):
     rates: list[tuple[int, int]] = []
-    monkeypatch.setattr(strava_client, "rate_sink", lambda daily, short: rates.append((daily, short)))
+    monkeypatch.setattr(strava_client, "rate_sink", lambda daily, short, counts: rates.append((daily, short)))
 
     _streams()
 
@@ -434,5 +434,129 @@ def test_a_header_less_run_waits_at_the_short_window_floor_then_continues(monkey
             break
 
     assert len(slept) == 1
-    assert sent == 91
+    assert sent == 90
     assert strava_client.short_window_calls_remaining() == 99
+
+
+# --- the tally outlasts a reading and a restart ----------------------------------
+
+
+@pytest.fixture
+def persisted(monkeypatch: pytest.MonkeyPatch):
+    """The tally stored in the (isolated) database, as outbound.claim() wires it."""
+    monkeypatch.setattr(strava_client, "rate_sink", events.record_strava_rate)
+    monkeypatch.setattr(strava_client, "rate_source", events.load_strava_counts)
+
+
+def _restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new process: no module state, same database."""
+    monkeypatch.setattr(strava_client, "_observation", None)
+    monkeypatch.setattr(strava_client, "_tally", None)
+    monkeypatch.setattr(strava_client, "_seeded", False)
+
+
+def test_a_reading_of_an_untouched_window_does_not_lift_the_short_window_figure_above_the_tally(monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=1, long_usage=1)
+    for _ in range(60):
+        _streams()
+
+    _observe(short_usage=2, long_usage=2)
+
+    assert strava_client.short_window_calls_remaining() == 100 - 62
+    assert strava_client.daily_calls_remaining() == 1000 - 62
+
+
+def test_the_daily_figure_is_held_down_by_the_tally_across_readings(monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=1, long_usage=1)
+    for _ in range(40):
+        _streams()
+    _at(monkeypatch, 2026, 3, 1, 11, 5)
+
+    _observe(short_usage=1, long_usage=3)
+
+    assert strava_client.daily_calls_remaining() == 1000 - 42
+    assert strava_client.short_window_calls_remaining() == 99
+
+
+def test_a_reading_lower_than_the_tally_still_wins(monkeypatch: pytest.MonkeyPatch):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=40, long_usage=500)
+    assert strava_client.short_window_calls_remaining() == 60
+    assert strava_client.daily_calls_remaining() == 500
+    _streams()
+    assert strava_client.short_window_calls_remaining() == 59
+
+
+def test_a_restart_resumes_the_counts_of_the_current_window_and_day(monkeypatch: pytest.MonkeyPatch, persisted):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=1, long_usage=1)
+    for _ in range(29):
+        _streams()
+    _restart(monkeypatch)
+    assert strava_client.short_window_calls_remaining() == 70
+
+    _observe(short_usage=1, long_usage=1)
+
+    assert strava_client.short_window_calls_remaining() == 69
+    assert strava_client.daily_calls_remaining() == 969
+
+
+def test_a_restart_ignores_the_counts_of_a_past_window_but_keeps_the_day(monkeypatch: pytest.MonkeyPatch, persisted):
+    _at(monkeypatch, 2026, 3, 1, 10, 5)
+    _observe(short_usage=1, long_usage=1)
+    for _ in range(29):
+        _streams()
+    _restart(monkeypatch)
+    _at(monkeypatch, 2026, 3, 1, 10, 20)
+
+    assert strava_client.short_window_calls_remaining() == 100
+    assert strava_client.daily_calls_remaining() == 970
+
+
+def test_a_restart_ignores_the_counts_of_a_past_day(monkeypatch: pytest.MonkeyPatch, persisted):
+    _at(monkeypatch, 2026, 3, 1, 23, 50)
+    _observe(short_usage=1, long_usage=1)
+    for _ in range(29):
+        _streams()
+    _restart(monkeypatch)
+    _at(monkeypatch, 2026, 3, 2, 9, 0)
+
+    assert strava_client.daily_calls_remaining() == 1000
+    assert strava_client.short_window_calls_remaining() == 100
+
+
+def test_a_restart_with_nothing_or_junk_stored_knows_nothing(monkeypatch: pytest.MonkeyPatch, persisted):
+    assert strava_client.daily_calls_remaining() is None
+
+    _restart(monkeypatch)
+    conn = events.db.connect()
+    events.db.set_meta(conn, events.STRAVA_RATE_META, '{"counts": {"day": "2026-03-01", "daily": "many"}}')
+    conn.commit()
+    conn.close()
+
+    assert strava_client.daily_calls_remaining() is None
+
+
+def test_a_restart_mid_window_does_not_spend_a_second_window(monkeypatch: pytest.MonkeyPatch, persisted, slept: list[float]):
+    _at(monkeypatch, 2026, 3, 1, 10, 1)
+    monkeypatch.setattr(strava_budget.time, "sleep", lambda seconds: (slept.append(seconds), _at(monkeypatch, 2026, 3, 1, 10, 16)))
+    _observe(short_usage=1, long_usage=1)
+    for _ in range(49):
+        _streams()
+    _restart(monkeypatch)
+    _at(monkeypatch, 2026, 3, 1, 10, 9)
+    _observe(short_usage=1, long_usage=1)
+    gate = strava_budget.Gate(12)
+    in_window = 51
+
+    for _ in range(200):
+        gate.acquire("streams")
+        if slept:
+            break
+        _streams()
+        in_window += 1
+
+    assert len(slept) == 1
+    assert in_window == 100 - strava_budget.SHORT_WINDOW_RESERVE

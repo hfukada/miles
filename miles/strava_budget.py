@@ -5,9 +5,11 @@ Anything beyond fetching new activities (detail, history backfills) stops at
 a reserve of daily calls, so a later sync the same day can still fetch new
 activities, and never takes the last calls of the 15-minute window.
 
-The numbers come from the latest response (strava_client), aged by the clock:
-an ended window reads as whole, and the daily figure is unknown once the UTC
-date changes. An unknown figure never blocks a request.
+The numbers come from strava_client: the smaller of the limit less the calls
+tallied in the current window or UTC day, and the latest response headers'
+figure less the calls since. The tally includes calls whose responses carry no
+headers (streams) and survives a restart, so a reading never lifts a figure
+above what the process has spent. An unknown figure never blocks a request.
 
 A Gate belongs to one run or one page request. It raises
 StravaAllowanceLowError for a request that would cross a reserve (a

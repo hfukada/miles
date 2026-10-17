@@ -9,7 +9,8 @@ recorded there rather than in process memory:
 - `outbound_events`: a timestamped row for each request that ended on a status
   the health check must place in time (429 on the last attempt, Strava 401);
   pruned after EVENT_RETENTION_DAYS.
-- a `meta` key holding the Strava allowance last seen.
+- a `meta` key holding the Strava allowance last seen and the calls tallied in
+  the current day and window.
 
 Recording is opt-in: outbound.claim() calls install(), which hooks http_client
 and strava_client, so exactly the processes that make outbound calls record.
@@ -120,19 +121,36 @@ def record_outcome(service: str, status: int) -> None:
         _logger.warning("could not record outbound outcome %s %s", service, status, exc_info=True)
 
 
-def record_strava_rate(daily_remaining: int, short_remaining: int) -> None:
-    """Remember the allowance the latest Strava response reported, for /metrics."""
-    value = json.dumps({
+def record_strava_rate(daily_remaining: int, short_remaining: int, counts: dict[str, object] | None = None) -> None:
+    """Remember the allowance the latest Strava response left, for /metrics,
+    and the calls tallied this day and window (`counts`), which the next
+    process resumes. One small UPDATE per response."""
+    stored: dict[str, object] = {
         "daily": daily_remaining,
         "short": short_remaining,
         "at": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    if counts is not None:
+        stored["counts"] = counts
     try:
         with _ledger_connection() as conn:
-            db.set_meta(conn, STRAVA_RATE_META, value)
+            db.set_meta(conn, STRAVA_RATE_META, json.dumps(stored))
             conn.commit()
     except Exception:
         _logger.warning("could not record the Strava allowance", exc_info=True)
+
+
+def load_strava_counts() -> dict[str, object] | None:
+    """The tally record_strava_rate last stored; None when there is none or the
+    database cannot be read."""
+    try:
+        with _ledger_connection() as conn:
+            value = db.get_meta(conn, STRAVA_RATE_META)
+        counts = json.loads(value).get("counts") if value else None
+    except Exception:
+        _logger.warning("could not read the stored Strava tally", exc_info=True)
+        return None
+    return counts if isinstance(counts, dict) else None
 
 
 def install() -> None:
@@ -140,6 +158,7 @@ def install() -> None:
     http_client.request_sink = record_request
     http_client.outcome_sink = record_outcome
     strava_client.rate_sink = record_strava_rate
+    strava_client.rate_source = load_strava_counts
 
 
 def recent(conn: sqlite3.Connection, *, status: int, since: datetime, service: str | None = None) -> list[sqlite3.Row]:

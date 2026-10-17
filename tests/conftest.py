@@ -43,7 +43,8 @@ def _fresh_strava_token_state(monkeypatch):
     monkeypatch.setattr(strava_client, "_access_token", None)
     monkeypatch.setattr(strava_client, "_access_token_expires_at", 0.0)
     monkeypatch.setattr(strava_client, "_observation", None)
-    monkeypatch.setattr(strava_client, "_calls_since", None)
+    monkeypatch.setattr(strava_client, "_tally", None)
+    monkeypatch.setattr(strava_client, "_seeded", False)
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +56,7 @@ def _fresh_http_state(monkeypatch):
     monkeypatch.setattr(http_client, "request_sink", None)
     monkeypatch.setattr(http_client, "outcome_sink", None)
     monkeypatch.setattr(strava_client, "rate_sink", None)
+    monkeypatch.setattr(strava_client, "rate_source", None)
 
 
 @pytest.fixture(autouse=True)
