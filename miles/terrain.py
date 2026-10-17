@@ -10,18 +10,20 @@ never on a request or startup path.
 """
 
 import bisect
+import copy
 import json
 import math
 import logging
 import sqlite3
 import threading
 import time
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Literal, Mapping, Sequence, cast
 from typing_extensions import TypedDict
 
+import numpy as np
 import pandas as pd
 
 from . import db, elevation, gpx_parse, races, streams
@@ -419,15 +421,69 @@ def _derive_bands(
     return out
 
 
+_MODEL_COLUMNS = ["grade_pct", "speed_mps", "heartrate", "cadence_spm", "is_walking", "elapsed_s", "temp_c"]
+_MODEL_CACHE_SIZE = 8
+# Backstop for what the marker cannot see: another process re-segmenting an
+# activity in place, or a write not yet committed when the model was read.
+_MODEL_CACHE_TTL_S = 60.0
+_model_cache: OrderedDict[tuple, tuple[float, TerrainModel]] = OrderedDict()
+_model_cache_lock = threading.Lock()
+_segment_generation = 0
+
+
+def _grade_bins(grades_pct: pd.Series) -> np.ndarray:
+    """_grade_bin over a column."""
+    inner = 1 + np.floor((grades_pct.to_numpy(dtype=float) - GRADE_BIN_MIN_PCT) / GRADE_BIN_WIDTH_PCT)
+    inner = np.where(grades_pct < GRADE_BIN_MIN_PCT, 0, inner)
+    return np.where(grades_pct >= GRADE_BIN_MAX_PCT, N_GRADE_BINS - 1, inner).astype(int)
+
+
+def _bump_segment_generation() -> None:
+    global _segment_generation
+    with _model_cache_lock:
+        _segment_generation += 1
+
+
+def _data_marker(conn: sqlite3.Connection) -> tuple:
+    """What the segment data looks like now, from the per-activity dates table
+    (every writer replaces an activity's dates row, so its count, sums, and
+    needs_dem flags move with additions, deletions, and date or flag changes
+    from any process), plus this process's write generation for a replacement
+    that leaves all of those equal."""
+    row = conn.execute(
+        "SELECT count(*), total(segment_count), total(needs_dem), total(activity_id), total(julianday(start_date)) "
+        "FROM terrain_segment_dates"
+    ).fetchone()
+    return (_segment_generation, *tuple(row))
+
+
 def current_model(
     conn: sqlite3.Connection, window_days: int = ROLLING_WINDOW_DAYS, as_of: date | None = None
 ) -> TerrainModel:
     """The athlete's model over a trailing window; bins with fewer than
-    MIN_SAMPLES_FOR_BIN samples use default_model()'s."""
+    MIN_SAMPLES_FOR_BIN samples use default_model()'s. Memoized per window,
+    date, model version, and the database's segment-change marker; the caller
+    gets its own copy."""
     as_of = as_of or date.today()
+    key = (_data_marker(conn), as_of.isoformat(), window_days, TERRAIN_MODEL_VERSION)
+    with _model_cache_lock:
+        now = time.monotonic()
+        entry = _model_cache.get(key)
+        if entry is None or now - entry[0] > _MODEL_CACHE_TTL_S:
+            # Building under the lock makes concurrent first requests compute once.
+            entry = (now, _build_model(conn, window_days, as_of))
+            _model_cache[key] = entry
+            while len(_model_cache) > _MODEL_CACHE_SIZE:
+                _model_cache.popitem(last=False)
+        else:
+            _model_cache.move_to_end(key)
+        return copy.deepcopy(entry[1])
+
+
+def _build_model(conn: sqlite3.Connection, window_days: int, as_of: date) -> TerrainModel:
     start_date = (as_of - timedelta(days=window_days)).isoformat()
     end_date = as_of.isoformat()
-    rows = conn.execute(
+    cursor = conn.execute(
         """
         SELECT
             ts.grade_dpct / 10.0 AS grade_pct, ts.speed_cms / 100.0 AS speed_mps,
@@ -437,7 +493,9 @@ def current_model(
         WHERE d.start_date >= ? AND d.start_date <= ?
         """,
         [start_date, end_date],
-    ).fetchall()
+    )
+    cursor.row_factory = None  # plain tuples: building a dict per row dominates the fetch
+    rows = cursor.fetchall()
 
     defaults = default_model()
     defaults.as_of = as_of.isoformat()
@@ -445,9 +503,9 @@ def current_model(
     if not rows:
         return defaults
 
-    df = pd.DataFrame([dict(r) for r in rows])
+    df = pd.DataFrame.from_records(rows, columns=_MODEL_COLUMNS)
     df["gap_speed_mps"] = df["speed_mps"] * streams.minetti_cost_ratios(cast(pd.Series, df["grade_pct"]))
-    df["bin"] = df["grade_pct"].map(_grade_bin)
+    df["bin"] = _grade_bins(cast(pd.Series, df["grade_pct"]))
     by_bin: dict[int, pd.DataFrame] = {cast(int, index): group for index, group in df.groupby("bin")}
 
     bins: list[GradeBinStats] = []
@@ -684,6 +742,7 @@ def segment_and_store_activity(
         [activity_id, start_date, len(segments or []), int(needs_dem)],
     )
     if not segments:
+        _bump_segment_generation()
         return 0
     conn.executemany(
         """
@@ -702,6 +761,7 @@ def segment_and_store_activity(
             for i, s in enumerate(segments)
         ],
     )
+    _bump_segment_generation()
     return len(segments)
 
 
@@ -792,6 +852,7 @@ def segment_or_record_failure(
         _logger.warning("terrain segmentation failed for activity %s", activity_id, exc_info=True)
         for table in ("terrain_segments", "terrain_segment_dates"):
             conn.execute(f"DELETE FROM {table} WHERE activity_id = ?", [activity_id])
+        _bump_segment_generation()
         record_segmentation_failure(conn, activity_id, e)
         return None
 
@@ -954,6 +1015,7 @@ def rebuild_terrain(conn: sqlite3.Connection, *, full: bool = False) -> dict[str
         conn.execute(
             f"DELETE FROM {table} WHERE activity_id NOT IN (SELECT activity_id FROM activities WHERE {sport_sql})", sport_params
         )
+    _bump_segment_generation()
     rows = conn.execute(
         f"SELECT activity_id FROM activities WHERE {sport_sql} ORDER BY start_date DESC", sport_params
     ).fetchall()

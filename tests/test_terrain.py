@@ -2,7 +2,7 @@ import json
 import math
 import sqlite3
 import threading
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -527,3 +527,222 @@ def test_a_percentile_is_taken_among_segments_in_the_same_open_ended_bin(conn: s
     )
 
     assert terrain._percentile_at_grade(conn, 41.0, 1.5, 90) == pytest.approx(50.0)
+
+
+# ---------------------------------------------------------------------------
+# current_model: equivalence with the row-at-a-time build, and its cache
+# ---------------------------------------------------------------------------
+
+
+def _reference_model(conn: sqlite3.Connection, window_days: int, as_of: date) -> terrain.TerrainModel:
+    """The model built the slow way: a dict per row and a scalar bin per value."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            terrain.pd.DataFrame, "from_records",
+            classmethod(lambda cls, rows, columns: pd.DataFrame([dict(zip(columns, r)) for r in rows])),
+        )
+        patch.setattr(terrain, "_grade_bins", lambda grades: grades.map(terrain._grade_bin).to_numpy())
+        return terrain._build_model(conn, window_days, as_of)
+
+
+def _insert_segments(conn: sqlite3.Connection, activity_id: int, start_date: str, grades_dpct: list[int], *, speed_cms: int = 250) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO terrain_segment_dates (activity_id, start_date, segment_count) VALUES (?, ?, ?)",
+        [activity_id, start_date, len(grades_dpct)],
+    )
+    conn.executemany(
+        """
+        INSERT INTO terrain_segments (activity_id, idx, dist_m, elapsed_s, grade_dpct, speed_cms, heartrate,
+                                      cadence_spm, is_walking, temp_dc, ele_source)
+        VALUES (?, ?, 20.0, ?, ?, ?, ?, 170, ?, ?, 1)
+        """,
+        [
+            (activity_id, i, i * 7, g, speed_cms + (i % 7) * 5, 140 + i % 30 if i % 11 else None, int(g > 150), 150 + i % 100)
+            for i, g in enumerate(grades_dpct)
+        ],
+    )
+    conn.commit()
+
+
+def test_the_vectorized_grade_bin_matches_the_scalar_one_at_every_edge():
+    edges = [terrain.GRADE_BIN_MIN_PCT + i * terrain.GRADE_BIN_WIDTH_PCT for i in range(terrain.N_GRADE_BINS)]
+    grades = sorted({g + d for g in edges for d in (-1e-9, 0.0, 1e-9, 0.1)} | {-80.0, -30.1, 29.9, 30.0, 30.1, 90.0})
+    series = pd.Series(grades)
+    assert list(terrain._grade_bins(series)) == [terrain._grade_bin(g) for g in grades]
+
+
+def test_current_model_matches_the_row_at_a_time_build_across_every_bin_edge(conn: sqlite3.Connection):
+    edges_dpct = [int(round((terrain.GRADE_BIN_MIN_PCT + i * terrain.GRADE_BIN_WIDTH_PCT) * 10)) for i in range(terrain.N_GRADE_BINS)]
+    grades: list[int] = []
+    for edge in edges_dpct:
+        for delta in (-1, 0, 1, 5):
+            grades.extend([edge + delta] * 3)
+    grades += [-900, -301, 299, 300, 301, 900] * 4
+    today = date.today()
+    _insert_segments(conn, 1, today.isoformat(), grades)
+    _insert_segments(conn, 2, (today - timedelta(days=10)).isoformat(), grades[::2])
+
+    for window_days in (30, 90):
+        got = terrain.current_model(conn, window_days=window_days, as_of=today)
+        assert got == _reference_model(conn, window_days, today)
+        assert any(b.sample_count >= terrain.MIN_SAMPLES_FOR_BIN for b in got.bins)
+        assert got.bins[0].sample_count > 0 and got.bins[-1].sample_count > 0
+
+
+def _count_builds(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    calls: list[int] = []
+    real = terrain._build_model
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(terrain, "_build_model", counting)
+    return calls
+
+
+def _fresh_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(terrain, "_model_cache", terrain.OrderedDict())
+
+
+def test_a_repeated_current_model_call_is_served_from_the_cache(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    _fresh_cache(monkeypatch)
+    _insert_segments(conn, 1, date.today().isoformat(), [10 * (i % 20) for i in range(200)])
+    calls = _count_builds(monkeypatch)
+
+    first = terrain.current_model(conn)
+    second = terrain.current_model(conn)
+
+    assert calls == [1]
+    assert first == second
+
+
+def test_segmenting_an_activity_invalidates_the_cached_model(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    _fresh_cache(monkeypatch)
+    before = terrain.current_model(conn, window_days=3650)
+    assert all(b.sample_count == 0 for b in before.bins)
+
+    terrain.segment_and_store_activity(conn, 1, _synthetic_stream_df(), date.today().isoformat(), 15.0, 130.0)
+    conn.commit()
+
+    assert any(b.sample_count > 0 for b in terrain.current_model(conn, window_days=3650).bins)
+
+
+def test_resegmenting_an_activity_in_place_invalidates_the_cached_model(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    _fresh_cache(monkeypatch)
+    today = date.today().isoformat()
+    slow_df = _synthetic_stream_df()
+    fast_df = slow_df.assign(velocity_smooth_mps=5.0)
+    terrain.segment_and_store_activity(conn, 1, slow_df, today, 15.0, 130.0)
+    slow = terrain.current_model(conn)
+
+    terrain.segment_and_store_activity(conn, 1, fast_df, today, 15.0, 130.0)
+
+    fast = terrain.current_model(conn)
+    assert [b.sample_count for b in fast.bins] == [b.sample_count for b in slow.bins]
+    assert fast != slow
+
+
+def test_a_cached_model_expires(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    _fresh_cache(monkeypatch)
+    _insert_segments(conn, 1, date.today().isoformat(), [100] * 40)
+    calls = _count_builds(monkeypatch)
+    clock = [1000.0]
+    monkeypatch.setattr(terrain.time, "monotonic", lambda: clock[0])
+
+    terrain.current_model(conn)
+    clock[0] += terrain._MODEL_CACHE_TTL_S - 1
+    terrain.current_model(conn)
+    assert len(calls) == 1
+    clock[0] += 2
+    terrain.current_model(conn)
+    assert len(calls) == 2
+
+
+def test_deleting_segments_or_a_rebuild_invalidates_the_cached_model(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    _fresh_cache(monkeypatch)
+    today = date.today().isoformat()
+    insert_activity(conn, 1)
+    insert_activity(conn, 2, sport_type="VirtualRun")
+    _insert_segments(conn, 1, today, [100] * 40)
+    _insert_segments(conn, 2, today, [-100] * 40)
+    assert sum(b.sample_count for b in terrain.current_model(conn).bins) == 80
+
+    monkeypatch.setattr(streams, "has_cached_streams", lambda aid: False)
+    terrain.rebuild_terrain(conn, full=True)  # drops the virtual run's segments
+    assert sum(b.sample_count for b in terrain.current_model(conn).bins) == 40
+
+    for table in ("terrain_segments", "terrain_segment_dates"):  # what re-upserting a changed activity does
+        conn.execute(f"DELETE FROM {table} WHERE activity_id = 1")
+    conn.commit()
+    assert sum(b.sample_count for b in terrain.current_model(conn).bins) == 0
+
+
+def test_cached_models_are_keyed_by_window_and_date(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    _fresh_cache(monkeypatch)
+    today = date.today()
+    _insert_segments(conn, 1, (today - timedelta(days=50)).isoformat(), [100] * 40)
+    calls = _count_builds(monkeypatch)
+
+    wide = terrain.current_model(conn, window_days=90, as_of=today)
+    narrow = terrain.current_model(conn, window_days=30, as_of=today)
+    later = terrain.current_model(conn, window_days=90, as_of=today + timedelta(days=60))
+
+    assert len(calls) == 3
+    assert sum(b.sample_count for b in wide.bins) == 40
+    assert sum(b.sample_count for b in narrow.bins) == 0
+    assert sum(b.sample_count for b in later.bins) == 0
+    assert (wide.window_days, narrow.window_days) == (90, 30)
+    assert later.as_of == (today + timedelta(days=60)).isoformat()
+
+
+def test_a_caller_mutating_its_model_does_not_alter_the_cached_one(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    _fresh_cache(monkeypatch)
+    _insert_segments(conn, 1, date.today().isoformat(), [100] * 40)
+    first = terrain.current_model(conn)
+    first.walk_onset_grade_pct = 99.0
+    first.bins[0].sample_count = 12345
+    first.fatigue_bands.clear()
+
+    again = terrain.current_model(conn)
+    assert again.walk_onset_grade_pct != 99.0
+    assert again.bins[0].sample_count != 12345
+    assert again.fatigue_bands
+
+
+def test_the_default_model_is_never_shared_between_calls(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    _fresh_cache(monkeypatch)
+    a = terrain.current_model(conn)
+    a.bins[0].sample_count = 7
+    a.window_days = 1
+    b = terrain.current_model(conn)
+    assert b.bins[0].sample_count == 0
+    assert b.window_days == terrain.ROLLING_WINDOW_DAYS
+    assert terrain.default_model().bins[0] is not terrain.default_model().bins[0]
+
+
+def test_concurrent_first_requests_build_the_model_once(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch, tmp_path):
+    _fresh_cache(monkeypatch)
+    path = tmp_path / "concurrent.db"
+    disk = db.connect(path)
+    db.init_db(disk)
+    _insert_segments(disk, 1, date.today().isoformat(), [100] * 40)
+    calls = _count_builds(monkeypatch)
+    results: list[terrain.TerrainModel] = []
+
+    def worker():
+        own = db.connect(path)
+        try:
+            results.append(terrain.current_model(own))
+        finally:
+            own.close()
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    disk.close()
+
+    assert len(calls) == 1
+    assert len(results) == 4 and all(r == results[0] for r in results)
