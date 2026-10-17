@@ -446,7 +446,7 @@ def current_model(
         return defaults
 
     df = pd.DataFrame([dict(r) for r in rows])
-    df["gap_speed_mps"] = df["speed_mps"] * df["grade_pct"].apply(streams.minetti_cost_ratio)
+    df["gap_speed_mps"] = df["speed_mps"] * streams.minetti_cost_ratios(cast(pd.Series, df["grade_pct"]))
     df["bin"] = df["grade_pct"].map(_grade_bin)
     by_bin: dict[int, pd.DataFrame] = {cast(int, index): group for index, group in df.groupby("bin")}
 

@@ -193,6 +193,12 @@ def minetti_cost_ratio(grade_pct: float) -> float:
     return float(cast(float, _minetti_cost(pd.Series([grade_pct / 100.0])).iloc[0]) / _FLAT_COST)
 
 
+def minetti_cost_ratios(grade_pct: pd.Series) -> pd.Series:
+    """minetti_cost_ratio over a whole column at once; per-row calls build a
+    Series each and cost seconds on tens of thousands of rows."""
+    return cast(pd.Series, _minetti_cost(grade_pct / 100.0) / _FLAT_COST)
+
+
 def compute_gap_pace_s_per_m(df: pd.DataFrame) -> pd.Series:
     """Grade-adjusted pace (seconds per meter) from velocity_smooth + grade_smooth.
 

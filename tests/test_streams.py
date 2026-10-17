@@ -17,6 +17,7 @@ from miles.streams import (
     median_per_window,
     min_median_max_per_window,
     minetti_cost_ratio,
+    minetti_cost_ratios,
 )
 
 
@@ -46,6 +47,11 @@ def test_gap_pace_equals_real_pace_on_the_flat_and_is_faster_uphill():
     # the convention Strava's own grade-adjusted pace follows.
     uphill = pd.DataFrame({"velocity_smooth_mps": [3.0] * 10, "grade_smooth": [10.0] * 10})  # percent, as Strava reports it
     assert compute_gap_pace_s_per_m(uphill).iloc[5] < 1.0 / 3.0
+
+
+def test_the_column_form_matches_the_scalar_one():
+    grades = [-60.0, -10.0, 0.0, 3.5, 10.0, 45.0, 1000.0]
+    assert list(minetti_cost_ratios(pd.Series(grades))) == pytest.approx([minetti_cost_ratio(g) for g in grades])
 
 
 def test_compute_gap_pace_zero_velocity_does_not_divide_by_zero():
