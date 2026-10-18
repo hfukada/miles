@@ -261,6 +261,12 @@ out-and-back when its stretch is better.
   after everything above it (`DIVERSITY_FLOOR`): the diversity penalty otherwise
   lifted a route that its purpose had scored out, because it shared nothing.
 
+### Background searches as built
+
+- The MCP `find_routes` runs the search in a background thread (`search_jobs.py`),
+  followed with `get_search` and stopped with `cancel_search`; the time budget is a
+  safety cap.
+
 ## Consequences
 
 - Network build takes longer and stores more per area (sections and their

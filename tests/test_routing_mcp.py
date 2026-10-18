@@ -1,5 +1,8 @@
 import json
 import sqlite3
+import threading
+import time
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import pytest
@@ -8,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 from test_sections import Map, pt
 
-from miles import network, route_search, routing_mcp, survey
+from miles import network, route_search, routing_mcp, search_jobs, survey
 
 # A single 400m trail with a named trailhead at its near end, a mile or so
 # from the drive origin -- enough distance for OSRM drive time to matter,
@@ -96,6 +99,24 @@ def tool(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     return call
 
 
+@pytest.fixture(autouse=True)
+def _no_leftover_searches(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    """Searches run on the test connection, so none may outlive the test."""
+    jobs: OrderedDict = OrderedDict()
+    monkeypatch.setattr(search_jobs, "_jobs", jobs)
+    yield
+    for job in jobs.values():
+        assert job.done.wait(10)
+
+
+def run_search(tool, args: dict) -> dict:
+    """find_routes, then get_search until it finishes."""
+    started = tool("find_routes", args)
+    if "search_id" not in started:
+        return started
+    return tool("get_search", {"search_id": started["search_id"], "wait_s": 40})
+
+
 @pytest.mark.parametrize("as_json_text", [False, True])
 def test_find_routes_tool_takes_starts_and_way_ids_as_lists_or_json_text_and_a_seed_makes_it_reproducible(tool, as_json_text: bool):
     starts = [{"lat": TH_LAT, "lng": ORIGIN_LNG, "label": "Lot"}]
@@ -105,11 +126,11 @@ def test_find_routes_tool_takes_starts_and_way_ids_as_lists_or_json_text_and_a_s
         "starts": json.dumps(starts) if as_json_text else starts,
         "avoid_way_ids": json.dumps(avoid) if as_json_text else avoid,
     }
-    result = tool("find_routes", args)
+    result = run_search(tool, args)
     assert "error" not in result
     assert result["candidates"][0]["start"]["label"] == "Lot"
     assert "longest_hike_mi" in result["candidates"][0]["runnability"]
-    again = tool("find_routes", args)
+    again = run_search(tool, args)
     assert result["seed"] == again["seed"] == 3  # a seed makes the search reproducible
     assert [c["distance_mi"] for c in result["candidates"]] == [c["distance_mi"] for c in again["candidates"]]
 
@@ -119,7 +140,7 @@ def test_get_route_candidate_lists_the_ways_in_travel_order_in_miles(tool):
         "area_id": 1, "distance_mi_min": 0.1, "distance_mi_max": 0.5, "shape": "loop", "seed": 3,
         "starts": [{"lat": TH_LAT, "lng": ORIGIN_LNG, "label": "Lot"}],
     }
-    summary = tool("find_routes", args)["candidates"][0]
+    summary = run_search(tool, args)["candidates"][0]
     assert "ways" not in summary
 
     detail = tool("get_route_candidate", {"candidate_id": summary["candidate_id"]})
@@ -149,7 +170,7 @@ def test_find_routes_tool_reports_the_sections_a_candidate_runs_and_takes_the_se
         "sections": [group_id], "repeat_value": 0.3, "surface_preference": "singletrack", "unfamiliar_only": True,
     }
 
-    result = tool("find_routes", args)
+    result = run_search(tool, args)
 
     assert result["candidates"] and "warnings" not in result
     top = result["candidates"][0]
@@ -158,11 +179,12 @@ def test_find_routes_tool_reports_the_sections_a_candidate_runs_and_takes_the_se
     assert set(used) == {"section_id", "block_id", "name", "miles"} and used["section_id"] == group_id
     assert used["miles"] == pytest.approx(1.49, abs=0.05)
     assert top["stops"] == []
-    assert "repeat_value" in tool("find_routes", {**args, "repeat_value": 2.0})["error"]
+    refused = tool("find_routes", {**args, "repeat_value": 2.0})
+    assert "repeat_value" in refused["error"] and "search_id" not in refused
     stop = {"lat": lat, "lng": lng, "label": "home", "at_mi": 1}
-    with_stop = tool("find_routes", {**args, "stops": [stop]})["candidates"][0]
+    with_stop = run_search(tool, {**args, "stops": [stop]})["candidates"][0]
     assert with_stop["stops"][0]["label"] == "home" and with_stop["stops"][0]["wanted_mi"] == 1
-    assert "no section 999999" in tool("find_routes", {**args, "sections": [999999]})["error"]
+    assert "no section 999999" in run_search(tool, {**args, "sections": [999999]})["error"]
 
 
 @pytest.mark.parametrize("origin", ["http://localhost", "http://localhost:6274", "https://miles-host"])
@@ -177,3 +199,80 @@ def test_clients_from_an_allowed_host_pass_the_origin_check_with_or_without_a_po
     )
     assert middleware._validate_origin(origin)
     assert not middleware._validate_origin("http://elsewhere.test")
+
+
+LOOP_ARGS = {
+    "area_id": 1, "distance_mi_min": 0.1, "distance_mi_max": 0.5, "shape": "loop", "seed": 3,
+    "starts": [{"lat": TH_LAT, "lng": ORIGIN_LNG, "label": "Lot"}],
+}
+
+
+@pytest.fixture
+def gated_walks(monkeypatch: pytest.MonkeyPatch):
+    """Loop generation that, from its `after`-th call on, announces itself and
+    blocks until released. Returns (entered, release, set_after)."""
+    entered, release = threading.Event(), threading.Event()
+    calls = {"n": 0, "after": 0}
+    real = route_search._GENERATORS["loop"]
+
+    def gated(*args):
+        calls["n"] += 1
+        if calls["n"] > calls["after"]:
+            entered.set()
+            assert release.wait(10)
+        return real(*args)
+
+    monkeypatch.setitem(route_search._GENERATORS, "loop", gated)
+    monkeypatch.setattr(route_search, "DEFAULT_TIME_BUDGET_S", 60.0)
+    return entered, release, calls
+
+
+def test_find_routes_returns_a_search_id_at_once_and_a_second_search_queues_behind_it(
+    tool, gated_walks, monkeypatch: pytest.MonkeyPatch
+):
+    entered, release, _ = gated_walks
+    monkeypatch.setattr(search_jobs, "MAX_WAIT_S", 0.2)
+
+    first = tool("find_routes", LOOP_ARGS)
+    assert first["status"] == "running" and first["candidates"] == []
+    assert entered.wait(10)
+    second = tool("find_routes", LOOP_ARGS)
+    assert second["status"] == "queued"
+
+    # The wait is capped, and gives up with the search still running.
+    began = time.monotonic()
+    assert tool("get_search", {"search_id": first["search_id"], "wait_s": 999})["status"] == "running"
+    assert time.monotonic() - began < 5
+
+    release.set()
+    for reply in (first, second):
+        finished = tool("get_search", {"search_id": reply["search_id"], "wait_s": 10})
+        assert finished["status"] == "done" and finished["candidates"] and finished["seed"] == 3
+
+
+def test_cancel_search_keeps_the_candidates_found_so_far_and_they_stay_usable(
+    tool, gated_walks, monkeypatch: pytest.MonkeyPatch
+):
+    entered, release, calls = gated_walks
+    calls["after"] = 1
+    monkeypatch.setattr(search_jobs, "CANCEL_WAIT_S", 0.1)
+
+    search_id = tool("find_routes", LOOP_ARGS)["search_id"]
+    assert entered.wait(10)
+    cancelled = tool("cancel_search", {"search_id": search_id})
+    assert cancelled["status"] == "cancelled" and cancelled["candidates"]
+
+    release.set()
+    final = tool("get_search", {"search_id": search_id, "wait_s": 10})
+    assert final["status"] == "cancelled" and final["candidates"] and "seed" in final
+    assert tool("get_route_candidate", {"candidate_id": final["candidates"][0]["candidate_id"]})["ways"]
+
+
+def test_get_search_reports_an_unknown_or_expired_search(tool, monkeypatch: pytest.MonkeyPatch):
+    assert "unknown or expired" in tool("get_search", {"search_id": "nope"})["error"]
+    assert "unknown or expired" in tool("cancel_search", {"search_id": "nope"})["error"]
+
+    monkeypatch.setattr(search_jobs, "JOB_TTL_S", -1.0)
+    old = run_search(tool, LOOP_ARGS)["search_id"]
+    tool("find_routes", LOOP_ARGS)  # starting a search drops finished jobs past their TTL
+    assert "unknown or expired" in tool("get_search", {"search_id": old})["error"]

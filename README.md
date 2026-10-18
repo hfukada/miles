@@ -243,6 +243,10 @@ variable that points it at your own instance. Two settings are worth making:
   service operators can reach you. Geocoding place names against the public
   Nominatim instance is refused until it is set (or `MILES_NOMINATIM_URL` points at
   another instance); coordinates need no geocoding.
+- `MILES_SEARCH_BUDGET_S`: seconds a route search may run when its request gives no
+  `time_budget_s` (default 10). Searches run in the background (`find_routes`,
+  `get_search`, `cancel_search`), so this is a cap on a search's run time, and
+  on slow hardware a good search wants minutes.
 - `MILES_TILE_URL`, `MILES_TILE_ATTRIBUTION`, `MILES_TILE_MAX_ZOOM`: replace the
   default OpenTopoMap basemap on the map pages with another tile server.
 

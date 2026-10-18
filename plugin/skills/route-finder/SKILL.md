@@ -182,8 +182,17 @@ comes from `get_route_candidate`'s `ways` too.
    90 minutes. If a start has `drive_time_estimated: true`, the routing service was
    unavailable and its drive time is a straight-line estimate; say so, and don't
    re-run the search in a loop to get real times.
+
+   `find_routes` starts the search and returns a `search_id` at once; a good one can
+   take minutes on slow hardware. Tell the athlete it is running, then call
+   `get_search(search_id, wait_s=40)` again and again within the same turn until its
+   status is `done` (this is the one place to keep polling within a turn, unlike an area
+   import). While it runs, `candidates` are the best so far: if it runs long, show them
+   as interim and say so. A status of `error` carries the reason. `cancel_search` stops a
+   search the athlete no longer wants and keeps what it found; a `cancelled` search's
+   candidates can be shared and saved like any other.
 4. **Compare styles.** Unless the athlete already named a style, run two to
-   four `find_routes` searches, one after another and never in parallel (the server runs
+   four searches, one after another and never in parallel (the server runs
    one search at a time, so parallel calls only queue), with different styles over the same start and distance:
    runnable (`min_runnable_pct` ≈ 90, no trail floor), trail (`min_trail_mi` about half
    the distance), and easy (`purpose="easy"`, shorter) — plus whatever their request
@@ -201,7 +210,7 @@ comes from `get_route_candidate`'s `ways` too.
 5. **Nothing qualifies?** Results come back with `missed_constraints`. Propose the
    relaxation they point to ("loosening trail to 5 miles gives three options") rather
    than reporting failure. Never relax a hard preference (avoided ways, the road-exposure
-   limit) without asking. If `budget_exceeded` is true, the 10-second search budget ran
+   limit) without asking. If `budget_exceeded` is true, the search's time budget ran
    out before enough candidates qualified: say the result may be thin, and narrow the
    request or try again.
    After a search, call `share_candidates` with the 2-6 candidates worth considering and

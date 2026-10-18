@@ -319,6 +319,29 @@ def test_the_walk_fills_in_when_the_area_has_no_sections(conn: sqlite3.Connectio
     assert all(c["sections_used"] == [] for c in result["candidates"])
 
 
+def test_a_flat_walk_for_a_hilly_purpose_is_a_ranked_near_miss_on_gain(conn: sqlite3.Connection):
+    m = Map()
+    m.square(0, 0, 100, name="Tiny Loop")
+    m.build(conn)
+
+    result = route_search.find_routes(conn, request(pt(0, 50), 300, 500, shape="loop", purpose="hilly"))
+
+    assert result["near_miss"]
+    for c in result["candidates"]:
+        assert c["built_from"] == "walk"
+        assert {miss["constraint"] for miss in c["missed_constraints"]} == {"gain_range"}
+        assert c["ranking"]["gain_fit"] < 1.0 and c["ranking"]["score"] is not None
+
+
+def test_the_search_budget_env_var_replaces_the_default_budget(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv(route_search.BUDGET_ENV, "-1")
+    req = request(START, 2700, 3300)
+    del req["time_budget_s"]
+
+    with pytest.raises(ValueError, match="time_budget_s"):
+        route_search.find_routes(conn, req)
+
+
 def test_the_assembly_runs_inside_the_search_slot_and_stops_at_the_deadline(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
     ring_with_street().build(conn)
     held: list[bool] = []

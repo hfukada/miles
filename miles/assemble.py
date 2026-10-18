@@ -46,6 +46,7 @@ import itertools
 import json
 import math
 import sqlite3
+import threading
 import time
 from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Callable, Hashable, Iterator, Mapping, MutableMapping, Sequence
@@ -418,7 +419,9 @@ class Assembly:
         shapes: Sequence[str],
         repeat_value: float,
         ids: Iterator[int],
+        cancelled: threading.Event,
     ) -> None:
+        self.cancelled = cancelled
         self.plan, self.graph, self.space, self.rows = plan, graph, space, rows
         self.start_nodes, self.prefs, self.ids = list(start_nodes), prefs, ids
         self.dmin, self.dmax = distance_m_min, distance_m_max
@@ -717,7 +720,7 @@ class Assembly:
         root = _State(start_node, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, None, None, 0)
         layers: dict[int, dict[tuple[int, int], _State]] = {0: {(start_node, 0): root}}
         done: list[_State] = []
-        while layers and time.monotonic() <= deadline:
+        while layers and time.monotonic() <= deadline and not self.cancelled.is_set():
             layer = layers.pop(min(layers))
             for state in sorted(layer.values(), key=self._rank)[:BEAM_WIDTH]:
                 children: list[_State | None] = []
@@ -769,7 +772,7 @@ class Assembly:
                     if len(fresh) >= MAX_COMPLETIONS:
                         break
                 found.extend(fresh)
-                if not fresh:
+                if not fresh or self.cancelled.is_set():
                     break
                 for block in max(fresh, key=lambda w: w.score).block_m:
                     self._worth[block] = self._worth[block] * ROUND_DISCOUNT
@@ -812,6 +815,25 @@ class Assembly:
             })
         score = value * self._fit(state.dist_m) * self._gain_fit(state.vert_m / 2.0, state.dist_m) - state.cost
         return Walk(start, traversal, _shape(traversal), state.dist_m, value, state.cost, score, block_m, reached, state.vert_m)
+
+    def rank_path(self, start: Start, segments: Sequence[tuple[int, bool]], distance_m: float, gain_m: float | None) -> dict:
+        """The terms of a path's score that was not built by this search: the
+        stretch value of the miles it runs, repeats discounted, and the charge
+        on the rest, as `rank` gives a walk."""
+        passes: Counter[int] = Counter()
+        block_m: defaultdict[int, float] = defaultdict(float)
+        value = weighted = vert_m = 0.0
+        for key, _ in segments:
+            vert_m += self._vertical(key)
+            entries = self._entries_of(key)
+            if not entries:
+                weighted += self.costs[key][0]
+            for entry in entries:
+                block_m[entry.block] += entry.meters
+                value += entry.value * self.repeat_value ** min(passes[entry.bit], 2)
+                passes[entry.bit] += 1
+        cost = CONNECTOR_CHARGE_PER_WEIGHTED_MI * weighted / MILE_M
+        return self.rank(Walk(start, [], "", distance_m, value, cost, 0.0, block_m, [], vert_m), gain_m)
 
     def rank(self, walk: Walk, gain_m: float | None) -> dict:
         """The terms of a walk's score and the sections it runs, the climb

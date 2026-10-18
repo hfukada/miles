@@ -13,6 +13,7 @@ import hashlib
 import heapq
 import itertools
 import json
+import os
 import random
 import sqlite3
 import threading
@@ -22,15 +23,19 @@ from collections import ChainMap, OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Collection, Iterable, Iterator, Literal, Mapping, MutableMapping, Sequence, cast
+from typing import Callable, Collection, Iterable, Iterator, Literal, Mapping, MutableMapping, Sequence, cast
 from typing_extensions import NotRequired, TypedDict
 
 from . import areas, drive_starts, network, routes, routes_spatial, sections, terrain
+from .fitness import FT_PER_M, MILE_M
 
 Shape = Literal["loop", "out_and_back", "lollipop", "any"]
 
 DEFAULT_N = 5
 DEFAULT_TIME_BUDGET_S = 10.0
+# Overrides DEFAULT_TIME_BUDGET_S for requests that give no time_budget_s, for
+# hardware too slow to finish a search in the default.
+BUDGET_ENV = "MILES_SEARCH_BUDGET_S"
 CANDIDATE_TTL_HOURS = 24.0
 
 # How far a request's start may snap onto an edge; wider than
@@ -139,7 +144,7 @@ class RouteCandidateOut(TypedDict):
     # randomized fallback; absent on candidates stored before sections existed.
     built_from: NotRequired[str]
     sections_used: NotRequired[list[dict]]  # section_id, block_id, name, length_m
-    ranking: NotRequired[dict]  # the terms of a section-built candidate's score
+    ranking: NotRequired[dict]  # the terms of the candidate's score
     stops: NotRequired[list[dict]]  # each requested stop with the mile it was passed at
 
 
@@ -149,6 +154,19 @@ class RouteSearchResult(TypedDict):
     budget_exceeded: bool
     seed: int
     warnings: list[str]
+
+
+class SearchProgress:
+    """What another thread may read of a running search, and its cancel flag.
+    `started` is set once the search holds the search lock; `qualifying` is
+    the pool's size; `snapshot`, set once there is a pool, persists and returns
+    the best candidates so far."""
+
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self.started = False
+        self.qualifying = 0
+        self.snapshot: Callable[[sqlite3.Connection], list[RouteCandidateOut]] | None = None
 
 
 class CandidateNotFoundError(LookupError):
@@ -678,7 +696,10 @@ def _runnable_pct(score: dict) -> float:
     return cast(float, score["runnability"]["run_pct"]) + cast(float, score["runnability"]["grind_pct"])
 
 
-def _soft_misses(score: dict, request: RouteSearchRequest, touched_way_ids: set[int]) -> list[ConstraintMiss]:
+def _soft_misses(
+    score: dict, request: RouteSearchRequest, touched_way_ids: set[int],
+    purpose_gain_ft_per_mi: tuple[float | None, float | None],
+) -> list[ConstraintMiss]:
     misses: list[ConstraintMiss] = []
     dmin, dmax = request["distance_m_min"], request["distance_m_max"]
     distance_m = cast(float, score["distance_m"])
@@ -696,6 +717,12 @@ def _soft_misses(score: dict, request: RouteSearchRequest, touched_way_ids: set[
             misses.append({"constraint": "min_runnable_pct", "detail": f"{runnable_pct:.0f}% runnable, need {min_runnable:.0f}%"})
 
     gain_min, gain_max = request.get("gain_m_min"), request.get("gain_m_max")
+    if gain_min is None and gain_max is None and score["has_elevation"]:
+        # The purpose's climb band, which is per mile, over this route's distance.
+        miles = cast(float, score["distance_m"]) / MILE_M
+        lo, hi = purpose_gain_ft_per_mi
+        gain_min = None if lo is None else lo * miles / FT_PER_M
+        gain_max = None if hi is None else hi * miles / FT_PER_M
     if gain_min is not None or gain_max is not None:
         if score["gain_m"] is None:
             misses.append({"constraint": "gain_range", "detail": "no elevation data"})
@@ -732,7 +759,7 @@ class _Candidate:
     score: dict
     missed: list[ConstraintMiss]
     built_from: str = "walk"
-    # Set on candidates assembled around sections: the terms of assemble.py's score.
+    # The terms of assemble.py's score.
     ranking: dict | None = None
     stops: list[dict] = field(default_factory=list)
 
@@ -856,6 +883,10 @@ def search_slot() -> Iterator[None]:
         yield
 
 
+def search_lock_held() -> bool:
+    return _search_lock.locked()
+
+
 def load_search_graph(conn: sqlite3.Connection, area_id: int) -> tuple[SearchGraph, dict[int, dict]]:
     """The area's cached graph and edge rows, loading them if needed. Load
     before search_slot: a load must never wait on, or be waited on by, the
@@ -885,6 +916,7 @@ def start_graph(
 def _evaluate(
     conn: sqlite3.Connection, area_id: int, request: RouteSearchRequest, segments: list[tuple[int, bool]],
     prefs: dict, runnability: network.RunnabilityFn, edge_rows: MutableMapping[int, dict],
+    purpose_gain_ft_per_mi: tuple[float | None, float | None],
 ) -> tuple[dict, list[ConstraintMiss]] | None:
     """A path's score and the soft constraints it misses, or None when it
     cannot be scored or breaks the road-exposure limit."""
@@ -895,43 +927,53 @@ def _evaluate(
     if score["road_exposure"]["violations"]:
         return None
     touched_way_ids = {edge_rows[eid]["way_id"] for eid, _ in segments if eid in edge_rows}
-    return score, _soft_misses(score, request, touched_way_ids)
+    return score, _soft_misses(score, request, touched_way_ids, purpose_gain_ft_per_mi)
 
 
-def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteSearchResult:
-    # assemble imports survey, which imports this module.
-    from . import assemble
-
-    starts_in = request["starts"]
-    if not starts_in:
+def validate_request(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteSearchRequest:
+    """The request with absent, None, and empty-list parameters dropped (they
+    are the same request, seed included), or ValueError when it cannot be
+    searched."""
+    if not request["starts"]:
         raise ValueError("find_routes needs at least one start")
-    # Absent, None, and empty-list parameters are the same request, seed included.
     request = cast(RouteSearchRequest, {k: v for k, v in request.items() if v not in (None, [])})
     if request["distance_m_min"] > request["distance_m_max"]:
         raise ValueError("distance_m_min must be <= distance_m_max")
-
-    area_id = request["area_id"]
-    shape = request.get("shape", "any")
-    n = request.get("n", DEFAULT_N)
-    if n < 1:
+    if request.get("n", DEFAULT_N) < 1:
         raise ValueError("n must be at least 1")
-    time_budget_s = request.get("time_budget_s", DEFAULT_TIME_BUDGET_S)
-    if time_budget_s <= 0:
-        raise ValueError("time_budget_s must be positive")
-    repeat_value = request.get("repeat_value", DEFAULT_REPEAT_VALUE)
-    if not 0.0 <= repeat_value <= 1.0:
+    if not 0.0 <= request.get("repeat_value", DEFAULT_REPEAT_VALUE) <= 1.0:
         raise ValueError("repeat_value must be between 0 and 1")
-    stops_in = request.get("stops") or []
-    for stop in stops_in:
+    for stop in request.get("stops") or []:
         at_mi = stop.get("at_mi")
         if at_mi is not None and at_mi <= 0:
             raise ValueError("a stop's at_mi must be positive")
+    require_searchable(conn, request["area_id"])
+    return request
+
+
+def find_routes(
+    conn: sqlite3.Connection, request: RouteSearchRequest, progress: SearchProgress | None = None
+) -> RouteSearchResult:
+    """Search synchronously. `progress` lets another thread watch and cancel
+    the search; a cancelled search returns what it has found so far."""
+    # assemble imports survey, which imports this module.
+    from . import assemble
+
+    request = validate_request(conn, request)
+    progress = progress or SearchProgress()
+    starts_in = request["starts"]
+    area_id = request["area_id"]
+    shape = request.get("shape", "any")
+    n = request.get("n", DEFAULT_N)
+    time_budget_s = request.get("time_budget_s", float(os.environ.get(BUDGET_ENV, DEFAULT_TIME_BUDGET_S)))
+    if time_budget_s <= 0:
+        raise ValueError("time_budget_s must be positive")
+    repeat_value = request.get("repeat_value", DEFAULT_REPEAT_VALUE)
+    stops_in = request.get("stops") or []
     seed = request.get("seed")
     if seed is None:
         seed = _default_seed(request)
     rng = random.Random(seed)
-
-    require_searchable(conn, area_id)
 
     prefs = network.get_route_preferences(conn)
     model = terrain.current_model(conn)
@@ -945,6 +987,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     shapes_to_try: list[str] = [shape] if shape != "any" else ["loop", "out_and_back", "lollipop"]
     warnings = list(plan.warnings)
     with _search_lock:
+        progress.started = True
         # Avoided ways leave the graph entirely, so no candidate can touch one.
         avoid_way_ids = (
             set(request.get("avoid_way_ids") or []) | network.avoided_way_ids(conn) | sections.excluded_way_ids(conn)
@@ -980,13 +1023,14 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         qualifying: dict[frozenset[int], _Candidate] = {}
         near_misses: dict[frozenset[int], _Candidate] = {}
         budget_exceeded = False
+        progress.snapshot = lambda c: _persist_selected(c, area_id, edge_rows, qualifying, near_misses, target_m, n)
 
+        assembly = assemble.Assembly(
+            plan, graph, space, edge_rows, replaced, start_nodes, stop_nodes, prefs, model,
+            distance_m_min=request["distance_m_min"], distance_m_max=request["distance_m_max"],
+            shapes=shapes_to_try, repeat_value=repeat_value, ids=ids, cancelled=progress.cancelled,
+        )
         if plan.blocks:
-            assembly = assemble.Assembly(
-                plan, graph, space, edge_rows, replaced, start_nodes, stop_nodes, prefs, model,
-                distance_m_min=request["distance_m_min"], distance_m_max=request["distance_m_max"],
-                shapes=shapes_to_try, repeat_value=repeat_value, ids=ids,
-            )
             pool_target = n * POOL_FACTOR
             # The walk may have to fill in afterwards, so it keeps a share of the budget.
             sections_end = deadline if plan.explicit or stops_in else deadline - (1.0 - SECTIONS_BUDGET_SHARE) * time_budget_s
@@ -994,7 +1038,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
                 if len(qualifying) >= pool_target:
                     break
                 segments = _flatten(walk.traversal)
-                evaluated = _evaluate(conn, area_id, request, segments, prefs, runnability, edge_rows) if segments else None
+                evaluated = _evaluate(conn, area_id, request, segments, prefs, runnability, edge_rows, plan.gain_band) if segments else None
                 if evaluated is None:
                     continue
                 score, misses = evaluated
@@ -1005,6 +1049,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
                 best = pool.get(identity)
                 if best is None or cast(dict, candidate.ranking)["score"] > cast(dict, best.ranking)["score"]:
                     pool[identity] = candidate
+                progress.qualifying = len(qualifying)
             budget_exceeded = time.monotonic() > deadline and len(qualifying) < n
         elif stops_in:
             warnings.append("stops can only be passed by routes built from sections, and none lies within reach of a start")
@@ -1018,7 +1063,9 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
 
         # The walk is the fallback for a request no section could serve; it
         # never stands in for sections the request named, and it cannot pass stops.
-        walking = not plan.explicit and not stops_in and not qualifying and not budget_exceeded
+        walking = (
+            not plan.explicit and not stops_in and not qualifying and not budget_exceeded and not progress.cancelled.is_set()
+        )
         if walking:
             contract_degree2_chains(graph, ids, protected=[node_id for node_id, _ in start_nodes])
             ctx = _SearchContext(graph=graph)
@@ -1028,6 +1075,8 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
             attempts_since_new = 0
             while len(qualifying) < pool_target and attempts < MAX_GENERATION_ATTEMPTS:
                 if len(qualifying) >= n and attempts_since_new >= STAGNATION_ATTEMPTS:
+                    break
+                if progress.cancelled.is_set():
                     break
                 if time.monotonic() > deadline:
                     budget_exceeded = len(qualifying) < n
@@ -1042,11 +1091,12 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
                 segments = _flatten(traversal)
                 if not segments:
                     continue
-                evaluated = _evaluate(conn, area_id, request, segments, prefs, runnability, edge_rows)
+                evaluated = _evaluate(conn, area_id, request, segments, prefs, runnability, edge_rows, plan.gain_band)
                 if evaluated is None:
                     continue
                 score, misses = evaluated
-                candidate = _Candidate(gen_shape, start_info, segments, score, misses)
+                ranking = assembly.rank_path(start_info, segments, score["distance_m"], score["gain_m"] if score["has_elevation"] else None)
+                candidate = _Candidate(gen_shape, start_info, segments, score, misses, ranking=ranking)
                 # The same set of edges walked in either direction is one route.
                 identity = _identity(edge_rows, segments)
                 pool = near_misses if misses else qualifying
@@ -1054,22 +1104,9 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
                     pool[identity] = candidate
                     if not misses:
                         attempts_since_new = 0
+                        progress.qualifying = len(qualifying)
 
-    if qualifying:
-        selected = _diversify(list(qualifying.values()), edge_rows, target_m, n)
-    else:
-        def near_key(c: _Candidate) -> tuple[int, int, float]:
-            return (len(c.missed), c.built_from != "sections", -(c.ranking["score"] if c.ranking else _quality(c, target_m)))
-
-        selected = []
-        covers: list[dict[int, float]] = []
-        for c in sorted(near_misses.values(), key=near_key):
-            cover = _cover(edge_rows, c.segments)
-            if len(selected) < n and not any(_duplicate(cover, other) for other in covers):
-                selected.append(c)
-                covers.append(cover)
-
-    result_candidates = [_persist_candidate(conn, area_id, edge_rows, c) for c in selected]
+    result_candidates = _persist_selected(conn, area_id, edge_rows, qualifying, near_misses, target_m, n)
     conn.commit()
     return {
         "candidates": result_candidates,
@@ -1078,6 +1115,33 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         "seed": seed,
         "warnings": warnings,
     }
+
+
+def _persist_selected(
+    conn: sqlite3.Connection,
+    area_id: int,
+    edge_rows: Mapping[int, dict],
+    qualifying: Mapping[frozenset[int], _Candidate],
+    near_misses: Mapping[frozenset[int], _Candidate],
+    target_m: float,
+    n: int,
+) -> list[RouteCandidateOut]:
+    """The n best of the pool, diversified, persisted; the closest misses when
+    nothing qualifies. Safe to call while the search still adds to the pool."""
+    if qualifying:
+        selected = _diversify(list(qualifying.values()), edge_rows, target_m, n)
+    else:
+        def near_key(c: _Candidate) -> tuple[int, int, float]:
+            return (len(c.missed), c.built_from != "sections", -(c.ranking["score"] if c.ranking else _quality(c, target_m)))
+
+        selected = []
+        covers: list[dict[int, float]] = []
+        for c in sorted(list(near_misses.values()), key=near_key):
+            cover = _cover(edge_rows, c.segments)
+            if len(selected) < n and not any(_duplicate(cover, other) for other in covers):
+                selected.append(c)
+                covers.append(cover)
+    return [_persist_candidate(conn, area_id, edge_rows, c) for c in selected]
 
 
 def _persist_candidate(

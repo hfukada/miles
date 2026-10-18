@@ -10,7 +10,7 @@ from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
 
-from . import candidate_sets, db, drive_starts, network, route_search, sections, survey
+from . import candidate_sets, db, drive_starts, network, route_search, search_jobs, sections, survey
 from .errors import reporting
 from .fitness import FT_PER_M, MILE_M
 from .offload import threaded
@@ -103,6 +103,29 @@ def _candidate_detail(candidate: route_search.RouteCandidateOut) -> dict:
         for w in candidate["ways"]
     ]
     return {**candidate, "ways": ways}
+
+
+def _search_reply(view: dict) -> dict:
+    """A search_jobs view as the tools answer it: candidates summarized, the
+    finished search's result fields alongside."""
+    out: dict = {
+        "search_id": view["search_id"],
+        "status": view["status"],
+        "purpose": view["purpose"],
+        "elapsed_s": _round(view["elapsed_s"], 1),
+        "qualifying": view["qualifying"],
+        "candidates": [_candidate_summary(c) for c in view["candidates"]],
+    }
+    result = view["result"]
+    if result is not None:
+        out.update(
+            near_miss=result["near_miss"], budget_exceeded=result["budget_exceeded"], seed=result["seed"]
+        )
+        if result["warnings"]:
+            out["warnings"] = result["warnings"]
+    if view["error"] is not None:
+        out["error"] = view["error"]
+    return out
 
 
 def _round(value: float | None, digits: int = 2) -> float | None:
@@ -366,23 +389,29 @@ def register_routing_tools(mcp: FastMCP) -> None:
         wanted_mi and the at_mi it was actually passed at. A route with stops
         is always built from sections, never the walk.
 
-        Returns up to n candidates (default 5): start, distance, trail/road
-        mix, runnability, road exposure, and a candidate_id for
-        get_route_candidate/save_route_candidate. When nothing meets every
-        soft constraint, the closest few come back, each with near_miss=true
-        and what it misses in missed_constraints (the result's near_miss is
-        true then too). budget_exceeded=true means the 10-second search
+        The search runs in the background and this returns at once with a
+        search_id and status "running" (or "queued" behind another search).
+        Follow it with get_search(search_id, wait_s=40) until its status is
+        "done"; cancel_search stops it. A search is a safety-capped
+        computation, not a ten-second one: the server's budget
+        (MILES_SEARCH_BUDGET_S, default 10 seconds) is how long it may run,
+        and on slow hardware that is minutes. Argument errors (a bad range,
+        an area that is not ready) are returned here; the rest show as an
+        "error" status. Searches run one at a time per server.
+
+        Up to n candidates (default 5) come back from get_search: start,
+        distance, trail/road mix, runnability, road exposure, and a
+        candidate_id for get_route_candidate/save_route_candidate. When
+        nothing meets every soft constraint, the closest few come back, each
+        with near_miss=true and what it misses in missed_constraints (the
+        result's near_miss is true then too). budget_exceeded=true means the
         time budget ran out before n candidates qualified, so the result may
         be thin; narrowing the request or a different seed can help. The same
         seed, request, and network reproduce the same candidates; the seed
-        used is always returned.
-
-        Searches run one at a time per server: parallel calls queue, and each
-        search's time budget starts when it begins running, so run them
-        sequentially. In each candidate's runnability, longest_hike_mi and
-        steep_descent_mi are distances along the route (miles of continuous
-        hiking, miles steeper than the athlete's descent threshold), not
-        vertical feet.
+        used is always returned. In each candidate's runnability,
+        longest_hike_mi and steep_descent_mi are distances along the route
+        (miles of continuous hiking, miles steeper than the athlete's descent
+        threshold), not vertical feet.
         """
         with db.connection() as conn:
             start_list = route_search.resolve_starts(
@@ -417,18 +446,39 @@ def register_routing_tools(mcp: FastMCP) -> None:
                 "unfamiliar_only": unfamiliar_only,
                 "purpose": purpose,
             }
-            result = route_search.find_routes(conn, request)
+            return json.dumps(_search_reply(search_jobs.start(conn, request)))
 
-        out: dict = {
-            "purpose": purpose,
-            "candidates": [_candidate_summary(c) for c in result["candidates"]],
-            "near_miss": result["near_miss"],
-            "budget_exceeded": result["budget_exceeded"],
-            "seed": result["seed"],
-        }
-        if result["warnings"]:
-            out["warnings"] = result["warnings"]
-        return json.dumps(out)
+    @mcp.tool()
+    @threaded
+    @reporting(search_jobs.UnknownSearchError)
+    def get_search(search_id: str, wait_s: float = 0) -> str:
+        """
+        The state of a find_routes search: status ("queued", "running",
+        "done", "cancelled" or "error", with error saying why), elapsed_s and
+        qualifying (candidates that meet every soft constraint so far).
+        candidates is the best found so far while it runs, then the final
+        list, in find_routes' candidate format; results from a running search
+        can still change. Once finished, the reply also has near_miss,
+        budget_exceeded, seed, and warnings, as find_routes' results used to.
+
+        wait_s (at most 45) holds the call until the search finishes or that
+        many seconds pass, so a long search is followed with repeated calls,
+        each wait_s=40. A search is lost if the server restarts, or an hour
+        after it finishes; the answer then says so.
+        """
+        return json.dumps(_search_reply(search_jobs.get(search_id, wait_s)))
+
+    @mcp.tool()
+    @threaded
+    @reporting(search_jobs.UnknownSearchError)
+    def cancel_search(search_id: str) -> str:
+        """
+        Stop a find_routes search and return get_search's reply: status
+        "cancelled" with the candidates found so far, which can be shared and
+        saved like any other. Use it when the athlete changes the request or
+        the search runs longer than they will wait.
+        """
+        return json.dumps(_search_reply(search_jobs.cancel(search_id)))
 
     @mcp.tool()
     @reporting(route_search.CandidateNotFoundError)
