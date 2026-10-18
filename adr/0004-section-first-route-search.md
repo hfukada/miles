@@ -194,6 +194,34 @@ out-and-back when its stretch is better.
 - Drive time to a start does not enter the ranking (phase 3). Miles run on a
   stretch's edges outside its chain are credited to that stretch.
 
+### Phase 2b: one search over a section graph (accepted 2026-10-18)
+
+Phase 2 treats a route as a section run plus the cheapest way home, so a return
+is scored as cost, never as running: it cannot find "up one trail, down the
+other, road home", and stops along the way have no place in it. A route is
+instead a walk that stitches stretches together with connectors.
+
+- **The graph.** Nodes are stretch ends and entry points, plus the start and any
+  stops. Edges are of two kinds: running a stretch (or the part of it between
+  two of its entry points), worth its adjusted quality per mile times its miles;
+  and a connector, the preference-weighted shortest path between two nodes, worth
+  nothing and charged at the survey's access cost. Connectors come from the
+  weighted trees the survey already computes, cached per area, and per start for
+  pinned areas.
+- **The search.** A bounded beam search over walks from the start, scored as
+  quality minus connector cost, kept within the distance window, ends at the
+  start (or the requested finish), and passes each stop near its requested mile.
+  Out-and-backs, loops, lollipops, stitched loops and figure-eights through a
+  stop are all walks in this graph; the per-shape builders go.
+- **Repeats replace the loop bonus.** A stretch run a second time earns
+  `repeat_value` (default 0.5, a request may set 0 to 1) of its quality. Loops
+  win when they are about as good, and an out-and-back that stays on a much
+  better stretch still beats a loop padded with weaker connectors.
+- **Stops.** `stops` lists points the route must pass, each optionally near a
+  mile mark (a refill at home, bottles left at a lot). A stop is a graph node
+  the walk must visit inside its mile window.
+- **Fallback.** The random walk stays only for a start with no reachable section.
+
 ## Consequences
 
 - Network build takes longer and stores more per area (sections and their
