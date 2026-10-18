@@ -63,15 +63,21 @@ from .races import (
 # allowlist for the SDK's DNS-rebinding protection (Host-header check).
 # Unset, FastMCP's own default applies: localhost Hosts only — secure for
 # the local case, and any remote client gets 421 "Invalid Host header"
-# until the deployment's hostnames are listed here.
+# until the deployment's hostnames are listed here. Origins are allowed for
+# the same hosts; a ":*" pattern only matches an origin that carries a port,
+# so the port-less form is allowed too (clients send "http://localhost").
 _allowed_hosts = [
     h.strip() for h in os.environ.get("MILES_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
 ]
+
+
+def allowed_origins(hosts: list[str]) -> list[str]:
+    origin_hosts = sorted({h for host in hosts for h in (host, host.removesuffix(":*"))})
+    return [f"{scheme}://{h}" for h in origin_hosts for scheme in ("http", "https")]
+
+
 _transport_security = (
-    TransportSecuritySettings(
-        allowed_hosts=_allowed_hosts,
-        allowed_origins=[f"{scheme}://{h}" for h in _allowed_hosts for scheme in ("http", "https")],
-    )
+    TransportSecuritySettings(allowed_hosts=_allowed_hosts, allowed_origins=allowed_origins(_allowed_hosts))
     if _allowed_hosts
     else None
 )

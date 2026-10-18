@@ -161,3 +161,17 @@ def test_find_routes_tool_reports_the_sections_a_candidate_runs_and_takes_the_se
     assert tool("find_routes", {**args, "sections": None, "loop_bonus": 0.0})["candidates"][0]["ranking"]["loop_factor"] == 1.0
     assert "loop_bonus" in tool("find_routes", {**args, "loop_bonus": 2.0})["error"]
     assert "no section 999999" in tool("find_routes", {**args, "sections": [999999]})["error"]
+
+
+@pytest.mark.parametrize("origin", ["http://localhost", "http://localhost:6274", "https://miles-host"])
+def test_clients_from_an_allowed_host_pass_the_origin_check_with_or_without_a_port(origin: str) -> None:
+    from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
+
+    from miles.mcp_server import allowed_origins
+
+    hosts = ["localhost:*", "miles-host:*"]
+    middleware = TransportSecurityMiddleware(
+        TransportSecuritySettings(allowed_hosts=hosts, allowed_origins=allowed_origins(hosts))
+    )
+    assert middleware._validate_origin(origin)
+    assert not middleware._validate_origin("http://elsewhere.test")
