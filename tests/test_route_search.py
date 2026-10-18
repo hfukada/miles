@@ -510,3 +510,23 @@ def test_concurrent_searches_run_one_at_a_time_and_each_gets_its_full_budget(tmp
     assert len(by_search) == 2
     for calls in by_search.values():
         assert calls[-1][1] - calls[0][0] >= budget_s * 0.8
+
+
+def test_diversify_drops_a_duplicate_cut_at_another_point_and_ranks_a_near_duplicate_after_a_different_route():
+    def edge(length_m: float, origin: int | None = None) -> dict:
+        return {"length_m": length_m} | ({} if origin is None else {"origin": origin})
+
+    rows = {1: edge(1000), 2: edge(1000), 3: edge(200), 4: edge(1500), 5: edge(500), -1: edge(900, 1), -2: edge(980, 1)}
+
+    def candidate(edge_ids: list[int], score: float) -> route_search._Candidate:
+        length_m = sum(rows[e]["length_m"] for e in edge_ids)
+        return route_search._Candidate(
+            "out_and_back", {"lat": 0.0, "lng": 0.0}, [(e, True) for e in edge_ids], {"distance_m": length_m}, [], "sections", {"score": score}
+        )
+
+    best, duplicate = candidate([1, 2], 10.0), candidate([-2, 2], 9.9)  # the same edges, one cut short
+    near_duplicate, different = candidate([-1, 2, 3], 9.5), candidate([4, 5], 6.0)
+
+    picked = route_search._diversify([best, duplicate, near_duplicate, different], rows, 2000.0, 5)
+
+    assert picked == [best, different, near_duplicate]

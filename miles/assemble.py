@@ -573,6 +573,7 @@ class Assembly:
         mid = next(self.ids)
         before_key, after_key = next(self.ids), next(self.ids)
         self.rows[before_key], self.rows[after_key] = split["before"], split["after"]
+        split["before"]["origin"] = split["after"]["origin"] = row.get("origin", edge.edge_key)
         if forward:
             key, piece = before_key, GraphEdge(before_key, edge.a, mid, split["before"]["length_m"], edge.allowed, [(before_key, True)])
         else:

@@ -320,3 +320,16 @@ def test_a_trail_mesh_far_from_the_start_gives_lollipops_that_chain_its_regions(
                 by_way[w["name"]] = by_way.get(w["name"], 0.0) + w["length_m"]
             assert by_way["Access Street"] == pytest.approx(5000, rel=0.05)  # the stem, out and back
         assert any(len(blocks_used(c)) >= 2 for c in lollipops)
+
+
+def test_no_two_candidates_run_the_same_edges(conn: sqlite3.Connection):
+    m = Map()
+    m.line([(0, 0), (1000, 0)], "residential", name="Access Street", maxspeed="25 mph")
+    m.line([(1000, 0), (1000, 2000)], "path", name="Alder Trail")
+    m.line([(1000, 0), (1600, 0), (1600, 2000), (1000, 2000)], "path", name="Birch Trail")
+    m.build(conn)
+
+    result = route_search.find_routes(conn, request(START, 6800, 7600))
+
+    runs = [(c["shape"], round(c["distance_m"]), tuple(w["way_id"] for w in c["ways"])) for c in result["candidates"]]
+    assert len(runs) >= 2 and len(set(runs)) == len(runs)

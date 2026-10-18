@@ -18,7 +18,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from collections import ChainMap, OrderedDict
+from collections import ChainMap, OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -62,6 +62,9 @@ POOL_FACTOR = 3
 # after which a small network is judged exhausted.
 STAGNATION_ATTEMPTS = 40
 DIVERSITY_WEIGHT = 2.0
+# Two candidates sharing this share of the longer one's length (by original
+# edge, whatever point a piece was cut at) are one route.
+DUPLICATE_SHARE = 0.95
 # A loop adds this share to the quality of a candidate that returns by a
 # different path; the request may set it from 0 up to MAX_LOOP_BONUS.
 DEFAULT_LOOP_BONUS = 0.075
@@ -360,6 +363,8 @@ def _splice_start(
     if split is None:
         return edge.a if cut.offset_m < cut.row["length_m"] / 2.0 else edge.b
 
+    for key in (cut.before_key, cut.after_key):
+        edge_rows[key]["origin"] = cut.row.get("origin", cut.edge_key)
     node_id = next(iter(ids))
     graph.nodes[node_id] = NodeInfo(split["node_lat"], split["node_lng"], "start")
     if replaced is not None:
@@ -721,12 +726,32 @@ def _quality(candidate: _Candidate, target_m: float) -> float:
     return closeness + _runnable_pct(candidate.score) / 100.0
 
 
+def _cover(edge_rows: Mapping[int, dict], candidate: _Candidate) -> dict[int, float]:
+    """The meters a candidate runs on each original edge: a piece cut from an
+    edge at a start or a turning point counts toward the edge it came from."""
+    cover: defaultdict[int, float] = defaultdict(float)
+    for eid, _ in candidate.segments:
+        row = edge_rows[eid]
+        cover[row.get("origin", eid)] += row["length_m"]
+    return cover
+
+
+def _shared_m(a: Mapping[int, float], b: Mapping[int, float]) -> float:
+    return sum(min(m, b[k]) for k, m in a.items() if k in b)
+
+
+def _duplicate(a: Mapping[int, float], b: Mapping[int, float]) -> bool:
+    return _shared_m(a, b) >= DUPLICATE_SHARE * max(sum(a.values()), sum(b.values()), 1.0)
+
+
 def _diversify(candidates: list[_Candidate], edge_rows: Mapping[int, dict], target_m: float, n: int) -> list[_Candidate]:
     """Up to n of `candidates`, best first, each penalized for the edges it
     shares with those already selected. A section-built candidate ranks by
     its score scaled to the best in the pool, so the penalty weighs the same
-    as for a walk's quality."""
+    as for a walk's quality. A candidate that duplicates a selected one is
+    dropped."""
     remaining = list(candidates)
+    covers = {id(c): _cover(edge_rows, c) for c in candidates}
     selected: list[_Candidate] = []
     best_score = max((cast(dict, c.ranking)["score"] for c in candidates if c.ranking is not None), default=0.0)
 
@@ -739,18 +764,19 @@ def _diversify(candidates: list[_Candidate], edge_rows: Mapping[int, dict], targ
         def penalized(c: _Candidate) -> float:
             if not selected:
                 return base(c)
-            c_ids = {eid for eid, _ in c.segments}
-            shared_m = 0.0
-            for s in selected:
-                s_ids = {eid for eid, _ in s.segments}
-                shared_m += sum(edge_rows.get(eid, {}).get("length_m", 0.0) for eid in c_ids & s_ids)
+            shared_m = sum(_shared_m(covers[id(c)], covers[id(s)]) for s in selected)
             fraction = min(shared_m / max(cast(float, c.score["distance_m"]), 1.0), 1.0)
             return base(c) - DIVERSITY_WEIGHT * fraction
 
         best = max(remaining, key=penalized)
         selected.append(best)
-        remaining.remove(best)
+        remaining = [c for c in remaining if c is not best and not _duplicate(covers[id(c)], covers[id(best)])]
     return selected
+
+
+def _identity(edge_rows: Mapping[int, dict], segments: list[tuple[int, bool]]) -> frozenset[int]:
+    """The original edges a route runs, in either direction."""
+    return frozenset(edge_rows[eid].get("origin", eid) for eid, _ in segments)
 
 
 def _default_seed(request: RouteSearchRequest) -> int:
@@ -939,7 +965,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
                 candidate = _Candidate(
                     built.shape, built.start, segments, score, misses, "sections", assembly.rank(built, segments)
                 )
-                identity = frozenset(eid for eid, _ in segments)
+                identity = _identity(edge_rows, segments)
                 pool = near_misses if misses else qualifying
                 best = pool.get(identity)
                 if best is None or cast(dict, candidate.ranking)["score"] > cast(dict, best.ranking)["score"]:
@@ -985,7 +1011,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
                 score, misses = evaluated
                 candidate = _Candidate(gen_shape, start_info, segments, score, misses)
                 # The same set of edges walked in either direction is one route.
-                identity = frozenset(eid for eid, _ in segments)
+                identity = _identity(edge_rows, segments)
                 pool = near_misses if misses else qualifying
                 if identity not in pool:
                     pool[identity] = candidate
@@ -999,7 +1025,13 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         def near_key(c: _Candidate) -> tuple[int, int, float]:
             return (len(c.missed), c.built_from != "sections", -(c.ranking["score"] if c.ranking else _quality(c, target_m)))
 
-        selected = sorted(near_misses.values(), key=near_key)[:n]
+        selected = []
+        covers: list[dict[int, float]] = []
+        for c in sorted(near_misses.values(), key=near_key):
+            cover = _cover(edge_rows, c)
+            if len(selected) < n and not any(_duplicate(cover, other) for other in covers):
+                selected.append(c)
+                covers.append(cover)
         near_miss = True
 
     result_candidates = [_persist_candidate(conn, area_id, edge_rows, c) for c in selected]
