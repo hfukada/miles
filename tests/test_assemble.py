@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 from test_sections import Map, pt
 
-from miles import assemble, route_search, sections, survey
+from miles import assemble, route_search, routing_mcp, sections, survey
 
 START = pt(0, 0)
 
@@ -333,3 +333,14 @@ def test_no_two_candidates_run_the_same_edges(conn: sqlite3.Connection):
 
     runs = [(c["shape"], round(c["distance_m"]), tuple(w["way_id"] for w in c["ways"])) for c in result["candidates"]]
     assert len(runs) >= 2 and len(set(runs)) == len(runs)
+
+
+def test_a_candidate_is_a_near_miss_exactly_when_it_lists_a_missed_constraint(conn: sqlite3.Connection):
+    ring_with_street().build(conn)
+
+    for min_trail_m, expected in ((1500, False), (9000, True)):
+        result = route_search.find_routes(conn, request(START, 2700, 3300, min_trail_m=min_trail_m))
+
+        assert result["candidates"] and result["near_miss"] is expected
+        for c in result["candidates"]:
+            assert routing_mcp._candidate_summary(c)["near_miss"] is expected

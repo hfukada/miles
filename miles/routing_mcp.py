@@ -81,6 +81,7 @@ def _candidate_summary(candidate: route_search.RouteCandidateOut) -> dict:
             "max_continuous_uncomfortable_mi": exposure["max_continuous_uncomfortable_m"] / MILE_M,
             "totals_mi": {k: v / MILE_M for k, v in exposure["totals_m"].items()},
         },
+        "near_miss": bool(candidate["missed_constraints"]),
         "missed_constraints": candidate["missed_constraints"],
     }
 
@@ -332,8 +333,9 @@ def register_routing_tools(mcp: FastMCP) -> None:
         Returns up to n candidates (default 5): start, distance, trail/road
         mix, runnability, road exposure, and a candidate_id for
         get_route_candidate/save_route_candidate. When nothing meets every
-        soft constraint, the closest few come back with near_miss=true, each
-        listing what it misses. budget_exceeded=true means the 10-second search
+        soft constraint, the closest few come back, each with near_miss=true
+        and what it misses in missed_constraints (the result's near_miss is
+        true then too). budget_exceeded=true means the 10-second search
         time budget ran out before n candidates qualified, so the result may
         be thin; narrowing the request or a different seed can help. The same
         seed, request, and network reproduce the same candidates; the seed

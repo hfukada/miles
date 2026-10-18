@@ -1020,7 +1020,6 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
 
     if qualifying:
         selected = _diversify(list(qualifying.values()), edge_rows, target_m, n)
-        near_miss = False
     else:
         def near_key(c: _Candidate) -> tuple[int, int, float]:
             return (len(c.missed), c.built_from != "sections", -(c.ranking["score"] if c.ranking else _quality(c, target_m)))
@@ -1032,13 +1031,12 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
             if len(selected) < n and not any(_duplicate(cover, other) for other in covers):
                 selected.append(c)
                 covers.append(cover)
-        near_miss = True
 
     result_candidates = [_persist_candidate(conn, area_id, edge_rows, c) for c in selected]
     conn.commit()
     return {
         "candidates": result_candidates,
-        "near_miss": near_miss,
+        "near_miss": any(c["missed_constraints"] for c in result_candidates),
         "budget_exceeded": budget_exceeded,
         "seed": seed,
         "warnings": warnings,
