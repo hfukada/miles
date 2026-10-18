@@ -9,7 +9,7 @@ preference-weighted shortest-path pass over the area graph.
 
 Score, in quality-miles:
 
-    score = quality x adjustment - access_cost
+    score = quality x adjustment x gain_fit - access_cost
 
     quality     = usable_mi x continuity x (1 + scenery) x runnability
                   x surface
@@ -28,9 +28,13 @@ Score, in quality-miles:
                   (run + GRIND_VALUE x grind + HIKE_VALUE x hike), the shares
                   taken from the section's grade histogram through the
                   athlete's terrain model
+                  A purpose sets GRIND_VALUE and HIKE_VALUE and scales the
+                  continuity and scenery terms (PURPOSES).
     surface     = the section's singletrack, track, and other shares of its
                   length, each weighted by SURFACE_WEIGHTS for the request's
                   surface_preference
+    gain_fit    = 1 inside the climb per mile the request's purpose wants,
+                  falling outside it (gain_fit()); always 1 with no purpose
     access_cost = ACCESS_COST_PER_WEIGHTED_MI x the one-way approach in
                   weighted miles: each stretch of the shortest approach counts
                   its length times its weight, which is higher on tolerable
@@ -68,6 +72,7 @@ from typing import Mapping, Sequence, cast
 from typing_extensions import NotRequired, TypedDict
 
 from . import familiarity, network, route_search, sections, terrain
+from .fitness import FT_PER_M
 from .route_search import GraphEdge, SearchGraph
 
 MILE_M = 1609.344
@@ -119,6 +124,49 @@ SURFACE_WEIGHTS: dict[str, dict[str, float]] = {
     "paved": {"singletrack": 0.6, "track": 0.6, "other": 1.0},
 }
 SURFACE_PREFERENCES = tuple(SURFACE_WEIGHTS)
+
+
+@dataclass(frozen=True)
+class Purpose:
+    """What a run is for, as the terms it changes: the climb per mile it wants
+    (a band in feet per mile, None for no limit on that side), how much grind
+    and hiking are worth against running, how much a section's intersections
+    count against it, and how much its scenery counts for."""
+    gain_ft_per_mi: tuple[float | None, float | None] = (None, None)
+    grind_value: float = GRIND_VALUE
+    hike_value: float = HIKE_VALUE
+    continuity_scale: float = 1.0
+    scenery_scale: float = 1.0
+
+
+PURPOSES: dict[str, Purpose] = {
+    "easy": Purpose(gain_ft_per_mi=(None, 40.0), grind_value=0.4, hike_value=0.05),
+    "workout": Purpose(gain_ft_per_mi=(None, 30.0), grind_value=0.4, hike_value=0.0, continuity_scale=2.5),
+    "long": Purpose(continuity_scale=0.7, scenery_scale=1.5),
+    "hilly": Purpose(gain_ft_per_mi=(120.0, None), grind_value=0.95, hike_value=0.5, continuity_scale=0.7),
+}
+# A route or section outside its purpose's gain band keeps 1 less this many
+# times the miss as a share of the band's nearest edge, to at least GAIN_FIT_FLOOR.
+GAIN_FIT_SLOPE = 1.0
+GAIN_FIT_FLOOR = 0.15
+
+
+def purpose_terms(name: str | None) -> Purpose:
+    if name is None:
+        return Purpose()
+    if name not in PURPOSES:
+        raise ValueError(f"unknown purpose {name!r}; choose from {', '.join(PURPOSES)}")
+    return PURPOSES[name]
+
+
+def gain_fit(ft_per_mi: float, band: tuple[float | None, float | None]) -> float:
+    """1 inside the gain band; outside it, falling with the miss."""
+    lo, hi = band
+    if lo is not None and ft_per_mi < lo:
+        return max(GAIN_FIT_FLOOR, 1.0 - GAIN_FIT_SLOPE * (lo - ft_per_mi) / lo)
+    if hi is not None and ft_per_mi > hi:
+        return max(GAIN_FIT_FLOOR, 1.0 - GAIN_FIT_SLOPE * (ft_per_mi - hi) / hi)
+    return 1.0
 
 
 class SurveyRow(TypedDict):
@@ -226,14 +274,24 @@ class EdgeCosts(dict[int, tuple[float, str | None, float]]):
 @dataclass
 class Tree:
     """Cheapest paths from one node: the cost and length to each node reached,
-    and the edge and node each was reached from."""
+    and the edge and node each was reached from. An inbound tree holds the
+    paths that lead to its source rather than away from it."""
     cost: dict[int, float]
     length: dict[int, float]
     prev_edge: dict[int, GraphEdge]
     prev_node: dict[int, int]
+    inbound: bool = False
 
     def steps(self, node: int) -> route_search.Steps:
-        return route_search._reconstruct(node, self.prev_edge, self.prev_node)
+        """The path in travel order: from the source to `node`, or from
+        `node` to the source of an inbound tree."""
+        if not self.inbound:
+            return route_search._reconstruct(node, self.prev_edge, self.prev_node)
+        steps: route_search.Steps = []
+        while node in self.prev_edge:
+            steps.append((self.prev_edge[node], node, self.prev_node[node]))
+            node = self.prev_node[node]
+        return steps
 
 
 # An edge in a tree's `penalized` set costs this many times its usual cost.
@@ -241,14 +299,17 @@ REUSE_COST_FACTOR = 4.0
 
 
 def weighted_tree(
-    graph: SearchGraph, source: int, costs: EdgeCosts, max_cost: float, penalized: Collection[int] = frozenset(),
-    targets: Collection[int] = (),
+    graph: SearchGraph, source: int, costs: Mapping[int, tuple[float, str | None, float]], max_cost: float, penalized: Collection[int] = frozenset(),
+    targets: Collection[int] = (), inbound: bool = False,
 ) -> Tree:
     """The cheapest paths from `source` out to max_cost, an edge in `penalized`
-    costing REUSE_COST_FACTOR times its base cost. With `targets`, the search
+    costing REUSE_COST_FACTOR times its base cost. With `inbound`, the paths
+    lead to `source` instead, each edge taken in the direction of travel, so a
+    one-way edge is crossed the way it may be run. With `targets`, the search
     stops once all of them are settled, so only they (and nodes settled on
     the way) have final costs. Traversal is inlined from GraphEdge.traverse:
     this is the search's hot loop."""
+    blocked_from_a, blocked_from_b = ("a_to_b", "b_to_a") if inbound else ("b_to_a", "a_to_b")
     pending = set(targets)
     cost: dict[int, float] = {source: 0.0}
     length: dict[int, float] = {source: 0.0}
@@ -270,11 +331,11 @@ def weighted_tree(
                 break
         for edge in adjacency.get(node, ()):
             if node == edge.a:
-                if edge.allowed == "b_to_a":
+                if edge.allowed == blocked_from_a:
                     continue
                 nxt = edge.b
             else:
-                if edge.allowed == "a_to_b":
+                if edge.allowed == blocked_from_b:
                     continue
                 nxt = edge.a
             step = costs[edge.edge_key][0]
@@ -287,7 +348,7 @@ def weighted_tree(
                 prev_edge[nxt] = edge
                 prev_node[nxt] = node
                 heapq.heappush(heap, (nd, nxt))
-    return Tree(cost, length, prev_edge, prev_node)
+    return Tree(cost, length, prev_edge, prev_node, inbound)
 
 
 def approach_to(tree: Tree, node: int, costs: EdgeCosts, rows: Mapping[int, dict]) -> Approach:
@@ -330,27 +391,29 @@ def _runnability(section: sections.Section, classes: Sequence[str], speeds: Sequ
     }
 
 
-def _runnability_factor(runnability: dict) -> float:
+def _runnability_factor(runnability: dict, purpose: Purpose) -> float:
     if runnability["run_pct"] is None:
         return NEUTRAL_RUNNABILITY
-    value = (runnability["run_pct"] + GRIND_VALUE * runnability["grind_pct"] + HIKE_VALUE * runnability["hike_pct"]) / 100.0
+    value = (
+        runnability["run_pct"] + purpose.grind_value * runnability["grind_pct"] + purpose.hike_value * runnability["hike_pct"]
+    ) / 100.0
     return RUNNABILITY_FLOOR + (1.0 - RUNNABILITY_FLOOR) * value
 
 
-def _scenery_bonus(scenery: dict) -> float:
+def _scenery_bonus(scenery: dict, scale: float) -> float:
     w = SCENERY_WEIGHTS
     bonus = (
         w["water"] * scenery["near_water_share"] + w["park"] * scenery["in_park_share"]
         + w["protected"] * scenery["protected_share"] + (w["route"] if scenery["route_names"] else 0.0)
         + min(w["poi_cap"], w["poi_each"] * (scenery["summits"] + scenery["viewpoints"]))
     )
-    return min(SCENERY_CAP, bonus)
+    return min(SCENERY_CAP, scale * bonus)
 
 
-def _continuity_factor(section: sections.Section) -> float:
+def _continuity_factor(section: sections.Section, scale: float) -> float:
     miles = max(section.length_m / MILE_M, 0.25)
     x_per_mi = (section.data["crossings"] + JUNCTION_WEIGHT * section.data["junctions"]) / miles
-    return 1.0 / (1.0 + CONTINUITY_PER_X * x_per_mi)
+    return 1.0 / (1.0 + scale * CONTINUITY_PER_X * x_per_mi)
 
 
 def _surface_factor(section: sections.Section, preference: str) -> float:
@@ -406,19 +469,21 @@ class Density:
         return self.continuity * (1.0 + self.scenery_bonus) * self.runnability_factor * self.surface
 
 
-def density_terms(section: sections.Section, classes: Sequence[str], speeds: Sequence[float], preference: str) -> Density:
+def density_terms(
+    section: sections.Section, classes: Sequence[str], speeds: Sequence[float], preference: str, purpose: Purpose = Purpose()
+) -> Density:
     runnability = _runnability(section, classes, speeds)
     return Density(
-        _continuity_factor(section), _scenery_bonus(section.data["scenery"]), _runnability_factor(runnability),
-        _surface_factor(section, preference), runnability,
+        _continuity_factor(section, purpose.continuity_scale), _scenery_bonus(section.data["scenery"], purpose.scenery_scale),
+        _runnability_factor(runnability, purpose), _surface_factor(section, preference), runnability,
     )
 
 
-def density(section: sections.Section, model: terrain.TerrainModel, preference: str) -> float:
+def density(section: sections.Section, model: terrain.TerrainModel, preference: str, purpose: Purpose = Purpose()) -> float:
     """A section's quality per usable mile, before any adjustment: continuity
     x (1 + scenery) x runnability x surface."""
     classes, speeds = grade_classes(model)
-    return density_terms(section, classes, speeds, preference).value
+    return density_terms(section, classes, speeds, preference, purpose).value
 
 
 def _own_adjustment(
@@ -468,6 +533,7 @@ def survey(
     include_fragments: bool = False,
     detail: str = "overview",
     within: int | None = None,
+    purpose: str | None = None,
 ) -> dict:
     """The area's sections around a start, best first: its groups, or with
     detail="detail" its stretches (those of one group, in position order, when
@@ -477,6 +543,7 @@ def survey(
         unknown = [k for k in kinds if k not in sections.SECTION_KINDS]
         if unknown:
             raise ValueError(f"unknown kinds {unknown}; kinds are {', '.join(sections.SECTION_KINDS)}")
+    terms_of_purpose = purpose_terms(purpose)
     preference = surface_preference or "any"
     if preference not in SURFACE_WEIGHTS:
         raise ValueError(f"unknown surface_preference {surface_preference!r}; choose from {', '.join(SURFACE_PREFERENCES)}")
@@ -609,15 +676,17 @@ def survey(
             continue
         approach = approach or Approach(math.inf, math.inf, 0.0, 0.0, 0.0)
 
-        terms = density_terms(section, classes, speeds, preference)
+        terms = density_terms(section, classes, speeds, preference, terms_of_purpose)
         usable_m = max(0.0, min(section.single_path_m, run_m - 2.0 * approach.approach_m)) if math.isfinite(approach.approach_m) else 0.0
         quality = usable_m / MILE_M * terms.value
         factor, adjustment = section_factor(section, parent, judgments, request_factors)
         access_cost = ACCESS_COST_PER_WEIGHTED_MI * approach.cost_m / MILE_M if math.isfinite(approach.cost_m) else math.inf
-        score = quality * factor - access_cost if math.isfinite(access_cost) else None
+        elevated = section.data["elevated_m"]
+        gain_per_mile = section.data["gain_m"] / (elevated / MILE_M) if elevated > 0 else None
+        fit = 1.0 if gain_per_mile is None else gain_fit(gain_per_mile * FT_PER_M, terms_of_purpose.gain_ft_per_mi)
+        score = quality * factor * fit - access_cost if math.isfinite(access_cost) else None
 
         group_stretches = stretches_by_group.get(section.section_id, []) if is_group else []
-        elevated = section.data["elevated_m"]
         surface = section.data["surface_m"]
         surface_total = sum(surface.values())
         row: SurveyRow = {
@@ -648,7 +717,7 @@ def survey(
             "crossings": section.data["crossings"],
             "scenery": section.data["scenery"],
             "runnability": terms.runnability,
-            "gain_m_per_mile": section.data["gain_m"] / (elevated / MILE_M) if elevated > 0 else None,
+            "gain_m_per_mile": gain_per_mile,
             "familiarity": {"runs": runs, "last_run": visit.last_run if visit else None, "new_to_you": runs == 0},
             "access": {
                 "approach_m": approach.approach_m if math.isfinite(approach.approach_m) else None,
@@ -667,6 +736,7 @@ def survey(
                 "quality": quality,
                 "adjustment": factor,
                 "adjusted_quality": quality * factor,
+                "gain_fit": fit,
                 "access_cost": access_cost if math.isfinite(access_cost) else None,
             },
             "score": score,
@@ -693,6 +763,7 @@ def survey(
         "ranked_count": len(ranked),
         "counts_by_kind": counts,
         "surface_preference": preference,
+        "purpose": purpose,
         "fragments_hidden": fragments_hidden,
         "fragment_limit_m": fragment_m,
         "ruled_out_count": ruled_out_count,

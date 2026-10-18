@@ -31,15 +31,26 @@ line so they can correct it:
 |---|---|
 | "13 miles", "about 2 hours" | `distance_mi_min`/`max` (±5–10%; convert time via recent easy pace) |
 | "loop" / "out and back" / "don't care" | `shape` |
-| "I'd rather a loop", "prefer loops" | `loop_bonus` ≈ 0.3; "don't care" → 0; omit for the default 0.075 |
+| "don't mind repeating", "happy to retrace the good part" | `repeat_value` 0.8–1; "no repeats", "no out-and-back" → 0; omit for the default 0.5 |
+| "refill at home around mile 8", "pass the lot halfway", "bottles at the car" | `stops=[{"lat", "lng", "label", "at_mi"}]`: the point, a label, and roughly how far along it should come (omit `at_mi` for "anywhere") |
 | "somewhere I haven't run" | `unfamiliar_only=true` |
 | "real trails", "paved is fine" | `surface_preference` (`singletrack`, `track`, `paved`) |
 | "at least 6 on trail", "mostly trail" | `min_trail_mi` |
 | "highly runnable" | `min_runnable_pct` ≈ 90; "runnable" ≈ 80; "I don't mind hiking" → omit |
-| "hilly", "some climbing", "flat" | `gain_ft_min`/`max`, scaled to distance |
+| "easy 9", "recovery", "shakeout" | `purpose="easy"` |
+| "tempo", "workout", "intervals", "progression" | `purpose="workout"` |
+| "long run", "trail day", "all day out" | `purpose="long"` |
+| "hilly", "climbing", "vert", "hills" | `purpose="hilly"` |
+| a particular climb ("at least 2,000 ft") | `gain_ft_min`/`max`; they replace the purpose's climb band |
 | "not that road", "must include the ridge" | `avoid_way_ids` / `include_way_ids`, with way ids from the `ways` list of `get_route_candidate`. `avoid_way_ids` is hard; `include_way_ids` is soft, so a result can still miss it |
 | "I can drive up to 30 min" | `max_drive_minutes` |
 | "from the door", no mention of driving | no `max_drive_minutes` |
+
+A purpose sets the climb per mile a route is scored against, how much grind and hiking
+count for, and how much junctions and scenery count. It steers the survey, the choice of
+sections, and the search alike. Say which
+purpose you used, as part of the one-line mapping, and pass the same one to `survey_area`
+and `find_routes`. With none, results are as before, with no preference for climb.
 
 Runnable percent counts run + grind (runnable but slow). Road comfort (traffic, speed,
 the maximum continuous uncomfortable stretch) comes from the athlete's stored
@@ -143,8 +154,10 @@ comes from `get_route_candidate`'s `ways` too.
    - `get_section(section_id)` returns a section's ways and a simplified geometry (a
      group also lists its stretches). To build routes around what the athlete picks,
      pass the ids to `find_routes` as `sections=[...]` (groups or stretches):
-     it assembles routes around exactly those. Say which section each candidate is built
-     around (`sections_used`: the section, its stretch, and the miles run on it).
+     every candidate must run at least 400 m of each (a tenth of one shorter than that),
+     and the route is scored as a whole, so the miles it runs on other sections earn
+     their value too. Say which sections each candidate runs (`sections_used`: the
+     section, its stretch, and the miles run on it).
      Naming sections means no random walk: if none can be reached, `warnings` says so.
      Searching is still the same one-at-a-time process below.
 3. **Search.** `find_routes` with the mapped constraints, and `sections=[...]` once the
@@ -152,17 +165,18 @@ comes from `get_route_candidate`'s `ways` too.
    survey's best sections for the start and distance, and the random walk only fills in
    when none of them gives a route (`built_from` is `"sections"` or `"walk"` on each
    candidate; say when one came from the walk, since it is not built around anything in
-   particular). A section-built candidate is an approach, a run along one or more
-   stretches, and a return: an out-and-back turning where the distance fits, a loop, or
-   a lollipop (a stem and a loop inside the section; a loop whose way home rejoins the
-   way out also reads as one). Present
+   particular). A section-built candidate is one walk over the chosen stretches: it runs
+   stretches, joins them with connectors, and ends at the start (`shape` is how the
+   finished walk looks, and a request's `shape` filters on it). Present
    `sections_used` for each. A candidate's `ranking` explains its order: section quality
-   (the miles run on sections, weighted by their survey quality) times a loop factor
-   times how well the distance fits, less the cost of reaching the section and getting
-   home. `loop_bonus` is how much a loop or lollipop gains over an out-and-back
-   of the same sections: "prefer loops" is about 0.3, "I don't care" is 0, the default
-   0.075 lets a loop win only a close call, and a clearly better out-and-back still wins
-   at any value. For a drive budget, candidates
+   (every mile run on any section, weighted by its survey quality) times how well the
+   distance fits and, with a purpose, how well its climb per mile fits (`gain_fit`), less
+   the cost of the miles on no section. `repeat_value` is what running a
+   stretch again is worth, as a share of its first run: the default 0.5 lets a loop win
+   when it is about as good and keeps an out-and-back over a much better stretch ahead of
+   a loop padded with weak connectors; "no repeats" is 0, and "I don't mind repeating"
+   is 0.8–1. A candidate's `stops` reports the mile each stop actually came at; a stop is
+   never ignored, so when no route can pass one, nothing comes back. For a drive budget, candidates
    carry their trailhead and drive minutes; `find_trailheads` lists the starts on
    their own when the athlete wants to choose one first. The drive budget is at most
    90 minutes. If a start has `drive_time_estimated: true`, the routing service was
@@ -172,7 +186,7 @@ comes from `get_route_candidate`'s `ways` too.
    four `find_routes` searches, one after another and never in parallel (the server runs
    one search at a time, so parallel calls only queue), with different styles over the same start and distance:
    runnable (`min_runnable_pct` ≈ 90, no trail floor), trail (`min_trail_mi` about half
-   the distance), and easy (low `gain_ft_max`, shorter) — plus whatever their request
+   the distance), and easy (`purpose="easy"`, shorter) — plus whatever their request
    implies. Present the results grouped by style, two or three per group, best group
    first: "a few strong road loops: A, B, C; two trail areas worth a look: D, E; for
    short and flat: F." Say plainly when a group is weak ("the trail options here are
@@ -190,6 +204,9 @@ comes from `get_route_candidate`'s `ways` too.
    limit) without asking. If `budget_exceeded` is true, the 10-second search budget ran
    out before enough candidates qualified: say the result may be thin, and narrow the
    request or try again.
+   After a search, call `share_candidates` with the 2-6 candidates worth considering and
+   a one-line note each, and give the athlete the link: the page shows each one's map,
+   profile and stats, and its Save as route button saves it.
 6. **Save.** `save_route_candidate` turns a candidate into a normal route. Then the
    athlete can view it at `/route.html?id=<route_id>` on the miles web app, download its
    GPX from `/api/routes/<route_id>/gpx` (for Strava or a watch), compare it with a race

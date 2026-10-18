@@ -108,3 +108,38 @@ function addBaseLayer(map, { withTerrainData = false } = {}) {
     }
   });
 }
+
+// One polyline segment per class run, repeating each boundary point at the
+// start of the next segment so the drawn line stays continuous across a class
+// change.
+function groupByClass(runs) {
+  return runs
+    .map((run, i) => {
+      const bridge = i ? [runs[i - 1].points[runs[i - 1].points.length - 1]] : [];
+      return { cls: run.cls, latlngs: [...bridge, ...run.points].map(p => [p.lat, p.lng]) };
+    })
+    .filter(g => g.latlngs.length > 1);
+}
+
+// Draws points ({lat, lng, cls}) into `layer` as a class-colored line over a
+// white casing, with a green start and a dark end marker. Returns the line's
+// [lat, lng] pairs.
+function drawClassedRoute(layer, points, theme) {
+  const groups = groupByClass(classRuns(points));
+  const allLatLngs = groups.flatMap(g => g.latlngs);
+  if (!allLatLngs.length) return allLatLngs;
+
+  // Casings first, so a neighboring segment never covers another's color.
+  for (const g of groups) L.polyline(g.latlngs, { color: '#ffffff', weight: 7, opacity: 0.9, lineCap: 'round' }).addTo(layer);
+  for (const g of groups) L.polyline(g.latlngs, { color: classColor(theme, g.cls), weight: 4, opacity: 1, lineCap: 'round' }).addTo(layer);
+
+  const dotIcon = (fill) => L.divIcon({
+    className: '',
+    html: `<svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="${fill}" stroke="white" stroke-width="2"/></svg>`,
+    iconSize: [16, 16],
+    iconAnchor: [8, 8],
+  });
+  L.marker(allLatLngs[0], { icon: dotIcon('#22c55e'), zIndexOffset: 1000 }).addTo(layer);
+  L.marker(allLatLngs[allLatLngs.length - 1], { icon: dotIcon('#111'), zIndexOffset: 1000 }).addTo(layer);
+  return allLatLngs;
+}

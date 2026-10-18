@@ -207,7 +207,7 @@ def connection(opener: Callable[[], sqlite3.Connection] | None = None) -> Iterat
         conn.close()
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def add_missing_columns(conn: sqlite3.Connection, table: str, *columns: str) -> bool:
@@ -633,6 +633,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     # These modules import this one (for connect()/DB_PATH), so importing
     # them at module level here would cycle; function-body imports break it.
     from .areas import init_area_schema
+    from .candidate_sets import init_candidate_set_schema
     from .drive_starts import init_drive_schema
     from .events import init_event_schema
     from .extracts import init_extract_schema
@@ -647,6 +648,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     init_network_schema(conn)
     init_drive_schema(conn)
     init_search_schema(conn)
+    init_candidate_set_schema(conn)
     init_section_schema(conn)
     # Graphs and sections built before the trail kind, bridge marks and
     # stretches carry none of these; their areas rebuild on the next

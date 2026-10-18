@@ -214,6 +214,79 @@ function statTile(label, value, sub, note) {
   `;
 }
 
+// Runnability classes read through the athlete's own terrain thresholds
+// (terrain.py's classify_grade), not a fixed grade-band scheme.
+const CLASS_LABEL = { run: 'Run', grind: 'Grind', hike: 'Hike' };
+
+function classColor(theme, cls) {
+  return theme.route[cls] ?? theme.route.neutral;
+}
+
+function classLegendHtml(theme) {
+  return ['run', 'grind', 'hike'].map(cls => `
+    <span><span class="swatch" style="background:${classColor(theme, cls)}"></span>${CLASS_LABEL[cls]}</span>
+  `).join('');
+}
+
+// Runs of consecutive points ({dist_m, ele_m, cls, ...}) sharing a class;
+// a point without a class is a run of class null.
+function classRuns(points) {
+  const runs = [];
+  for (const p of points) {
+    const cls = p.cls ?? null;
+    const last = runs[runs.length - 1];
+    if (last && last.cls === cls) last.points.push(p);
+    else runs.push({ cls, points: [p] });
+  }
+  return runs;
+}
+
+// ECharts option for an elevation profile (miles by feet) with each class run
+// banded under one neutral line. Points are in route_point_classes' shape.
+function classedElevationOption(theme, points) {
+  const data = points.map(p => [p.dist_m / MILE_METERS, p.ele_m != null ? p.ele_m * FT_PER_METER : null]);
+  const runs = classRuns(points);
+  const markAreaData = runs
+    .map((run, i) => {
+      const last = run.points[run.points.length - 1];
+      return {
+        cls: run.cls,
+        start: run.points[0].dist_m / MILE_METERS,
+        end: (runs[i + 1] ? runs[i + 1].points[0] : last).dist_m / MILE_METERS,
+      };
+    })
+    .filter(b => b.cls != null)
+    .map(b => [
+      { xAxis: b.start, itemStyle: { color: classColor(theme, b.cls), opacity: 0.22 } },
+      { xAxis: b.end },
+    ]);
+  return {
+    animation: false,
+    grid: { top: 12, right: 24, bottom: 32, left: 56 },
+    tooltip: chartAxisTooltip(theme, (items) => {
+      if (!items.length) return '';
+      const v = items[0].data[1];
+      return `${items[0].axisValue.toFixed(2)} mi<br>${v != null ? Math.round(v) : '—'} ft`;
+    }),
+    xAxis: chartValueAxis(theme, {
+      name: 'mi',
+      min: 0,
+      axisLine: { lineStyle: { color: theme.gridline } },
+      splitLine: { show: false },
+    }),
+    yAxis: chartValueAxis(theme, { name: 'ft', scale: true }),
+    series: [{
+      name: 'Elevation',
+      type: 'line',
+      data,
+      showSymbol: false,
+      areaStyle: { color: theme.muted, opacity: 0.1 },
+      lineStyle: { width: 1.25, color: theme.text },
+      markArea: markAreaData.length ? { silent: true, data: markAreaData } : undefined,
+    }],
+  };
+}
+
 function chartValueAxis(theme, { axisLabel = {}, ...rest } = {}) {
   return {
     type: 'value',
@@ -246,4 +319,27 @@ function chartAxisTooltip(theme, formatter) {
 // Shared by the terrain page's four charts: bar/line over a category axis.
 function chartGrid(bottom) {
   return { top: 16, right: 24, bottom, left: 56 };
+}
+
+function esc(text) {
+  return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function failure(res) {
+  try {
+    const body = await res.json();
+    if (typeof body.detail === 'string') return body.detail;
+  } catch (e) { /* not JSON */ }
+  return `HTTP ${res.status}`;
+}
+
+// {data} or {error}: a failed fetch never throws, so each panel decides
+// for itself what a failure means.
+async function getJson(url) {
+  try {
+    const res = await fetch(url);
+    return res.ok ? { data: await res.json() } : { error: await failure(res) };
+  } catch (e) {
+    return { error: 'Network error.' };
+  }
 }

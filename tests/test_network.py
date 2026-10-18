@@ -289,6 +289,30 @@ def test_parse_maxspeed_mph(raw, expected):
     assert parsed is None if expected is None else parsed == pytest.approx(expected, rel=1e-4)
 
 
+@pytest.mark.parametrize(
+    "highway, tags, expected",
+    [
+        ("residential", {"oneway": "yes"}, "no"),
+        ("secondary", {"oneway": "-1"}, "no"),
+        ("residential", {"oneway": "yes", "oneway:foot": "yes"}, "yes"),
+        ("residential", {"oneway": "yes", "oneway:foot": "no"}, "no"),
+        ("residential", {"oneway:foot": "-1"}, "-1"),
+        ("path", {"oneway": "yes"}, "yes"),
+        ("track", {"oneway": "-1"}, "-1"),
+        ("footway", {"oneway": "yes", "oneway:foot": "no"}, "no"),
+        ("path", {"oneway:bicycle": "yes"}, "no"),
+        ("path", {"oneway": "no", "oneway:bicycle": "yes"}, "no"),
+    ],
+    ids=[
+        "a one-way street is two-way for a runner", "a reversed one-way street too", "oneway:foot binds a street",
+        "oneway:foot=no", "oneway:foot=-1", "a one-way path binds", "a one-way track binds",
+        "oneway:foot overrides oneway on a path", "oneway:bicycle is ignored", "oneway:bicycle beside oneway=no",
+    ],
+)
+def test_the_runner_direction_of_a_way_follows_foot_tags_and_ignores_street_and_bicycle_oneways(highway, tags, expected):
+    assert network._oneway_value(highway, tags) == expected
+
+
 def _road_exposure(conn: sqlite3.Connection, tags: dict) -> tuple[dict, float]:
     """Per-tier metres and total distance for a 300 m road with the given tags."""
     elements = [node(1, 40.0, -105.0), node(2, 40.0 + by_deg_lat(300.0), -105.0), way(10, [1, 2], tags)]

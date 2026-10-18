@@ -36,6 +36,7 @@ from .distance_builds import (
     _DISTANCE_CATEGORY,
 )
 from .areas_api import router as areas_api_router
+from .candidates_api import router as candidates_api_router
 from .fitness_api import router as fitness_api_router
 from .health_api import router as health_api_router
 from .plan_api import router as plan_api_router
@@ -1506,6 +1507,7 @@ def sync_status() -> sync.SyncStatus:
 
 # Must precede the catch-all static mount below.
 app.include_router(areas_api_router)
+app.include_router(candidates_api_router)
 app.include_router(distance_builds_router)
 app.include_router(fitness_api_router)
 app.include_router(health_api_router)

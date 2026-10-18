@@ -65,16 +65,16 @@ out-and-back when its stretch is better.
   section: it is never used in a route (as avoided ways are removed from the
   graph), persists with its note keyed the same way, can be undone, and still
   appears in a survey marked excluded.
-- **Routes are assembled around chosen sections.** A candidate is an approach,
-  one or more sections, and a return: a loop through a section, an
-  out-and-back along it, or a lollipop. Explicit
-  style requests (trail, flat, highly runnable) filter sections before
-  assembly rather than candidates after it. The randomized walk remains as the
-  fallback for requests with no section preference.
+- **Routes are built around chosen sections.** A candidate is a walk that runs
+  stretches of the chosen sections and joins them with connectors (phase 2b).
+  Explicit style requests (trail, flat, highly runnable) filter sections before
+  the search rather than candidates after it. The randomized walk remains as the
+  fallback for requests no section can serve.
 - **Ranking trades section quality against access cost.**
   A candidate's score is the adjusted quality of the distance spent on
-  sections, less its access cost, with a loop bonus (default 7.5%, adjustable per request
-  from 0 to about 50%) so a loop wins between otherwise equal routes and a
+  sections, less the cost of the connectors between them. A stretch run again
+  earns a share of its value (`repeat_value`, default 50%, adjustable per
+  request from 0 to 100%), so a loop wins between otherwise equal routes and a
   better out-and-back still wins over a lesser loop. Scenery counts the same
   everywhere; unfamiliar sections are a filter the request can ask for, not a
   global weight.
@@ -85,7 +85,7 @@ out-and-back when its stretch is better.
    store sections, add the survey tool with section adjustments (stored and
    per request), and open route conversations with it. An agent can already steer the existing search toward a section through
    `include_way_ids`.
-2. Section-anchored candidate assembly and the new ranking.
+2. Route search over the sections (first as per-shape builders, then one search over a section graph) and the new ranking.
 3. Drive mode over sections and their trailheads.
 
 ### Phase 1 as built
@@ -152,75 +152,114 @@ out-and-back when its stretch is better.
 
 ### Phase 2 as built
 
-- `assemble.py` builds candidates around blocks. With `sections=[ids]` (a group
-  or stretch id; a group stands for its stretches) it builds around exactly those
-  and never falls back to the walk: an excluded section is refused, and a request
-  none of whose sections can be reached returns no candidates and a warning.
-  Without it the survey's best sections for each start (the first four, eight
-  each) supply the blocks, and the walk runs only when no section-built candidate
-  meets the request.
-- One preference-weighted shortest-path tree per start, on the survey's access cost,
-  reaches every block entry; an approach longer than 30% of the target one way, or
-  with more continuous uncomfortable road than the preferences allow, drops that
-  entry. Return trees run from the start with the block's chain at four times its
-  cost, so a return avoids the way out where it can.
-- Shapes. Out-and-back: approach, the chain from an entry in either direction, the
-  last edge cut where the distance runs out, retrace; when the chain ends first, the
-  route goes on over the next-best block within a short connector, up to six times.
-  Loop: the chain to the node whose total with the return fits (of those that make
-  the distance, the one whose way home retraces least), home by the penalized tree;
-  a chain too short for the target goes out over further blocks, up to six chains
-  in all with a block of the same group preferred, each reached by a connector as
-  short as an out-and-back's, and returns by a tree that avoids all of them. A
-  return that rejoins the approach for 200 m or more makes the route a lollipop. Lollipop: a stem and a loop inside the
-  group's own edges, out to a far point and back by a path that avoids the way out.
-  A loop-like candidate whose return retraces half or more of what it ran is
-  reported as an out-and-back and earns no bonus.
+- `assemble.py` plans the blocks a search runs over. With `sections=[ids]` (a group
+  or stretch id; a group stands for its stretches) it uses exactly those and never
+  falls back to the walk: an excluded section is refused, and a request none of whose
+  sections can be reached returns no candidates and a warning. Without it the survey's
+  best sections for each start (the first four, eight each) supply the blocks, and the
+  walk runs only when no section-built candidate meets the request.
 - Every candidate goes through the same pipeline as a walk: `score_path`, the
   road-exposure limit, soft constraints, diversification (a section-built
   candidate's score is scaled to the best in its pool), persistence, and the search
   lock and time budget. The survey behind the plan runs before the lock is taken.
-- Ranking, in quality-miles: `score = quality x loop x fit - access_cost`.
-  `quality` sums, over the blocks run, the section's adjusted quality per mile
-  (continuity x (1 + scenery) x runnability x surface x adjustment, survey.py's
-  terms) times the miles run on it, counted each time it is run. `loop` is
-  `1 + loop_bonus` (default 0.075, a request may set 0 to 0.5) for a loop or
-  lollipop, else 1. `fit` is 1 inside the distance range and falls by twice the miss
-  as a share of the target outside it. `access_cost` is the survey's per-mile charge
-  on half the weighted cost of everything run off the blocks. A candidate reports
-  `built_from`, `sections_used` (section, stretch, and meters on each) and the terms.
 - The graph a search runs on keeps every node of the chosen sections' edges, whatever
   their distance from the start, so a long edge is not lost to the search radius.
-- Drive time to a start does not enter the ranking (phase 3). Miles run on a
-  stretch's edges outside its chain are credited to that stretch.
+- Drive time to a start does not enter the ranking (phase 3).
+- Phase 2's per-shape builders (an approach, one chain, a retrace or a tree home) and
+  its loop bonus were replaced by phase 2b: they could only score a return as cost,
+  and walked it by reversing the path from the start, which fails across a one-way
+  edge.
 
-### Phase 2b: one search over a section graph (accepted 2026-10-18)
+### Phase 2b as built: one search over a section graph
 
-Phase 2 treats a route as a section run plus the cheapest way home, so a return
-is scored as cost, never as running: it cannot find "up one trail, down the
-other, road home", and stops along the way have no place in it. A route is
-instead a walk that stitches stretches together with connectors.
+- **One-way tags are read for a runner** (network build): a road ignores `oneway`
+  unless `oneway:foot` is set, a path or track follows `oneway:foot` and then `oneway`,
+  and `oneway:bicycle` never applies. Every path a search needs is computed in the
+  direction of travel (an inbound tree for the way home), never by reversing one.
+- **The graph.** Running edges are the pieces (about 250 m) of every edge of the
+  chosen stretches, in each direction a runner may take; a piece is worth the
+  stretch's adjusted quality per mile (`survey.density` times the section's factor)
+  times its miles. Connectors are the preference-weighted shortest paths between hubs
+  (stretch entry and end nodes, the start, the stops), charged half the survey's
+  per-mile access charge on the weighted length of their miles on no stretch (what
+  they earn on stretches is under "Phase 2c"), so a route that goes out and comes back
+  pays the survey's charge once. The start and the stops are sinks
+  that every hub and every junction of a stretch can connect to, by the cheapest path
+  and by the cheapest that avoids the corridor the way out used, so a loop can come
+  home by another road. A connector that is only stretches is dropped (the walk runs
+  those), as is one with more continuous uncomfortable road than the preferences allow.
+- **The search.** A bounded beam search walks the graph in layers of 150 m, keeping
+  the best 200 walks (one per node and set of stops passed) by score so far plus an
+  optimistic bound: the miles left, less the shortest way home, at the best density
+  within reach. A walk is pruned when it can no longer get home inside the range, and
+  complete when it is back at the start inside the range (5% slack, scored by the
+  distance-fit term outside it) with every stop passed. To return walks that are not
+  variations of one, a start is searched five times, each time with the stretches of the
+  best walk so far worth 40% of their value. Finished walks are deduplicated by the
+  original edges they run (the same run in either direction, or cut at different
+  points, is one). Completions and finished walks are taken best of each set of
+  stretches first, so turning-point variants of one stretch cannot crowd out the best
+  walk over another set. Shape (out-and-back when half the walk repeats, lollipop when it ends
+  retracing its start, otherwise loop) is read off the finished walk and only filters
+  a request's `shape`.
+- **Soft constraints steer the search.** A request for climbing or trail makes the
+  search value a stretch more the more it helps (up to double for the climb per mile
+  the request needs, plus half for being trail), in the search only: the reported
+  score is unsteered. Without it the highest-scoring walks decide, and a request for
+  a hilly route gets whatever hill the best walks happen to touch. A climb band's
+  top steers the other way: a stretch climbing over it is valued less, to a quarter.
+- **Repeats replace the loop bonus.** A piece run a second time earns `repeat_value`
+  (default 0.5, a request may set 0 to 1) of its value and a third time or more its
+  square, so oscillating on one stretch cannot fill a distance for free.
+- **Stops.** `stops: [{lat, lng, label?, at_mi?}]` snap to the network like a start.
+  A stop is passed when the walk is at its node, inside a mile either side of `at_mi`
+  if given. Each candidate reports the mile it was passed at. A request with stops
+  never falls back to the walk.
+- **Connector trees are cached** in process per area, graph build and set of avoided
+  ways, and per route preferences and terrain model (their edge costs), bounded to
+  3 areas and 1000 trees each. Trees from the start and the stops depend on the
+  request's own splice of those points into the graph and are computed per request.
+- **Ranking, in quality-miles:** `score = quality x fit x gain_fit - access_cost`, with
+  `quality` the miles run on stretches weighted as above, `fit` 1 inside the range and falling by
+  twice the miss as a share of the target outside it. A candidate reports
+  `built_from`, `sections_used` (section, stretch and meters, a meter run twice counted
+  twice, those with 400 m or more) and these terms.
+- **Fallback.** The random walk runs only for a request that names no sections and
+  has no stops, when no section-built candidate meets the request; the section search
+  then uses 60% of the time budget and leaves the rest to the walk.
 
-- **The graph.** Nodes are stretch ends and entry points, plus the start and any
-  stops. Edges are of two kinds: running a stretch (or the part of it between
-  two of its entry points), worth its adjusted quality per mile times its miles;
-  and a connector, the preference-weighted shortest path between two nodes, worth
-  nothing and charged at the survey's access cost. Connectors come from the
-  weighted trees the survey already computes, cached per area, and per start for
-  pinned areas.
-- **The search.** A bounded beam search over walks from the start, scored as
-  quality minus connector cost, kept within the distance window, ends at the
-  start (or the requested finish), and passes each stop near its requested mile.
-  Out-and-backs, loops, lollipops, stitched loops and figure-eights through a
-  stop are all walks in this graph; the per-shape builders go.
-- **Repeats replace the loop bonus.** A stretch run a second time earns
-  `repeat_value` (default 0.5, a request may set 0 to 1) of its quality. Loops
-  win when they are about as good, and an out-and-back that stays on a much
-  better stretch still beats a loop padded with weaker connectors.
-- **Stops.** `stops` lists points the route must pass, each optionally near a
-  mile mark (a refill at home, bottles left at a lot). A stop is a graph node
-  the walk must visit inside its mile window.
-- **Fallback.** The random walk stays only for a start with no reachable section.
+### Phase 2c as built: credit for every mile, must-include, purpose
+
+- **Every mile on a stored stretch earns that stretch's adjusted quality**, whether
+  the walk runs it as a piece or a connector crosses it, and whether or not the
+  request named it. Only miles on no stretch are connector cost. Every stretch of the
+  area is a planned block; those chosen to build around (named, or the survey's best)
+  supply running pieces and hubs, the rest only credit. A connector's crossing of a
+  stretch is counted per piece where the stretch is built around and per edge elsewhere,
+  so a repeat earns `repeat_value` by whichever way it was run, and a retrace by
+  connector earns no more than one by running. The search and the final ranking share
+  one value, so they agree. This replaced the rule that only the named sections earn:
+  a loop home by a riverside path the request never named paid for those miles
+  and earned nothing, and lost to a retraced out-and-back.
+- **`sections=[ids]` means must-include.** A candidate qualifies only if it covers
+  `MIN_INCLUDE_M` (400 m) of each named section, or `MIN_INCLUDE_SHARE` (a tenth) of it
+  if that is less, counting any mile on it; the whole route is scored. A named section
+  is still refused when excluded, and the walk still never fills in.
+- **Purpose** (`easy`, `workout`, `long`, `hilly`; none keeps the earlier behavior)
+  is a set of terms (`survey.PURPOSES` holds the values): a climb band in feet per mile,
+  the value of grind and hiking in runnability, a scale on the continuity term, and one on
+  scenery. They change the survey's section quality and so the search's block values;
+  the survey also multiplies a section's score by a `gain_fit` of its own climb per
+  mile. A route's score is multiplied by the same `gain_fit` of its climb per mile
+  (`GAIN_FIT_SLOPE`, `GAIN_FIT_FLOOR`): 1 inside the band and, outside it, falling by
+  the miss as a share of the band's nearest edge. A request's own gain range replaces
+  the band; with a range and no purpose a route is not scored against it, as before. The
+  search carries each walk's climb (half its smoothed vertical travel, as a walk is
+  closed) so a finished walk is ordered by the fit, and the reported score uses the
+  route's measured gain. The random walk ignores the purpose.
+- **A candidate scoring under a quarter of the best** in the pool is offered only
+  after everything above it (`DIVERSITY_FLOOR`): the diversity penalty otherwise
+  lifted a route that its purpose had scored out, because it shared nothing.
 
 ## Consequences
 

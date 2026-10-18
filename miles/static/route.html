@@ -22,30 +22,10 @@
     .route-view .note button:disabled { color: var(--muted); cursor: default; }
     .route-view .note .error { display: inline; padding: 0; margin-left: 0.5rem; font-style: normal; color: var(--series-6); }
 
-    .route-view .chart-panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 0.875rem 1.25rem 1rem;
-      margin-bottom: 1.25rem;
-    }
-    .route-view .chart-panel-title { font-size: 0.8125rem; font-weight: 600; color: var(--text); margin-bottom: 0.5rem; }
     .route-view #map-route { height: 380px; border-radius: 6px; }
     .route-view #chart-elevation { height: 180px; }
     .route-view #gap-body { min-height: 9rem; }
     .route-view .stat .skeleton { height: 1.1rem; width: 2.75rem; margin-top: 0.125rem; }
-    .route-view .leaflet-tile-pane { filter: saturate(0.85); }
-
-    .route-view .legend { display: flex; gap: 1rem; margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-secondary); min-height: 1rem; }
-    .route-view .legend .skeleton { width: 10rem; height: 0.75rem; }
-    .route-view .legend .swatch {
-      display: inline-block;
-      width: 1.25rem;
-      height: 0.25rem;
-      border-radius: 2px;
-      margin-right: 0.3125rem;
-      vertical-align: 2px;
-    }
     </style>
 </head>
 <body>
@@ -66,37 +46,6 @@
   let elevChart = null;
   let showId = 0;
   let state = null;
-
-  // Runnability classes read through the athlete's own terrain thresholds
-  // (see terrain.py's classify_grade) — not a fixed grade-band scheme.
-  const CLASS_LABEL = { run: 'Run', grind: 'Grind', hike: 'Hike' };
-
-  function classColor(theme, cls) {
-    return theme.route[cls] ?? theme.route.neutral;
-  }
-
-  function esc(text) {
-    return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  }
-
-  async function failure(res) {
-    try {
-      const body = await res.json();
-      if (typeof body.detail === 'string') return body.detail;
-    } catch (e) { /* not JSON */ }
-    return `HTTP ${res.status}`;
-  }
-
-  // {data} or {error}: a failed fetch never throws, so each panel decides
-  // for itself what a failure means.
-  async function getJson(url) {
-    try {
-      const res = await fetch(url);
-      return res.ok ? { data: await res.json() } : { error: await failure(res) };
-    } catch (e) {
-      return { error: 'Network error.' };
-    }
-  }
 
   async function main() {
     if (!routeId) {
@@ -229,17 +178,11 @@
     });
   }
 
-  function legendHtml(theme) {
-    return ['run', 'grind', 'hike'].map(cls => `
-      <span><span class="swatch" style="background:${classColor(theme, cls)}"></span>${CLASS_LABEL[cls]}</span>
-    `).join('');
-  }
-
   function renderLegend() {
     const legend = document.getElementById('legend');
     if (!legend) return;
     legend.innerHTML = state.points
-      ? legendHtml(chartTheme())
+      ? classLegendHtml(chartTheme())
       : `<span>Runnability colors unavailable: ${esc(state.pointsError)}</span>`;
   }
 
@@ -264,28 +207,9 @@
     else document.getElementById('gap-panel').remove();
   }
 
-  // Runs of consecutive profile points sharing a terrain class; every point
-  // is one run of class null until the classes arrive.
-  function classRuns(points, clsByIdx) {
-    const runs = [];
-    for (const p of points) {
-      const cls = clsByIdx?.get(p.idx) ?? null;
-      const last = runs[runs.length - 1];
-      if (last && last.cls === cls) last.points.push(p);
-      else runs.push({ cls, points: [p] });
-    }
-    return runs;
-  }
-
-  // One polyline segment per run, repeating each boundary point at the start
-  // of the next segment so the drawn line stays continuous across a class change.
-  function groupByClass(runs) {
-    return runs
-      .map((run, i) => {
-        const bridge = i ? [runs[i - 1].points[runs[i - 1].points.length - 1]] : [];
-        return { cls: run.cls, latlngs: [...bridge, ...run.points].map(p => [p.lat, p.lng]) };
-      })
-      .filter(g => g.latlngs.length > 1);
+  // The profile with each point's terrain class (null until the classes arrive).
+  function classedProfile() {
+    return state.profile.map(p => ({ ...p, cls: state.points?.get(p.idx) ?? null }));
   }
 
   function drawMap() {
@@ -305,22 +229,8 @@
     }
     routeLayer.clearLayers();
 
-    const groups = groupByClass(classRuns(state.profile, state.points));
-    const allLatLngs = groups.flatMap(g => g.latlngs);
+    const allLatLngs = drawClassedRoute(routeLayer, classedProfile(), theme);
     if (!allLatLngs.length) return;
-
-    // White casings first, so a neighboring segment never covers another's color.
-    for (const g of groups) L.polyline(g.latlngs, { color: '#ffffff', weight: 7, opacity: 0.9, lineCap: 'round' }).addTo(routeLayer);
-    for (const g of groups) L.polyline(g.latlngs, { color: classColor(theme, g.cls), weight: 4, opacity: 1, lineCap: 'round' }).addTo(routeLayer);
-
-    const dotIcon = (fill) => L.divIcon({
-      className: '',
-      html: `<svg width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="${fill}" stroke="white" stroke-width="2"/></svg>`,
-      iconSize: [16, 16],
-      iconAnchor: [8, 8],
-    });
-    L.marker(allLatLngs[0], { icon: dotIcon('#22c55e'), zIndexOffset: 1000 }).addTo(routeLayer);
-    L.marker(allLatLngs[allLatLngs.length - 1], { icon: dotIcon('#111'), zIndexOffset: 1000 }).addTo(routeLayer);
 
     if (first) routeMap.fitBounds(L.latLngBounds(allLatLngs), { padding: [16, 16] });
   }
@@ -334,53 +244,8 @@
       return;
     }
     el.classList.remove('skeleton');
-    const theme = chartTheme();
-    const data = profilePoints.map(p => [p.dist_m / MILE_METERS, p.ele_m != null ? p.ele_m * FT_PER_METER : null]);
-
-    // markArea bands colored by class, spanning each contiguous run's
-    // distance range, drawn under a single neutral elevation line.
-    const runs = classRuns(profilePoints, state.points);
-    const markAreaData = runs
-      .map((run, i) => {
-        const last = run.points[run.points.length - 1];
-        return {
-          cls: run.cls,
-          start: run.points[0].dist_m / MILE_METERS,
-          end: (runs[i + 1] ? runs[i + 1].points[0] : last).dist_m / MILE_METERS,
-        };
-      })
-      .filter(b => b.cls != null)
-      .map(b => [
-        { xAxis: b.start, itemStyle: { color: classColor(theme, b.cls), opacity: 0.22 } },
-        { xAxis: b.end },
-      ]);
-
     if (!elevChart) elevChart = echarts.init(el);
-    elevChart.setOption({
-      animation: false,
-      grid: { top: 12, right: 24, bottom: 32, left: 56 },
-      tooltip: chartAxisTooltip(theme, (items) => {
-        if (!items.length) return '';
-        const v = items[0].data[1];
-        return `${items[0].axisValue.toFixed(2)} mi<br>${v != null ? Math.round(v) : '—'} ft`;
-      }),
-      xAxis: chartValueAxis(theme, {
-        name: 'mi',
-        min: 0,
-        axisLine: { lineStyle: { color: theme.gridline } },
-        splitLine: { show: false },
-      }),
-      yAxis: chartValueAxis(theme, { name: 'ft', scale: true }),
-      series: [{
-        name: 'Elevation',
-        type: 'line',
-        data,
-        showSymbol: false,
-        areaStyle: { color: theme.muted, opacity: 0.1 },
-        lineStyle: { width: 1.25, color: theme.text },
-        markArea: markAreaData.length ? { silent: true, data: markAreaData } : undefined,
-      }],
-    }, true);
+    elevChart.setOption(classedElevationOption(chartTheme(), classedProfile()), true);
   }
 
   function renderGapAnalysis(gap) {

@@ -4,12 +4,13 @@ and feet, drive times minutes; the modules underneath work in meters and
 seconds, and the conversion happens only here."""
 
 import json
+import os
 from collections.abc import Mapping
 from typing import Any, cast
 
 from mcp.server.fastmcp import FastMCP
 
-from . import db, drive_starts, network, route_search, sections, survey
+from . import candidate_sets, db, drive_starts, network, route_search, sections, survey
 from .errors import reporting
 from .fitness import FT_PER_M, MILE_M
 from .offload import threaded
@@ -61,9 +62,13 @@ def _candidate_summary(candidate: route_search.RouteCandidateOut) -> dict:
             "score": _round(ranking["score"]),
             "section_quality_miles": _round(ranking["quality_mi"]),
             "access_cost": _round(ranking["access_cost"]),
-            "loop_factor": _round(ranking["loop"], 3),
             "distance_fit": _round(ranking["fit"], 2),
+            "gain_fit": _round(ranking["gain_fit"], 2),
         },
+        "stops": [
+            {"label": st["label"], "wanted_mi": st["wanted_mi"], "at_mi": _round(st["at_mi"])}
+            for st in candidate.get("stops", [])
+        ],
         "start": _start_view(candidate["start"]),
         "distance_mi": candidate["distance_m"] / MILE_M,
         "trail_mi": score["trail_distance_m"] / MILE_M,
@@ -194,7 +199,7 @@ def _survey_view(result: dict) -> dict:
         "distance_mi": _round(result["distance_m"] / MILE_M if result["distance_m"] is not None else None),
         "run_distance_mi": _round(result["run_distance_m"] / MILE_M),
         "sections": [_section_row_view(r) for r in result["sections"]],
-        "score_formula": "score = quality x adjustment - access_cost (quality-miles); see terms on each section",
+        "score_formula": "score = quality x adjustment x gain_fit - access_cost (quality-miles); see terms on each section",
     }
 
 
@@ -273,9 +278,11 @@ def register_routing_tools(mcp: FastMCP) -> None:
         starts: list[route_search.Start] | None = None,
         seed: int | None = None,
         sections: list[int] | None = None,
-        loop_bonus: float = route_search.DEFAULT_LOOP_BONUS,
+        repeat_value: float = route_search.DEFAULT_REPEAT_VALUE,
+        stops: list[route_search.Stop] | None = None,
         surface_preference: str | None = None,
         unfamiliar_only: bool = False,
+        purpose: str | None = None,
     ) -> str:
         """
         Find candidate running routes over an imported area's network graph
@@ -308,27 +315,56 @@ def register_routing_tools(mcp: FastMCP) -> None:
         (group or stretch ids, from survey_area or get_section), around
         exactly those; without, around the survey's best sections for the
         start and distance, and the randomized walk fills in only when those
-        give fewer than n routes (built_from says which: "sections" or
-        "walk"). Each section-built candidate is an approach, a run along one
-        or more stretches, and a return: an out-and-back (turning where the
-        distance fits), a loop, or a lollipop (a stem and a loop inside the
-        section), a short stretch continuing over the next within reach.
-        Naming sections never falls back to
-        the walk: if none can be reached, warnings says so. sections_used lists
-        what each candidate runs: section_id, block_id, name and the miles on
-        it (an out-and-back counts a mile each way).
+        give no route that meets the request (built_from says which:
+        "sections" or "walk"). A section-built candidate is one search over
+        the sections' stretches: a walk that runs stretches, joins them with
+        connectors (the cheapest comfortable way between two points) and ends at
+        the start; shape only filters what the finished walk looks like. Naming
+        sections never falls back to the walk: if none can be reached, warnings
+        says so. sections_used lists what each candidate runs: section_id,
+        block_id, name and the miles on it (a mile run twice counts twice).
 
-        Section-built candidates rank by ranking.score = section quality
-        x loop_factor x distance_fit - access_cost, in quality-miles: the
-        adjusted survey quality of the miles run on sections, a loop bonus
-        for returning by a different path, 1 inside the distance range and
-        falling outside it, less the weighted cost of reaching the section
-        and getting home. loop_bonus (default 0.075, 0 to 0.5) is the share
-        a loop or lollipop adds: 0.3 when the athlete prefers loops,
-        0 when they do not care, and a better out-and-back still beats a
-        lesser loop at any value. surface_preference ("singletrack", "track",
-        "paved", "any") and unfamiliar_only are survey_area's, used to
-        choose the sections when none are named.
+        Every mile a route runs on any section earns that section's adjusted
+        quality, named or not, on a stretch the search built around or one a
+        connector crosses; only miles on no section are charged as connector
+        cost. sections=[ids] therefore means "must include": a candidate
+        qualifies only if it runs at least 400 m of each named section (or a
+        tenth of it, if shorter), and is scored as a whole.
+
+        Section-built candidates rank by ranking.score = section_quality_miles
+        x distance_fit x gain_fit - access_cost, in quality-miles: the adjusted
+        survey quality of the miles run on sections, 1 inside the distance
+        range and falling outside it, 1 inside the purpose's climb band (below)
+        and falling outside it, less the weighted cost of the miles on no
+        section. A stretch run again earns repeat_value (default 0.5, 0 to 1)
+        of its quality the second time and its square after that: 0 when the
+        athlete wants no repeats, 0.8 to 1 when they do not mind retracing a
+        favorite stretch. surface_preference ("singletrack", "track", "paved",
+        "any") and unfamiliar_only are survey_area's, used to choose the
+        sections when none are named.
+
+        purpose is what the run is for; set it whenever the athlete's words
+        say, and tell them which you used. "easy"/"recovery" (up to about 40
+        ft of climb per mile; hiking and steep grind cost the most) for an easy
+        run; "workout"/"tempo"/"intervals" (up to 30 ft per mile, continuous
+        sections weighted up) for a quality session; "long" (no climb
+        preference, scenery weighted up) for a long run or a trail day;
+        "hilly" (at least 120 ft per mile, grind and short hikes cost little)
+        for hills, climbing, or vert. Omit it when none applies. The purpose
+        sets the climb band a candidate is scored against (gain_ft_min and
+        gain_ft_max, when given, replace the band), how much grind and hiking
+        count for, how much junctions and crossings count against a section,
+        and how much scenery counts for; it also steers which sections are
+        chosen and how the search values them. It does not apply to the
+        random walk that fills in when no section serves the request.
+
+        stops are points the route must pass: {"lat", "lng", "label"?, "at_mi"?}.
+        With at_mi the route passes the stop within a mile of that distance
+        along the route (a refill at home around mile 8, a lot at the halfway
+        point); without it, anywhere. A stop snaps to the nearest path within
+        500 m, so its position is the network's; each candidate's stops lists
+        wanted_mi and the at_mi it was actually passed at. A route with stops
+        is always built from sections, never the walk.
 
         Returns up to n candidates (default 5): start, distance, trail/road
         mix, runnability, road exposure, and a candidate_id for
@@ -375,13 +411,16 @@ def register_routing_tools(mcp: FastMCP) -> None:
                 "include_way_ids": include_way_ids,
                 "seed": seed,
                 "sections": sections,
-                "loop_bonus": loop_bonus,
+                "repeat_value": repeat_value,
+                "stops": stops,
                 "surface_preference": surface_preference,
                 "unfamiliar_only": unfamiliar_only,
+                "purpose": purpose,
             }
             result = route_search.find_routes(conn, request)
 
         out: dict = {
+            "purpose": purpose,
             "candidates": [_candidate_summary(c) for c in result["candidates"]],
             "near_miss": result["near_miss"],
             "budget_exceeded": result["budget_exceeded"],
@@ -416,6 +455,27 @@ def register_routing_tools(mcp: FastMCP) -> None:
             return json.dumps(route_search.save_route_candidate(conn, candidate_id, name))
 
     @mcp.tool()
+    @reporting(route_search.CandidateNotFoundError, ValueError)
+    def share_candidates(candidate_ids: list[str], title: str, notes: dict[str, str] | None = None) -> str:
+        """
+        Publish find_routes candidates as a page the athlete opens on their
+        phone: one card each with a map, elevation profile, stats, and a
+        Save as route button. Call it after find_routes with the 2-6
+        candidates worth considering, in the order to show them, and a
+        one-line note each in `notes` (keyed by candidate_id; why this one,
+        what sets it apart). Then give the athlete the link.
+
+        Returns set_id, url, and expires_at. The set and its candidates are
+        kept for a week. url is absolute when the server has MILES_PUBLIC_URL
+        set; otherwise it is a path (/candidates.html?set=...) to open on the
+        miles web app's own address.
+        """
+        with db.connection() as conn:
+            set_id, expires_at = candidate_sets.create_set(conn, candidate_ids, title, notes)
+        base = os.environ.get("MILES_PUBLIC_URL", "").rstrip("/")
+        return json.dumps({"set_id": set_id, "url": f"{base}/candidates.html?set={set_id}", "expires_at": expires_at})
+
+    @mcp.tool()
     @threaded
     @reporting(ValueError, sections.SectionNotFoundError)
     def survey_area(
@@ -431,6 +491,7 @@ def register_routing_tools(mcp: FastMCP) -> None:
         include_fragments: bool = False,
         detail: str = "overview",
         within: int | None = None,
+        purpose: str | None = None,
     ) -> str:
         """
         Survey an imported area for stretches worth running before building a
@@ -483,6 +544,12 @@ def register_routing_tools(mcp: FastMCP) -> None:
         run distance, whichever is more; judged per group in an overview, per
         stretch in detail); fragments_hidden counts them.
 
+        purpose ("easy", "workout", "long", "hilly") is find_routes': it weighs
+        a section's runnability, continuity and scenery for that kind of run
+        and multiplies its score by gain_fit, which falls as its climb per
+        mile (gain_ft_per_mi) leaves the purpose's band. Use the same purpose
+        for the survey and the search.
+
         adjustments is {section_id: factor} for this request only, nothing
         stored: use it for what you know of a place that the map lacks, with
         factors between 0.5 and 2.0. Say where the knowledge came from; offer
@@ -522,6 +589,7 @@ def register_routing_tools(mcp: FastMCP) -> None:
                 include_fragments=include_fragments,
                 detail=detail,
                 within=within,
+                purpose=purpose,
             )
         return json.dumps(_survey_view(result))
 

@@ -1,109 +1,117 @@
-"""Section-anchored candidate assembly (adr/0004-section-first-route-search.md).
+"""One search over a section graph (adr/0004-section-first-route-search.md).
 
-A candidate is an approach, one or more building blocks, and a return, where a
-block is a stretch of a section (sections.py) with its edges ordered into one
-or two side-by-side chains. Nothing here walks at random: each candidate is
-built from shortest paths, and the distance is fitted by choosing how much of
-a chain to run.
+A route is a walk from the start that stitches stretches of sections together
+with connectors, and ends back at the start inside the distance range after
+passing every stop.
 
-Shapes, for a block chain entered at one of its nodes J:
+The section graph has two kinds of edge:
 
-- out-and-back: approach to J, run the chain in one direction to the node
-  that makes the target distance, retrace.
-- loop: approach to J, run the chain to a node K, return from K to the start
-  by the cheapest path that avoids the chain where it can. A return that
-  rejoins the approach is a lollipop; one that retraces what was run is an
-  out-and-back and earns no loop bonus.
-- lollipop: a stem to J, a loop J -> far point -> J inside the block's own
-  network (the cheapest path out, then the cheapest path back that avoids
-  it), the stem again.
-- chained loop: a chain too short to fill the distance, then further blocks
-  (the group the route is in first) each within a short connector, up to
-  MAX_LOOP_BLOCKS in all, then home by the cheapest path that avoids all of
-  it. Of the nodes where the route would make the distance, the one whose way
-  home retraces least is taken.
+- running: an edge of a chosen stretch (cut into pieces of about PIECE_M so a
+  walk can turn anywhere), walked in either direction where one-way tags allow,
+  worth the stretch's adjusted quality per mile (survey.density x the section's
+  factor) times the miles run. A piece run again earns repeat_value of that, and
+  a piece run a third time or more repeat_value squared.
+- connecting: the preference-weighted shortest path between two hubs (the
+  start, the stops, and the entry and end nodes of the stretches), worth nothing
+  and charged CONNECTOR_CHARGE_PER_WEIGHTED_MI. Paths are computed in the
+  direction of travel. The start and the stops are sinks that every hub, and
+  every junction of a stretch, can connect to; each sink also gets a way in that
+  avoids the corridor its way out uses, so a loop can come home by another road.
 
-Approach and return paths are one shortest-path tree each, over the cost
-survey.py uses for access: a comfortable edge costs its length, and
-uncomfortable road, crossings and steep grades cost more.
+A bounded beam search walks the graph in layers of BUCKET_M of distance, keeping
+BEAM_WIDTH walks per layer, ranked by score so far plus an optimistic bound on
+what the miles left can earn. Walks ending at the start inside the range, with
+every stop passed inside its window, are collected. The search runs ROUNDS times,
+each time discounting the stretches of the best walk so far, so the walks that come
+back are not all variations of one.
 
-Ranking, in quality-miles (survey.py's quality notion):
+Every mile on a stored stretch earns that stretch's adjusted quality, whether the
+walk runs it as a piece or crosses it inside a connector; only miles on no
+stretch are charged. Repeats are counted per piece, or per edge off the chosen
+stretches, whichever way the mile was run.
 
-    score = quality x loop x fit - access_cost
+    score = quality x fit x gain_fit - access_cost
 
-    quality     = sum over blocks of density x miles run on that block, a
-                  block's density being its stretch's adjusted quality per
-                  mile (survey.density x survey.section_factor); a mile is
-                  counted each time it is run, an out-and-back's twice
-    loop        = 1 + loop_bonus for a loop or lollipop that returns by a
-                  different path, else 1
+    quality     = sum over the miles run on stretches of density x meters,
+                  repeats discounted as above
     fit         = 1 inside the requested distance range; outside it, falling
                   by FIT_SLOPE of the miss as a share of the target, to 0
-    access_cost = ACCESS_COST_PER_WEIGHTED_MI x half the weighted cost, in
-                  miles, of everything run off the blocks (the approach and
-                  the return together are about twice the one-way approach
-                  the survey charges)
+    gain_fit    = 1 inside the purpose's climb band (survey.gain_fit); always 1
+                  with no purpose
+    access_cost = the weighted miles of connector on no stretch at
+                  CONNECTOR_CHARGE_PER_WEIGHTED_MI
 """
 
+import itertools
+import json
 import math
-import random
 import sqlite3
 import time
-from collections import Counter
-from collections.abc import Collection, Iterable, Iterator, Mapping, MutableMapping, Sequence
+from collections import Counter, OrderedDict, defaultdict
+from collections.abc import Callable, Hashable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass, field
+from typing import NamedTuple, TypeVar, cast
 
-from . import familiarity, network, route_search, sections, survey, terrain
-from .route_search import GraphEdge, SearchGraph, Start, Traversal
+from . import familiarity, gpx_parse, network, route_search, routes_spatial, sections, survey, terrain
+from .fitness import FT_PER_M
+from .route_search import GraphEdge, NodeInfo, SearchGraph, Start, Stop, Traversal
 
 MILE_M = survey.MILE_M
+_T = TypeVar("_T")
 
 # Sections taken from the survey when a request names none, per start.
 SURVEY_N = 8
 MAX_SURVEY_STARTS = 4
-JOINS_PER_CHAIN = 2
+STEER_TRAIL = 0.5
+# The search values a stretch above a gain band's top by no less than this share.
+STEER_FLOOR = 0.25
+# A route runs a section it was told to include when it covers MIN_INCLUDE_SHARE
+# of the section or MIN_INCLUDE_M of it, whichever is less. A section a route
+# covers less than MIN_INCLUDE_M of is incidental, not part of what it runs.
+MIN_INCLUDE_SHARE = 0.1
+MIN_INCLUDE_M = 400.0
 
-# The approach, one way, may be at most this share of the target distance.
+# A connector to or from the start or a stop may be at most this share of the
+# target distance long; the trees it comes from are explored to
+# APPROACH_TREE_SHARE of the target in weighted cost.
 APPROACH_SHARE_MAX = 0.3
-# The approach tree is explored out to this share of the target in weighted cost.
 APPROACH_TREE_SHARE = 0.6
-# Return and loop-back trees are explored out to this share of the target in weighted cost.
-RETURN_TREE_SHARE = 0.65
-MIN_RUN_M = 300.0
-# An edge is run whole, or its remainder dropped, when the distance still
-# wanted is within this much of its length or under it.
-CUT_SLACK_M = 50.0
-# A stem shorter than this makes a lollipop indistinguishable from a loop.
-MIN_STEM_M = 200.0
-# A route that runs out of chain goes on to another block within this
-# weighted cost, at most this many times; a loop chains at most MAX_LOOP_BLOCKS
-# blocks. A block of the group the route is already in is worth
-# SAME_GROUP_BONUS times its quality when choosing the next one.
-EXTENSION_MAX_COST_M = 1500.0
-MAX_EXTENSIONS = 6
-MAX_LOOP_BLOCKS = 6
-# Next blocks tried at each step of a loop.
-LOOP_BRANCHING = 2
-SAME_GROUP_BONUS = 1.25
-# A way home after a chained loop is explored out to this many times the
-# distance the route has left, in weighted cost.
-HOME_REACH_SLACK = 1.5
-# Turning points along a chain compared by how much of the way home they retrace,
-# in steps of TURN_REUSE_STEP of it; the closest to the target distance wins a tie.
-TURN_CANDIDATES = 12
-TURN_REUSE_STEP = 0.05
-# Far points tried per entry point when forming a loop inside a group's own
-# network, and entry points.
-INNER_FAR_POINTS = 8
-INNER_JOINS = 2
-# A far point's out leg is this share range of the loop wanted, and the loop
-# built through it must land within this share of the wanted length.
-INNER_FAR_SHARE = (0.25, 0.65)
-INNER_LENGTH_SHARE = (0.75, 1.25)
-OUT_AND_BACK_REUSE_SHARE = 0.5
-# A walked inner loop that retraces more than this share of itself is not a loop.
-INNER_RETRACE_MAX = 0.3
+# Connectors between hubs are explored to this weighted cost, and a hub keeps
+# its cheapest CONNECTORS_PER_HUB.
+CONNECTOR_MAX_COST_M = 1500.0
+CONNECTORS_PER_HUB = 12
+# A route's connectors are charged at this per weighted mile: half the survey's
+# one-way access charge, since a route pays both ways of its approach.
+CONNECTOR_CHARGE_PER_WEIGHTED_MI = survey.ACCESS_COST_PER_WEIGHTED_MI / 2.0
+# A stretch's edges are cut into pieces of about this length.
+PIECE_M = 250.0
+
+BEAM_WIDTH = 200
+# Walks are grouped in layers of this much distance; a step always moves to a later layer.
+BUCKET_M = 150.0
+# A walk may finish this share of the target outside the range, and is scored by fit there.
+FIT_SLACK_SHARE = 0.05
 FIT_SLOPE = 2.0
+# A stop with a requested mile counts when the walk passes it within this many miles of it.
+STOP_WINDOW_MI = 1.0
+# A start is searched this many times, the stretches of the best walk so far
+# worth ROUND_DISCOUNT of their value each time. Finished walks considered per
+# round, distinct ones kept per round, and returned.
+ROUNDS = 5
+ROUND_DISCOUNT = 0.4
+SCANNED_COMPLETIONS = 600
+MAX_COMPLETIONS = 60
+MAX_WALKS = 120
+
+# A walk that repeats this share of its length is an out-and-back, and one whose
+# last edges retrace its first by MIN_STEM_M or more, a lollipop.
+OUT_AND_BACK_REUSE_SHARE = 0.5
+MIN_STEM_M = 200.0
+
+# Connector trees cached per area, graph build and avoided ways, and the most
+# kept in all.
+MAX_SPACES = 3
+MAX_CACHED_TREES = 3000
 
 
 @dataclass
@@ -111,20 +119,36 @@ class PlannedBlock:
     block: sections.Block
     # Adjusted quality per mile: survey.density x the section's factor.
     density: float
+    # What the search (never the score) multiplies the block's value by, to
+    # lean toward the request's gain and trail minimums.
+    steer: float = 1.0
+    # False for a stretch the search only credits miles on, never builds around.
+    runs: bool = True
 
 
 @dataclass
 class BlockPlan:
+    """Every stretch of the area as a block: those to build routes around run,
+    the rest only earn the miles a connector crosses on them."""
     blocks: list[PlannedBlock] = field(default_factory=list)
     explicit: bool = False
     warnings: list[str] = field(default_factory=list)
     overrides: dict[int, str] = field(default_factory=dict)
+    # The climb per mile (ft) the request wants, and whether a route is scored
+    # against it (only when it names a purpose).
+    gain_band: tuple[float | None, float | None] = (None, None)
+    fit_gain: bool = False
+    # For each section the request names: the blocks it covers and the least
+    # a route must cover of them.
+    required: list[tuple[list[int], float]] = field(default_factory=list)
 
     def keep_nodes(self, rows: Mapping[int, dict]) -> set[int]:
-        """The end nodes of every edge of the blocks, which the search graph
-        keeps even beyond its radius."""
+        """The end nodes of every edge of the blocks to build around, which the
+        search graph keeps even beyond its radius."""
         nodes: set[int] = set()
         for planned in self.blocks:
+            if not planned.runs:
+                continue
             for eid in planned.block["edge_ids"]:
                 row = rows.get(eid)
                 if row is not None:
@@ -132,34 +156,59 @@ class BlockPlan:
         return nodes
 
 
-@dataclass
-class Built:
-    """A candidate's path, before scoring."""
-    shape: str
-    start: Start
-    traversal: Traversal
-    loop_like: bool
-
-
 # ---------------------------------------------------------------------------
 # Choosing blocks
 # ---------------------------------------------------------------------------
+
+
+def _gain_band(request: route_search.RouteSearchRequest, purpose: survey.Purpose, target_m: float) -> tuple[float | None, float | None]:
+    """The climb per mile (ft) the request wants: its own gain range if it
+    gives one, else its purpose's band."""
+    gain_min, gain_max = request.get("gain_m_min"), request.get("gain_m_max")
+    if not (gain_min or gain_max):
+        return purpose.gain_ft_per_mi
+    per_mile = FT_PER_M * MILE_M / target_m
+    return (gain_min * per_mile if gain_min else None, gain_max * per_mile if gain_max else None)
+
+
+def _steer(stretch: sections.Section, band: tuple[float | None, float | None], request: route_search.RouteSearchRequest) -> float:
+    """Soft constraints only filter a finished walk, which leaves a request for
+    a hilly or trail-heavy route to the walks that happen to score best. So the
+    search values a stretch more the more it helps: one point for the share of
+    the band's climb per mile it has, STEER_TRAIL for being trail; and less the
+    further its climb is over the band's top."""
+    steer = 1.0
+    lo, hi = band
+    elevated = stretch.data["elevated_m"]
+    if elevated > 0:
+        ft_per_mile = stretch.data["gain_m"] * FT_PER_M / (elevated / MILE_M)
+        if lo:
+            steer += min(ft_per_mile / lo, 1.0)
+        if hi and ft_per_mile > hi:
+            steer *= max(STEER_FLOOR, hi / ft_per_mile)
+    surface = stretch.data["surface_m"]
+    if request.get("min_trail_m") and surface:
+        steer += STEER_TRAIL * (surface.get("singletrack", 0.0) + surface.get("track", 0.0)) / sum(surface.values())
+    return steer
 
 
 def plan_blocks(
     conn: sqlite3.Connection, request: route_search.RouteSearchRequest, model: terrain.TerrainModel
 ) -> BlockPlan:
     """The blocks to build around: those of the sections the request names, or
-    of the survey's best sections for its starts. Takes the search slot (the
+    of the survey's best sections for its starts, plus the area's other
+    stretches as blocks that only earn credit. Takes the search slot (the
     survey does), so call it outside it."""
     area_id = request["area_id"]
+    purpose_name = request.get("purpose")
+    purpose = survey.purpose_terms(purpose_name)
     preference = request.get("surface_preference") or "any"
     if preference not in survey.SURFACE_WEIGHTS:
         raise ValueError(f"unknown surface_preference {preference!r}; choose from {', '.join(survey.SURFACE_PREFERENCES)}")
     target_m = (request["distance_m_min"] + request["distance_m_max"]) / 2.0
     unfamiliar_only = request.get("unfamiliar_only", False)
     named = list(dict.fromkeys(request.get("sections") or []))
-    plan = BlockPlan(explicit=bool(named))
+    plan = BlockPlan(explicit=bool(named), gain_band=_gain_band(request, purpose, target_m), fit_gain=purpose_name is not None)
     plan.overrides = {
         r["way_id"]: r["verdict"] for r in conn.execute("SELECT way_id, verdict FROM net_way_overrides").fetchall()
     }
@@ -178,7 +227,7 @@ def plan_blocks(
         for start in request["starts"][:MAX_SURVEY_STARTS]:
             result = survey.survey(
                 conn, area_id, start["lat"], start["lng"], distance_m=target_m, n=SURVEY_N,
-                surface_preference=preference, unfamiliar_only=unfamiliar_only,
+                surface_preference=preference, unfamiliar_only=unfamiliar_only, purpose=purpose_name,
             )
             ids.extend(r["section_id"] for r in result["sections"] if not r["excluded"] and r["section_id"] not in ids)
     judgments = sections.judgments_for(conn, list(by_id.values()))
@@ -189,74 +238,26 @@ def plan_blocks(
             if judgments[section_id]["exclusion"] or (parent and judgments[parent.section_id]["exclusion"]):
                 raise ValueError(f"section {section_id} is excluded; clear its exclusion to route through it")
     visits = familiarity.visits(conn, area_id) if unfamiliar_only else {}
+    classes, speeds = survey.grade_classes(model)
+
+    def planned(stretch: sections.Section, block: sections.Block, runs: bool) -> PlannedBlock:
+        factor, _adjustment = survey.section_factor(stretch, by_id[block["section_id"]], judgments)
+        density = survey.density_terms(stretch, classes, speeds, preference, purpose).value * factor
+        return PlannedBlock(block, density, _steer(stretch, plan.gain_band, request), runs)
+
     for block in sections.building_blocks(conn, area_id, ids):
         stretch, group = by_id[block["block_id"]], by_id[block["section_id"]]
         if any(v in visits and visits[v].runs > 0 for v in (stretch.section_id, group.section_id)):
             continue
-        factor, _adjustment = survey.section_factor(stretch, group, judgments)
-        plan.blocks.append(PlannedBlock(block, survey.density(stretch, model, preference) * factor))
+        plan.blocks.append(planned(stretch, block, True))
+    built = {pb.block["block_id"] for pb in plan.blocks}
+    plan.blocks.extend(
+        planned(s, sections.block_of(s), False) for s in by_id.values() if s.level == sections.STRETCH and s.section_id not in built
+    )
+    for section_id in named:
+        covers = [i for i, pb in enumerate(plan.blocks) if section_id in (pb.block["section_id"], pb.block["block_id"])]
+        plan.required.append((covers, min(MIN_INCLUDE_M, MIN_INCLUDE_SHARE * by_id[section_id].single_path_m)))
     return plan
-
-
-# ---------------------------------------------------------------------------
-# Search-graph geometry of a block
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class _Chain:
-    """A run of a block's edges in the search graph: edges[i] joins nodes[i]
-    and nodes[i + 1], cum[i] meters from nodes[0]."""
-    nodes: list[int]
-    edges: list[GraphEdge]
-    cum: list[float]
-    # Nodes where the approach may join the chain.
-    joins: set[int] = field(default_factory=set)
-    keys: frozenset[int] = frozenset()
-    # Index of the block the chain belongs to.
-    block: int = -1
-
-    def run(self, i: int, k: int) -> Traversal | None:
-        """The way from nodes[i] to nodes[k], None when a one-way edge forbids it."""
-        if k > i:
-            out = [(self.edges[j], self.nodes[j]) for j in range(i, k)]
-        else:
-            out = [(self.edges[j], self.nodes[j + 1]) for j in reversed(range(k, i))]
-        return out if all(e.traverse(frm) is not None for e, frm in out) else None
-
-
-@dataclass
-class _Prepared:
-    planned: PlannedBlock
-    chains: list[_Chain]
-
-
-def _expand(
-    key: int, cur: int, graph: SearchGraph, rows: Mapping[int, dict], replaced: Mapping[int, tuple[int, int, int, int]]
-) -> list[tuple[GraphEdge, int, int]] | None:
-    """The graph edges standing for original edge `key`, walked from `cur`; an
-    edge cut by a start point stands for its two pieces. None when the edge
-    is gone (removed or outside the bound) or does not touch `cur`."""
-    edge = graph.edges_by_key.get(key)
-    if edge is not None:
-        if cur == edge.a:
-            return [(edge, cur, edge.b)]
-        if cur == edge.b:
-            return [(edge, cur, edge.a)]
-        return None
-    pieces = replaced.get(key)
-    if pieces is None:
-        return None
-    first, second, a, _b = pieces
-    ordered = (first, second) if cur == a else (second, first)
-    out: list[tuple[GraphEdge, int, int]] = []
-    for piece in ordered:
-        part = _expand(piece, cur, graph, rows, replaced)
-        if part is None:
-            return None
-        out.extend(part)
-        cur = part[-1][2]
-    return out
 
 
 def _leaf_keys(key: int, graph: SearchGraph, replaced: Mapping[int, tuple[int, int, int, int]]) -> list[int]:
@@ -265,563 +266,606 @@ def _leaf_keys(key: int, graph: SearchGraph, replaced: Mapping[int, tuple[int, i
     pieces = replaced.get(key)
     return [k for piece in pieces[:2] for k in _leaf_keys(piece, graph, replaced)] if pieces else []
 
-
-def _chain_runs(
-    edge_ids: Sequence[int], graph: SearchGraph, rows: Mapping[int, dict], replaced: Mapping[int, tuple[int, int, int, int]]
-) -> list[_Chain]:
-    """A block chain's edges as runs still present in the graph, each walked
-    in the chain's own direction."""
-    runs: list[_Chain] = []
-    nodes: list[int] = []
-    edges: list[GraphEdge] = []
-
-    def flush() -> None:
-        nonlocal nodes, edges
-        if edges:
-            cum = [0.0]
-            for e in edges:
-                cum.append(cum[-1] + e.length_m)
-            runs.append(_Chain(nodes, edges, cum))
-        nodes, edges = [], []
-
-    ends = [(rows[e]["from_node_id"], rows[e]["to_node_id"]) for e in edge_ids]
-    for idx, eid in enumerate(edge_ids):
-        a, b = ends[idx]
-        if not nodes or nodes[-1] not in (a, b):
-            flush()
-            follower = ends[idx + 1] if idx + 1 < len(ends) else None
-            start = a if follower is None or a not in follower else b
-            nodes = [start]
-        steps = _expand(eid, nodes[-1], graph, rows, replaced)
-        if steps is None:
-            flush()
-            continue
-        for edge, _frm, to in steps:
-            edges.append(edge)
-            nodes.append(to)
-    flush()
-    return runs
-
-
 # ---------------------------------------------------------------------------
-# Assembly
+# Connector trees, cached across searches
 # ---------------------------------------------------------------------------
 
 
-def _reverse(traversal: Traversal) -> Traversal | None:
-    back: Traversal = []
-    for edge, frm in reversed(traversal):
-        step = edge.traverse(frm)
-        assert step is not None
-        if edge.traverse(step[0]) is None:
-            return None
-        back.append((edge, step[0]))
-    return back
+class _Space:
+    """An area's graph without the avoided ways, and the hub-to-hub connector
+    trees computed on it. A tree depends on the route preferences and the
+    terrain model through the edge costs, so trees are keyed by a fingerprint
+    of those. Used only inside the search lock."""
+
+    def __init__(self, graph: SearchGraph, rows: Mapping[int, dict]) -> None:
+        self.graph, self.rows = graph, rows
+        self.costs: dict[str, survey.EdgeCosts] = {}
+        self.trees: OrderedDict[tuple[str, int], survey.Tree] = OrderedDict()
+
+    def tree(self, fingerprint: str, costs: survey.EdgeCosts, node: int) -> survey.Tree:
+        key = (fingerprint, node)
+        tree = self.trees.get(key)
+        if tree is None:
+            tree = self.trees[key] = survey.weighted_tree(self.graph, node, costs, CONNECTOR_MAX_COST_M)
+            while len(self.trees) > MAX_CACHED_TREES // MAX_SPACES:
+                self.trees.popitem(last=False)
+        else:
+            self.trees.move_to_end(key)
+        return tree
 
 
-def _keys(traversal: Traversal) -> set[int]:
-    return {edge.edge_key for edge, _ in traversal}
+_spaces: OrderedDict[tuple, _Space] = OrderedDict()
 
 
-def _length(traversal: Traversal) -> float:
-    return sum(edge.length_m for edge, _ in traversal)
+def connector_space(
+    area_id: int, built_at: str | None, base_graph: SearchGraph, rows: Mapping[int, dict], avoid_way_ids: set[int]
+) -> _Space:
+    """The area's graph minus `avoid_way_ids`, cached per graph build. Call it
+    inside the search lock; callers copy the graph before changing it."""
+    key = (area_id, built_at, frozenset(avoid_way_ids))
+    space = _spaces.get(key)
+    if space is None:
+        graph = route_search._copy_graph(base_graph)
+        route_search._remove_ways(graph, rows, avoid_way_ids)
+        space = _spaces[key] = _Space(graph, rows)
+        while len(_spaces) > MAX_SPACES:
+            _spaces.popitem(last=False)
+    else:
+        _spaces.move_to_end(key)
+    return space
 
 
-def _retraced_share(traversal: Traversal) -> float:
-    """The share of the length that repeats an edge already run."""
-    seen: set[int] = set()
-    repeated = 0.0
-    for edge, _ in traversal:
-        if edge.edge_key in seen:
-            repeated += edge.length_m
-        seen.add(edge.edge_key)
-    total = _length(traversal)
-    return repeated / total if total > 0 else 0.0
+def _cost_fingerprint(prefs: dict, model: terrain.TerrainModel, overrides: Mapping[int, str]) -> str:
+    return json.dumps(
+        [prefs, model.walk_onset_grade_pct, model.descent_comfort_grade_pct, sorted(overrides.items())], sort_keys=True
+    )
 
 
-def _shared_m(leg: Traversal, earlier: Traversal) -> float:
-    """The length of `leg` on edges `earlier` already ran."""
-    seen = _keys(earlier)
-    return sum(e.length_m for e, _ in leg if e.edge_key in seen)
+# ---------------------------------------------------------------------------
+# The walk
+# ---------------------------------------------------------------------------
 
 
-def _return_shape(back: Traversal, ran: Traversal, stem: Traversal) -> str:
-    """What a return leg makes of the route: an out-and-back when it retraces
-    OUT_AND_BACK_REUSE_SHARE of what was run, a lollipop when it rejoins the
-    stem for at least MIN_STEM_M, otherwise a loop."""
-    total = _length(back)
-    if total > 0 and _shared_m(back, ran) / total >= OUT_AND_BACK_REUSE_SHARE:
-        return "out_and_back"
-    return "lollipop" if _shared_m(back, stem) >= MIN_STEM_M else "loop"
+class _Entry(NamedTuple):
+    """Miles on a stretch that earn value: a piece of it, or an edge off the
+    chosen stretches. `bit` is what a repeat is counted by, `block` the
+    planned block it earns for."""
+    bit: int
+    value: float
+    meters: float
+    block: int
+
+
+class _Run(NamedTuple):
+    """Running a piece of a stretch from the node it is listed under."""
+    to: int
+    edge: GraphEdge
+    entry: _Entry
+    vert_m: float
+    blocks: int
+
+
+class _Link(NamedTuple):
+    """A connector: the path to another hub, its length, its access charge on
+    the miles that are on no stretch, and the miles that are on one."""
+    to: int
+    traversal: Traversal
+    length_m: float
+    cost: float
+    entries: tuple[_Entry, ...]
+    vert_m: float
+    blocks: int
+
+
+class _State:
+    __slots__ = ("node", "dist_m", "value", "cost", "vert_m", "ran", "twice", "stops", "parent", "action", "bucket", "blocks")
+
+    def __init__(
+        self, node: int, dist_m: float, value: float, cost: float, vert_m: float, ran: int, twice: int, stops: int,
+        parent: "_State | None", action: _Run | _Link | None, bucket: int,
+    ) -> None:
+        self.node, self.dist_m, self.value, self.cost, self.vert_m = node, dist_m, value, cost, vert_m
+        self.ran, self.twice, self.stops = ran, twice, stops
+        self.parent, self.action, self.bucket = parent, action, bucket
+        # The planned blocks run so far, one bit each.
+        self.blocks = (parent.blocks if parent else 0) | (action.blocks if action else 0)
+
+
+@dataclass
+class Walk:
+    """A finished walk, before scoring by the network."""
+    start: Start
+    traversal: Traversal
+    shape: str
+    distance_m: float
+    value: float
+    cost: float
+    score: float
+    block_m: dict[int, float]
+    stops: list[dict]
+    # Total vertical travel (climb plus descent) in meters, which is twice a
+    # closed route's gain.
+    vert_m: float
+
+
+@dataclass
+class _StopSpec:
+    node: int
+    stop: Stop
+    lo_m: float
+    hi_m: float
 
 
 class Assembly:
-    """Candidate paths around a BlockPlan's blocks, within one search's graph.
-    The graph, rows and start nodes are the search's own (start points
-    spliced in, `replaced` recording the cuts); nothing is contracted."""
+    """Walks over one search's section graph. The graph, rows and start nodes
+    are the search's own (start and stop points spliced in, `replaced`
+    recording the cuts); the stretches' edges are cut into pieces in place."""
 
     def __init__(
         self,
         plan: BlockPlan,
         graph: SearchGraph,
+        space: _Space,
         rows: MutableMapping[int, dict],
         replaced: Mapping[int, tuple[int, int, int, int]],
         start_nodes: Sequence[tuple[int, Start]],
+        stop_nodes: Sequence[tuple[int, Stop]],
         prefs: dict,
         model: terrain.TerrainModel,
         *,
         distance_m_min: float,
         distance_m_max: float,
         shapes: Sequence[str],
-        loop_bonus: float,
-        ids: Iterable[int],
+        repeat_value: float,
+        ids: Iterator[int],
     ) -> None:
-        self.graph, self.rows, self.start_nodes = graph, rows, list(start_nodes)
-        self.ids = iter(ids)
-        self.prefs = prefs
-        self.target_m = (distance_m_min + distance_m_max) / 2.0
+        self.plan, self.graph, self.space, self.rows = plan, graph, space, rows
+        self.start_nodes, self.prefs, self.ids = list(start_nodes), prefs, ids
         self.dmin, self.dmax = distance_m_min, distance_m_max
+        self.target_m = (distance_m_min + distance_m_max) / 2.0
+        self.limit_hi = distance_m_max + FIT_SLACK_SHARE * self.target_m
+        self.limit_lo = distance_m_min - FIT_SLACK_SHARE * self.target_m
         self.shapes = set(shapes)
-        self.loop_bonus = loop_bonus
+        self.repeat_value = repeat_value
         self.costs = survey.EdgeCosts(prefs, model, plan.overrides, rows)
-        self.replaced = replaced
-        self.blocks: list[_Prepared] = []
-        # The block each edge of the search graph is credited to: the first
-        # whose stretch holds it.
-        self.owner: dict[int, int] = {}
-        # Block indices by group, whose own edges an inner loop may use.
-        self.groups: dict[int, list[int]] = {}
-        self._group_graphs: dict[int, SearchGraph] = {}
-        start_ids = {n for n, _ in start_nodes}
-        for index, planned in enumerate(plan.blocks):
-            block = planned.block
-            joins = {*block["entry_nodes"], *block["end_nodes"], *start_ids}
-            prep = _Prepared(planned, [])
-            self.blocks.append(prep)
-            self.groups.setdefault(block["section_id"], []).append(index)
-            for eid in block["edge_ids"]:
-                for leaf in _leaf_keys(eid, graph, replaced):
-                    self.owner.setdefault(leaf, index)
-            for chain in block["chains"]:
-                for run in _chain_runs(chain, graph, rows, replaced):
-                    if run.cum[-1] >= MIN_RUN_M:
-                        run.joins, run.keys, run.block = joins, frozenset(e.edge_key for e in run.edges), index
-                        prep.chains.append(run)
-            # A chain can also be joined where it ends and where another chain
-            # of the block crosses it.
-            at_node = Counter(n for chain in prep.chains for n in set(chain.nodes))
-            for chain in prep.chains:
-                chain.joins = joins | {chain.nodes[0], chain.nodes[-1]} | {n for n in chain.nodes if at_node[n] > 1}
-            prep.chains.sort(key=lambda c: -c.cum[-1])
-        self._trees: dict[tuple, survey.Tree] = {}
-        self.deadline = math.inf
+        fingerprint = _cost_fingerprint(prefs, model, plan.overrides)
+        self._fingerprint = fingerprint
+        self._space_costs = space.costs.setdefault(fingerprint, survey.EdgeCosts(prefs, model, plan.overrides, space.rows))
+        self.stops: list[_StopSpec] = []
+        for node, stop in stop_nodes:
+            at_mi = stop.get("at_mi")
+            lo, hi = (0.0, math.inf) if at_mi is None else (
+                max(at_mi - STOP_WINDOW_MI, 0.0) * MILE_M, (at_mi + STOP_WINDOW_MI) * MILE_M
+            )
+            self.stops.append(_StopSpec(node, stop, lo, hi))
 
-    def _tree(
-        self, key: tuple, source: int, max_cost: float, penalized: frozenset[int] = frozenset(),
-        targets: Collection[int] = (),
-    ) -> survey.Tree:
-        if key not in self._trees:
-            self._trees[key] = survey.weighted_tree(self.graph, source, self.costs, max_cost, penalized, targets)
-        return self._trees[key]
+        self.hubs: set[int] = set()
+        self.runs: dict[int, list[_Run]] = {}
+        self._run_origins: set[int] = set()
+        self._near_density: dict[int, float] = {}
+        self._best_per_mile = 0.0
+        # What earns on each stored edge: the block and value per meter of the
+        # best stretch it is on; the entries of the pieces cut from it (by the
+        # edge they came from, and by key); the entries of the edges off the
+        # chosen stretches, once asked for.
+        self._credit: dict[int, tuple[int, float]] = {}
+        self._origin_entries: dict[int, list[_Entry]] = {}
+        self._piece_entry: dict[int, _Entry] = {}
+        self._credit_cache: dict[int, tuple[_Entry, ...]] = {}
+        self._vertical_m: dict[int, float] = {}
+        self._next_bit = 0
+        self._build_runs(replaced)
+        self._hub_links: dict[int, list[_Link]] = {}
+        self._sink_links: dict[int, list[_Link]] = {}
+        self._home_m: Mapping[int, float] = {}
+        self._worth: dict[int, float] = {}
 
-    def _totals(self, chain: _Chain, ji: int, direction: int, base_m: float, tree: survey.Tree) -> dict[int, float]:
-        """For each node of `chain` at least MIN_RUN_M on from ji in
-        `direction` that the tree reaches, the length of a route of base_m that
-        runs the chain to it and goes home by the tree."""
-        return {
-            k: base_m + abs(chain.cum[k] - chain.cum[ji]) + tree.length[chain.nodes[k]]
-            for k in range(ji + direction, len(chain.nodes) if direction > 0 else -1, direction)
-            if chain.nodes[k] in tree.cost and abs(chain.cum[k] - chain.cum[ji]) >= MIN_RUN_M
-        }
+    # -----------------------------------------------------------------------
+    # The graph
+    # -----------------------------------------------------------------------
 
-    def candidates(self, deadline: float) -> Iterator[Built]:
-        """Built candidates, best blocks first, until the deadline."""
-        self.deadline = deadline
-        trees: dict[int, survey.Tree] = {}
-        for s_node, _start in self.start_nodes:
-            trees[s_node] = self._tree(("approach", s_node), s_node, self.target_m * APPROACH_TREE_SHARE)
-        inner_done: set[tuple[int, int]] = set()
-        for index, prep in enumerate(self.blocks):
-            group_id = prep.planned.block["section_id"]
-            for s_node, start in self.start_nodes:
-                t1 = trees[s_node]
-                for chain in prep.chains:
-                    for ji in self._joins(chain, t1):
-                        if time.monotonic() > deadline:
-                            return
-                        yield from self._single(s_node, start, t1, chain, ji)
-                if {"loop", "lollipop"} & self.shapes and (group_id, s_node) not in inner_done:
-                    inner_done.add((group_id, s_node))
-                    if time.monotonic() > deadline:
-                        return
-                    yield from self._inner_loops(group_id, s_node, start, t1)
-        if {"loop", "lollipop"} & self.shapes:
-            # Chaining blocks is the costliest shape, so it gets what is left of the budget.
-            for prep in self.blocks:
-                for s_node, start in self.start_nodes:
-                    for chain in prep.chains:
-                        joins = self._joins(chain, trees[s_node])
-                        for built in self._chained_from(s_node, start, trees[s_node], chain, joins[:1]):
-                            if time.monotonic() > deadline:
-                                return
-                            yield built
+    def _cut_into_pieces(self, edge: GraphEdge) -> list[GraphEdge]:
+        """`edge` as pieces of about PIECE_M, replacing it in the graph. Rows
+        and nodes of the pieces are the search's own; each piece names the
+        stored edge it came from."""
+        count = math.ceil(edge.length_m / PIECE_M)
+        if count <= 1:
+            return [edge]
+        origin = self.rows[edge.edge_key].get("origin", edge.edge_key)
+        pieces: list[GraphEdge] = []
+        rest = edge
+        for k in range(count - 1):
+            split = network.split_edge_row(self.rows[rest.edge_key], rest.length_m / (count - k))
+            if split is None:
+                break
+            mid, first_key, second_key = next(self.ids), next(self.ids), next(self.ids)
+            for key, row in ((first_key, split["before"]), (second_key, split["after"])):
+                self.rows[key] = row
+                row["origin"] = origin
+            self.graph.nodes[mid] = NodeInfo(split["node_lat"], split["node_lng"], "junction")
+            self.graph.remove_edge(rest)
+            first = GraphEdge(first_key, rest.a, mid, split["before"]["length_m"], rest.allowed, [(first_key, True)])
+            self.graph.add_edge(first)
+            pieces.append(first)
+            rest = GraphEdge(second_key, mid, rest.b, split["after"]["length_m"], rest.allowed, [(second_key, True)])
+            self.graph.add_edge(rest)
+        pieces.append(rest)
+        return pieces
 
-    def _joins(self, chain: _Chain, t1: survey.Tree) -> list[int]:
-        """Indices of the chain's nodes worth entering at, cheapest approach first."""
-        reachable = [
-            (t1.cost[n], i) for i, n in enumerate(chain.nodes)
-            if n in chain.joins and n in t1.cost and t1.length[n] <= APPROACH_SHARE_MAX * self.target_m
-        ]
-        return [i for _cost, i in sorted(reachable)[:JOINS_PER_CHAIN]]
-
-    def _approach(self, t1: survey.Tree, node: int) -> tuple[route_search.Steps, float] | None:
-        """The path to `node` and its length, None when it has more continuous
-        uncomfortable road than the preferences allow."""
-        approach = survey.approach_to(t1, node, self.costs, self.rows)
-        if approach.max_uncomfortable_run_m > self.prefs["max_continuous_uncomfortable_m"]:
-            return None
-        return t1.steps(node), approach.approach_m
-
-    def _single(
-        self, s_node: int, start: Start, t1: survey.Tree, chain: _Chain, ji: int
-    ) -> Iterator[Built]:
-        found = self._approach(t1, chain.nodes[ji])
+    def _vertical(self, key: int) -> float:
+        """Climb plus descent along an edge, smoothed as score_path does."""
+        found = self._vertical_m.get(key)
         if found is None:
-            return
-        steps, approach_m = found
-        stem = route_search._forward(steps)
-        looping = "loop" in self.shapes or "lollipop" in self.shapes
-        for direction in (1, -1):
-            if "out_and_back" in self.shapes:
-                built = self._out_and_back(start, chain, ji, direction, stem, approach_m)
-                if built:
-                    yield built
-            if looping:
-                built = self._turn_home(start, chain, ji, direction, stem, approach_m, stem, self._home_tree(s_node, chain, ji, direction, set(), approach_m))
-                if built and built.shape in self.shapes:
-                    yield built
+            row = self.rows[key]
+            found = 0.0
+            if row["has_elevation"]:
+                points = network.unpack_edge_points(bytes(row["points_blob"]))
+                if len(points) > 1:
+                    smoothed, _window = gpx_parse.roughness_smoothed([p[2] for p in points], [cast(float, p[3]) for p in points])
+                    found = sum(gpx_parse.gain_loss_m(smoothed))
+            self._vertical_m[key] = found
+        return found
 
-    def _group_graph(self, group_id: int) -> SearchGraph:
-        """The search graph restricted to the edges of a group's blocks."""
-        if group_id not in self._group_graphs:
-            sub = SearchGraph()
-            for index in self.groups[group_id]:
-                for eid in self.blocks[index].planned.block["edge_ids"]:
-                    for key in _leaf_keys(eid, self.graph, self.replaced):
-                        edge = self.graph.edges_by_key[key]
-                        sub.add_edge(edge)
-                        sub.nodes[edge.a] = self.graph.nodes[edge.a]
-                        sub.nodes[edge.b] = self.graph.nodes[edge.b]
-            self._group_graphs[group_id] = sub
-        return self._group_graphs[group_id]
+    def _build_runs(self, replaced: Mapping[int, tuple[int, int, int, int]]) -> None:
+        owner: dict[int, int] = {}
+        for index, planned in enumerate(self.plan.blocks):
+            block = planned.block
+            per_m = planned.density / MILE_M
+            for eid in block["edge_ids"]:
+                held = self._credit.get(eid)
+                if held is None or per_m > held[1]:
+                    self._credit[eid] = (index, per_m)
+            if not planned.runs:
+                continue
+            self.hubs.update(n for n in (*block["entry_nodes"], *block["end_nodes"]) if n in self.graph.nodes)
+            for eid in block["edge_ids"]:
+                for key in _leaf_keys(eid, self.graph, replaced):
+                    owner.setdefault(key, index)
+        for key, index in owner.items():
+            per_m = self.plan.blocks[index].density / MILE_M
+            for piece in self._cut_into_pieces(self.graph.edges_by_key[key]):
+                origin = self.rows[piece.edge_key].get("origin", piece.edge_key)
+                self._run_origins.add(origin)
+                entry = _Entry(self._next_bit, per_m * piece.length_m, piece.length_m, index)
+                self._next_bit += 1
+                self._piece_entry[piece.edge_key] = entry
+                self._origin_entries.setdefault(origin, []).append(entry)
+                vert_m = self._vertical(piece.edge_key)
+                for frm in (piece.a, piece.b):
+                    step = piece.traverse(frm)
+                    if step is not None:
+                        self.runs.setdefault(frm, []).append(_Run(step[0], piece, entry, vert_m, 1 << index))
+        for node, runs in self.runs.items():
+            self._near_density[node] = max(r.entry.value / r.entry.meters for r in runs) * MILE_M
+        self._best_per_mile = max(self._near_density.values(), default=0.0)
 
-    def _far_loops(self, sub: SearchGraph, join: int, loop_m: float, rng: random.Random) -> Iterator[Traversal]:
-        """Loops from `join` through a group's own edges: out by the cheapest
-        path to a far point, back by the cheapest path that avoids the way
-        out. Each is at least INNER_LENGTH_SHARE[0] of loop_m, never over
-        INNER_LENGTH_SHARE[1]."""
-        out_tree = survey.weighted_tree(sub, join, self.costs, loop_m)
-        lo, hi = INNER_FAR_SHARE
-        far = [n for n, d in out_tree.length.items() if lo * loop_m <= d <= hi * loop_m]
-        rng.shuffle(far)
-        for node in far[:INNER_FAR_POINTS]:
-            out = route_search._forward(out_tree.steps(node))
-            back_tree = survey.weighted_tree(sub, join, self.costs, loop_m, _keys(out), [node])
-            if node not in back_tree.cost:
-                continue
-            back = _reverse(route_search._forward(back_tree.steps(node)))
-            if back is None:
-                continue
-            loop = out + back
-            if (
-                INNER_LENGTH_SHARE[0] * loop_m <= _length(loop) <= INNER_LENGTH_SHARE[1] * loop_m
-                and _retraced_share(loop) < INNER_RETRACE_MAX
-            ):
-                yield loop
-
-    def _inner_loops(self, group_id: int, s_node: int, start: Start, t1: survey.Tree) -> Iterator[Built]:
-        """Loops formed inside a group's own network, entered by the cheapest
-        approach: a lollipop when the approach is a real stem, a loop when the
-        start is at the group."""
-        sub = self._group_graph(group_id)
-        reachable = sorted(
-            (t1.cost[n], n) for n in sub.nodes if n in t1.cost and t1.length[n] <= APPROACH_SHARE_MAX * self.target_m
-        )
-        for _cost, join in reachable[:INNER_JOINS]:
-            found = self._approach(t1, join)
-            if found is None:
-                continue
-            steps, approach_m = found
-            stem = route_search._forward(steps)
-            stem_back = _reverse(stem)
-            loop_m = self.target_m - 2.0 * approach_m
-            shape = "lollipop" if approach_m >= MIN_STEM_M else "loop"
-            if stem_back is None or loop_m < 2.0 * MIN_RUN_M or shape not in self.shapes:
-                continue
-            rng = random.Random(group_id * 7919 + join)
-            for loop in self._far_loops(sub, join, loop_m, rng):
-                yield Built(shape, start, stem + loop + stem_back, True)
-
-    def _cut(self, edge: GraphEdge, frm: int, travel_m: float) -> tuple[GraphEdge, int] | None:
-        """The first travel_m of `edge` walked from `frm`, as an edge of its
-        own in this search's rows."""
-        row = self.rows[edge.edge_key]
-        forward = frm == edge.a
-        split = network.split_edge_row(row, travel_m if forward else edge.length_m - travel_m)
-        if split is None:
-            return None
-        mid = next(self.ids)
-        before_key, after_key = next(self.ids), next(self.ids)
-        self.rows[before_key], self.rows[after_key] = split["before"], split["after"]
-        split["before"]["origin"] = split["after"]["origin"] = row.get("origin", edge.edge_key)
-        if forward:
-            key, piece = before_key, GraphEdge(before_key, edge.a, mid, split["before"]["length_m"], edge.allowed, [(before_key, True)])
+    def _entries_of(self, key: int) -> tuple[_Entry, ...]:
+        """What the miles on an edge earn: nothing off every stretch."""
+        found = self._credit_cache.get(key)
+        if found is not None:
+            return found
+        row = self.rows[key]
+        origin = row.get("origin", key)
+        if key in self._piece_entry:
+            found = (self._piece_entry[key],)
+        elif origin in self._origin_entries:
+            found = tuple(self._origin_entries[origin])
+        elif origin in self._credit:
+            index, per_m = self._credit[origin]
+            found = (_Entry(self._next_bit, per_m * row["length_m"], row["length_m"], index),)
+            self._next_bit += 1
         else:
-            key, piece = after_key, GraphEdge(after_key, mid, edge.b, split["after"]["length_m"], edge.allowed, [(after_key, True)])
-        if edge.edge_key in self.owner:
-            self.owner[key] = self.owner[edge.edge_key]
-        return piece, frm
+            found = ()
+        self._credit_cache[key] = found
+        return found
 
-    def _partial_run(self, chain: _Chain, ji: int, direction: int, want_m: float) -> Traversal | None:
-        """The way along `chain` from nodes[ji] for about want_m, the last
-        edge cut where the distance runs out; the whole remainder when the
-        chain is shorter."""
-        out: Traversal = []
-        run_m = 0.0
-        i = ji
-        while run_m < want_m - CUT_SLACK_M:
-            e = i if direction > 0 else i - 1
-            if not 0 <= e < len(chain.edges):
-                break
-            edge, frm = chain.edges[e], chain.nodes[i]
-            if edge.traverse(frm) is None:
-                return None
-            left = want_m - run_m
-            if edge.length_m <= left + CUT_SLACK_M:
-                out.append((edge, frm))
-                run_m += edge.length_m
-                i += direction
-                continue
-            cut = self._cut(edge, frm, left)
-            if cut is not None:
-                out.append(cut)
-                run_m += left
-            break
-        return out if run_m >= MIN_RUN_M else None
+    def _link(
+        self, tree: survey.Tree, node: int, to: int, costs: survey.EdgeCosts, rows: Mapping[int, dict]
+    ) -> _Link | None:
+        """The connector along `tree`'s path between its source and `node`,
+        ending at `to`; None when the
+        path has more continuous uncomfortable road than the preferences
+        allow, or runs on stretches only (a walk takes those as running)."""
+        if survey.approach_to(tree, node, costs, rows).max_uncomfortable_run_m > self.prefs["max_continuous_uncomfortable_m"]:
+            return None
+        traversal = route_search._forward(tree.steps(node))
+        if all(self.rows[e.edge_key].get("origin", e.edge_key) in self._run_origins for e, _ in traversal):
+            return None
+        entries: list[_Entry] = []
+        weighted = length = vert_m = 0.0
+        for e, _ in traversal:
+            found = self._entries_of(e.edge_key)
+            entries.extend(found)
+            if not found:
+                weighted += costs[e.edge_key][0]
+            length += e.length_m
+            vert_m += self._vertical(e.edge_key)
+        by_block: defaultdict[int, float] = defaultdict(float)
+        for entry in entries:
+            by_block[entry.block] += entry.meters
+        blocks = sum(1 << b for b, m in by_block.items() if m >= MIN_INCLUDE_M)
+        return _Link(to, traversal, length, CONNECTOR_CHARGE_PER_WEIGHTED_MI * weighted / MILE_M, tuple(entries), vert_m, blocks)
 
-    @staticmethod
-    def _end_node(traversal: Traversal) -> int:
-        edge, frm = traversal[-1]
-        step = edge.traverse(frm)
-        assert step is not None
-        return step[0]
+    def _corridor(self, out: survey.Tree) -> set[int]:
+        """The edges the paths from a tree's source to the hubs use."""
+        keys: set[int] = set()
+        seen: set[int] = set()
+        for hub in self.hubs:
+            node = hub
+            while node in out.prev_edge and node not in seen:
+                seen.add(node)
+                keys.add(out.prev_edge[node].edge_key)
+                node = out.prev_node[node]
+        return keys
 
-    def _next_chains(
-        self, node: int, left_m: float, used: set[int], group_id: int, limit: int
-    ) -> list[tuple[Traversal, _Chain, int, int]]:
-        """From `node`, the connectors to the `limit` block chains worth most
-        for the distance still wanted, best first (a group the route is
-        already in counting SAME_GROUP_BONUS times over), each with where on
-        its chain to join it and in which direction."""
-        tree = self._tree(("extension", node), node, EXTENSION_MAX_COST_M)
-        options: dict[int, tuple[float, _Chain, int, int]] = {}
-        for prep in self.blocks:
-            bonus = SAME_GROUP_BONUS if prep.planned.block["section_id"] == group_id else 1.0
-            for chain in prep.chains:
-                if chain.keys & used:
-                    continue
-                for i, n in enumerate(chain.nodes):
-                    if n not in chain.joins or n not in tree.cost:
+    def _connect_sinks(self, finish: int) -> None:
+        """Connectors out of and into the start (`finish`) and the stops. Those into a sink
+        come in two kinds: the cheapest path, and the cheapest that avoids the
+        corridor the way out uses."""
+        sinks = list(dict.fromkeys([finish, *(s.node for s in self.stops)]))
+        lengths = {key: (row["length_m"], None, 0.0) for key, row in self.rows.items()}
+        self._home_m = survey.weighted_tree(self.graph, finish, lengths, self.limit_hi, inbound=True).cost
+        self._sink_links = {}
+        bound = APPROACH_TREE_SHARE * self.target_m
+        cap = APPROACH_SHARE_MAX * self.target_m
+        targets = self.hubs | set(sinks)
+        # A walk may turn for home at any junction of the stretches.
+        exits = targets | {n for n in self.runs if len(self.graph.adjacency.get(n, ())) != 2}
+        for sink in sinks:
+            out = survey.weighted_tree(self.graph, sink, self.costs, bound)
+            into = survey.weighted_tree(self.graph, sink, self.costs, bound, inbound=True)
+            corridor = self._corridor(out)
+            around = survey.weighted_tree(self.graph, sink, self.costs, bound, corridor, inbound=True) if corridor else None
+            for node in out.cost:
+                if node != sink and node in targets and out.length[node] <= cap:
+                    link = self._link(out, node, node, self.costs, self.rows)
+                    if link is not None:
+                        self._sink_links.setdefault(sink, []).append(link)
+            for tree in (into, around) if around is not None else (into,):
+                for node in tree.cost:
+                    if node == sink or node not in exits:
                         continue
-                    for direction in (1, -1):
-                        avail = chain.cum[-1] - chain.cum[i] if direction > 0 else chain.cum[i]
-                        if avail < MIN_RUN_M:
-                            continue
-                        value = bonus * prep.planned.density * min(avail, left_m) / MILE_M
-                        value -= survey.ACCESS_COST_PER_WEIGHTED_MI * tree.cost[n] / MILE_M
-                        if id(chain) not in options or value > options[id(chain)][0]:
-                            options[id(chain)] = (value, chain, i, direction)
-        best = sorted(options.values(), key=lambda o: (-o[0], o[2], o[3]))[:limit]
-        return [(route_search._forward(tree.steps(chain.nodes[i])), chain, i, direction) for _v, chain, i, direction in best]
+                    if tree is around and [e.edge_key for e, _, _ in into.steps(node)] == [e.edge_key for e, _, _ in tree.steps(node)]:
+                        continue
+                    link = self._link(tree, node, sink, self.costs, self.rows)
+                    if link is not None:
+                        self._sink_links.setdefault(node, []).append(link)
 
-    def _group_of(self, chain: _Chain) -> int:
-        return self.blocks[chain.block].planned.block["section_id"]
+    def _links_of_hub(self, node: int) -> list[_Link]:
+        links = self._hub_links.get(node)
+        if links is None:
+            tree = self.space.tree(self._fingerprint, self._space_costs, node)
+            found = [
+                link for other in tree.cost
+                if other != node and other in self.hubs and other in self.graph.nodes
+                and (link := self._link(tree, other, other, self._space_costs, self.space.rows)) is not None
+            ]
+            found.sort(key=lambda link: (link.cost, link.to))
+            links = self._hub_links[node] = found[:CONNECTORS_PER_HUB]
+        return links
 
-    def _extension(
-        self, node: int, left_m: float, used: set[int], group_id: int
-    ) -> tuple[Traversal, float, _Chain] | None:
-        """From `node`, a connector to the next block chain and the run along
-        it (the last edge cut where the distance runs out), with the distance
-        both cover."""
-        found = self._next_chains(node, left_m, used, group_id, 1)
-        if not found:
-            return None
-        connector, chain, i, direction = found[0]
-        run = self._partial_run(chain, i, direction, left_m)
-        if run is None:
-            return None
-        return connector + run, _length(connector) + _length(run), chain
-
-    def _out_leg(
-        self, chain: _Chain, ji: int, direction: int, stem: Traversal, approach_m: float, want_m: float
-    ) -> Traversal | None:
-        """The way out: the stem, the run along `chain`, and, when the chain
-        ends before want_m, further blocks reached by short connectors."""
-        run = self._partial_run(chain, ji, direction, want_m - approach_m)
-        if run is None:
-            return None
-        out = stem + run
-        have = approach_m + _length(run)
-        used = _keys(out)
-        group_id = self._group_of(chain)
-        for _ in range(MAX_EXTENSIONS):
-            if want_m - have < MIN_RUN_M:
-                break
-            extension = self._extension(self._end_node(out), want_m - have, used, group_id)
-            if extension is None:
-                break
-            out = out + extension[0]
-            have += extension[1]
-            used |= _keys(extension[0])
-            group_id = self._group_of(extension[2])
-        return out
-
-    def _out_and_back(
-        self, start: Start, chain: _Chain, ji: int, direction: int, stem: Traversal, approach_m: float
-    ) -> Built | None:
-        out = self._out_leg(chain, ji, direction, stem, approach_m, self.target_m / 2.0)
-        if out is None:
-            return None
-        back = _reverse(out)
-        return None if back is None else Built("out_and_back", start, out + back, False)
-
-    def _home_tree(self, s_node: int, chain: _Chain, ji: int, direction: int, used: set[int], out_m: float) -> survey.Tree:
-        """The cheapest ways home from the start to the nodes of `chain` on
-        from ji, where the chain and what has been run (`used`) cost more to
-        reuse, explored as far as the distance left after `out_m` allows. Only
-        the tree for a chain alone is kept."""
-        penalized = frozenset(used | chain.keys)
-        if used:
-            reach = max(self.target_m - out_m, 0.0) * HOME_REACH_SLACK
-            ahead = chain.nodes[ji + 1:] if direction > 0 else chain.nodes[:ji]
-            return survey.weighted_tree(self.graph, s_node, self.costs, reach, penalized, ahead)
-        return self._tree(("home", s_node, id(chain)), s_node, self.target_m * RETURN_TREE_SHARE, penalized, chain.nodes)
-
-    def _chained_from(
-        self, s_node: int, start: Start, t1: survey.Tree, chain: _Chain, joins: Sequence[int]
-    ) -> Iterator[Built]:
-        """Loops that chain further blocks on from a chain, entered at its
-        cheapest join: out over this chain and on to further blocks
-        (MAX_LOOP_BLOCKS in all, LOOP_BRANCHING choices for each next one, the
-        group the route is in first), each reached by a connector within
-        EXTENSION_MAX_COST_M, turning home at the node of a later chain where
-        the cheapest way back that avoids what was run makes the target
-        distance. A chain that can fill the distance alone is left to the
-        single-block loop."""
-        for ji in joins:
-            found = self._approach(t1, chain.nodes[ji])
-            if found is None:
-                continue
-            steps, approach_m = found
-            stem = route_search._forward(steps)
-            for direction in (1, -1):
-                for built in self._chain_on(s_node, start, t1, chain, ji, direction, stem, stem, approach_m, set(), 0):
-                    if built.shape in self.shapes:
-                        yield built
-
-    def _chain_on(
-        self, s_node: int, start: Start, t1: survey.Tree, chain: _Chain, ji: int, direction: int, stem: Traversal,
-        out: Traversal, out_m: float, used: set[int], stage: int,
-    ) -> Iterator[Built]:
-        # The approach tree stands in for the way home while the route is still
-        # too short to turn; the penalized tree is worked out only once it can.
-        reachable = self._totals(chain, ji, direction, out_m, t1)
-        best_m = max(reachable.values(), default=0.0)
-        if stage and best_m >= self.dmin:
-            built = self._turn_home(
-                start, chain, ji, direction, out, out_m, stem, self._home_tree(s_node, chain, ji, direction, used, out_m)
-            )
-            if built is not None:
-                yield built
-        last = len(chain.nodes) - 1 if direction > 0 else 0
-        run = chain.run(ji, last)
-        if best_m >= self.target_m or run is None or last == ji or stage + 1 >= MAX_LOOP_BLOCKS:
-            return
-        out, out_m, used = out + run, out_m + _length(run), used | _keys(run)
-        for connector, nxt, i, d in self._next_chains(
-            self._end_node(out), max(self.target_m - best_m, MIN_RUN_M), used | _keys(stem), self._group_of(chain),
-            LOOP_BRANCHING,
-        ):
-            if time.monotonic() > self.deadline:
-                return
-            yield from self._chain_on(
-                s_node, start, t1, nxt, i, d, stem, out + connector, out_m + _length(connector),
-                used | _keys(connector), stage + 1,
-            )
-
-    def _turn_home(
-        self, start: Start, chain: _Chain, ji: int, direction: int, out: Traversal, out_m: float, stem: Traversal,
-        tree: survey.Tree,
-    ) -> Built | None:
-        """`out`, then the chain run to a node, and home by the tree's path:
-        of the nodes that make the requested distance (the closest few to the
-        target if none does), the one whose way home retraces the least."""
-        totals = self._totals(chain, ji, direction, out_m, tree)
-        if not totals:
-            return None
-        by_miss = sorted(totals, key=lambda k: (abs(totals[k] - self.target_m), k))
-        fitting = [k for k in by_miss if self.dmin <= totals[k] <= self.dmax]
-        best: tuple[float, float, Built] | None = None
-        for k in (fitting or by_miss[:1])[:TURN_CANDIDATES]:
-            run = chain.run(ji, k)
-            back = _reverse(route_search._forward(tree.steps(chain.nodes[k])))
-            if run is None or back is None:
-                continue
-            ran = out + run
-            total = _length(back)
-            reuse = _shared_m(back, ran) / total if total > 0 else 0.0
-            shape = _return_shape(back, ran, stem)
-            key = (round(reuse / TURN_REUSE_STEP), abs(totals[k] - self.target_m))
-            if best is None or key < best[:2]:
-                best = (*key, Built(shape, start, ran + back, shape != "out_and_back"))
-        return None if best is None else best[2]
+    def _links(self, node: int) -> list[_Link]:
+        links = self._sink_links.get(node, [])
+        return links + self._links_of_hub(node) if node in self.hubs else links
 
     # -----------------------------------------------------------------------
-    # Ranking
+    # The search
     # -----------------------------------------------------------------------
 
-    def rank(self, built: Built, segments: Sequence[tuple[int, bool]]) -> dict:
-        """The terms of a built candidate's score and the sections it runs."""
-        miles: Counter[int] = Counter()
-        off_block_cost_m = 0.0
-        distance_m = 0.0
-        for edge_id, _forward in segments:
-            length_m = self.rows[edge_id]["length_m"]
-            distance_m += length_m
-            owner = self.owner.get(edge_id)
-            if owner is None:
-                off_block_cost_m += self.costs[edge_id][0]
-            else:
-                miles[owner] += length_m
-        quality = sum(self.blocks[i].planned.density * m / MILE_M for i, m in miles.items())
+    def _fit(self, distance_m: float) -> float:
         miss = max(self.dmin - distance_m, distance_m - self.dmax, 0.0)
-        fit = max(0.0, 1.0 - FIT_SLOPE * miss / max(self.target_m, 1.0))
-        loop = 1.0 + self.loop_bonus if built.loop_like else 1.0
-        access_cost = survey.ACCESS_COST_PER_WEIGHTED_MI * off_block_cost_m / 2.0 / MILE_M
+        return max(0.0, 1.0 - FIT_SLOPE * miss / max(self.target_m, 1.0))
+
+    def _gain_fit(self, gain_m: float, distance_m: float) -> float:
+        if not self.plan.fit_gain:
+            return 1.0
+        return survey.gain_fit(gain_m * FT_PER_M / (max(distance_m, 1.0) / MILE_M), self.plan.gain_band)
+
+    def _score(self, state: _State) -> float:
+        return state.value * self._fit(state.dist_m) * self._gain_fit(state.vert_m / 2.0, state.dist_m) - state.cost
+
+    def _earn(self, state: _State, entries: Sequence[_Entry]) -> tuple[float, int, int]:
+        """What running `entries` after `state` earns, and the repeat counts after."""
+        gain, ran, twice = 0.0, state.ran, state.twice
+        for entry in entries:
+            bit = 1 << entry.bit
+            if twice & bit:
+                factor = self.repeat_value**2
+            elif ran & bit:
+                factor, twice = self.repeat_value, twice | bit
+            else:
+                factor, ran = 1.0, ran | bit
+            gain += entry.value * factor * self._worth.get(entry.block, 1.0)
+        return gain, ran, twice
+
+    def _rank(self, state: _State) -> tuple[float, int, float]:
+        """Sort key, best first: the score so far plus what the miles left
+        could earn at the best density within reach of the node."""
+        density = self._near_density.get(state.node, self._best_per_mile)
+        bound = max(self.target_m - state.dist_m - self._home_m.get(state.node, 0.0), 0.0) / MILE_M * density
+        return (-(state.value - state.cost + bound), state.node, state.bucket)
+
+    def _child(
+        self, state: _State, to: int, length_m: float, gain: float, cost: float, action: _Run | _Link,
+        ran: int, twice: int,
+    ) -> _State | None:
+        dist = state.dist_m + length_m
+        if dist > self.limit_hi:
+            return None
+        home = self._home_m.get(to)
+        if home is None:
+            return None
+        if dist + home > self.limit_hi:
+            return None
+        stops = state.stops
+        for i, spec in enumerate(self.stops):
+            if stops >> i & 1:
+                continue
+            if spec.node == to and spec.lo_m <= dist <= spec.hi_m:
+                stops |= 1 << i
+            elif dist > spec.hi_m:
+                return None
+        bucket = max(state.bucket + 1, int(dist // BUCKET_M))
+        return _State(
+            to, dist, state.value + gain, state.cost + cost, state.vert_m + action.vert_m, ran, twice, stops, state, action, bucket
+        )
+
+    def _beam(self, start_node: int, deadline: float) -> list[_State]:
+        """The finished walks from one start: states at the start, inside the
+        range (with slack) and past every stop."""
+        everything = (1 << len(self.stops)) - 1
+        root = _State(start_node, 0.0, 0.0, 0.0, 0.0, 0, 0, 0, None, None, 0)
+        layers: dict[int, dict[tuple[int, int], _State]] = {0: {(start_node, 0): root}}
+        done: list[_State] = []
+        while layers and time.monotonic() <= deadline:
+            layer = layers.pop(min(layers))
+            for state in sorted(layer.values(), key=self._rank)[:BEAM_WIDTH]:
+                children: list[_State | None] = []
+                for run in self.runs.get(state.node, ()):
+                    gain, ran, twice = self._earn(state, (run.entry,))
+                    children.append(self._child(state, run.to, run.edge.length_m, gain, 0.0, run, ran, twice))
+                for link in self._links(state.node):
+                    gain, ran, twice = self._earn(state, link.entries)
+                    children.append(self._child(state, link.to, link.length_m, gain, link.cost, link, ran, twice))
+                for child in children:
+                    if child is None:
+                        continue
+                    if child.node == start_node and child.stops == everything and self.limit_lo <= child.dist_m:
+                        done.append(child)
+                    held = layers.setdefault(child.bucket, {})
+                    key = (child.node, child.stops)
+                    if key not in held or child.value - child.cost > held[key].value - held[key].cost:
+                        held[key] = child
+        return done
+
+    # -----------------------------------------------------------------------
+    # Results
+    # -----------------------------------------------------------------------
+
+    def walks(self, deadline: float) -> Iterator[Walk]:
+        """Distinct finished walks, best first, until `deadline`. Each start
+        gets an equal share of the time. A start is searched up to ROUNDS times,
+        each time with the stretches of the best walk so far worth ROUND_DISCOUNT
+        of what they were, so the walks found are not all variations of one."""
+        found: list[Walk] = []
+        covers: list[Mapping[int, float]] = []
+        for k, (node, start) in enumerate(self.start_nodes):
+            now = time.monotonic()
+            share_end = now + (deadline - now) / (len(self.start_nodes) - k)
+            self._worth = {i: planned.steer for i, planned in enumerate(self.plan.blocks)}
+            self._connect_sinks(node)
+            for _ in range(ROUNDS):
+                fresh: list[Walk] = []
+                states = sorted(self._beam(node, share_end), key=lambda s: (-self._score(s), s.dist_m))
+                for state in itertools.islice(_by_variety(states, lambda s: s.blocks), SCANNED_COMPLETIONS):
+                    walk = self._walk(state, start)
+                    if not walk.block_m or walk.shape not in self.shapes or not self._includes_required(walk):
+                        continue
+                    cover = route_search._cover(self.rows, route_search._flatten(walk.traversal))
+                    if any(route_search._duplicate(cover, other) for other in covers):
+                        continue
+                    covers.append(cover)
+                    fresh.append(walk)
+                    if len(fresh) >= MAX_COMPLETIONS:
+                        break
+                found.extend(fresh)
+                if not fresh:
+                    break
+                for block in max(fresh, key=lambda w: w.score).block_m:
+                    self._worth[block] = self._worth[block] * ROUND_DISCOUNT
+        found.sort(key=lambda w: -w.score)
+        yield from itertools.islice(_by_variety(found, lambda w: frozenset(i for i, m in w.block_m.items() if m >= MIN_INCLUDE_M)), MAX_WALKS)
+
+    def _includes_required(self, walk: Walk) -> bool:
+        return all(sum(walk.block_m.get(i, 0.0) for i in covers) >= least_m for covers, least_m in self.plan.required)
+
+    def _walk(self, state: _State, start: Start) -> Walk:
+        """The walk that ends in `state`, valued without any round discount."""
+        chain: list[_State] = [state]
+        while chain[-1].parent is not None:
+            chain.append(chain[-1].parent)
+        chain.reverse()
+        traversal: Traversal = []
+        block_m: defaultdict[int, float] = defaultdict(float)
+        passes: Counter[int] = Counter()
+        value = 0.0
+        for before, s in zip(chain, chain[1:]):
+            action = s.action
+            if isinstance(action, _Run):
+                traversal.append((action.edge, before.node))
+                entries: Sequence[_Entry] = (action.entry,)
+            elif action is not None:
+                traversal.extend(action.traversal)
+                entries = action.entries
+            else:
+                continue
+            for entry in entries:
+                block_m[entry.block] += entry.meters
+                value += entry.value * self.repeat_value ** min(passes[entry.bit], 2)
+                passes[entry.bit] += 1
+        reached: list[dict] = []
+        for spec in self.stops:
+            visit = next((s for s in chain if s.node == spec.node and spec.lo_m <= s.dist_m <= spec.hi_m), None)
+            reached.append({
+                "label": spec.stop.get("label"), "lat": spec.stop["lat"], "lng": spec.stop["lng"],
+                "wanted_mi": spec.stop.get("at_mi"), "at_mi": None if visit is None else visit.dist_m / MILE_M,
+            })
+        score = value * self._fit(state.dist_m) * self._gain_fit(state.vert_m / 2.0, state.dist_m) - state.cost
+        return Walk(start, traversal, _shape(traversal), state.dist_m, value, state.cost, score, block_m, reached, state.vert_m)
+
+    def rank(self, walk: Walk, gain_m: float | None) -> dict:
+        """The terms of a walk's score and the sections it runs, the climb
+        being the route's own when it is known and else the walk's estimate."""
+        fit = self._fit(walk.distance_m)
+        gain_fit = self._gain_fit(walk.vert_m / 2.0 if gain_m is None else gain_m, walk.distance_m)
         used = [
             {
-                "section_id": self.blocks[i].planned.block["section_id"],
-                "block_id": self.blocks[i].planned.block["block_id"],
-                "name": self.blocks[i].planned.block["name"],
+                "section_id": self.plan.blocks[i].block["section_id"],
+                "block_id": self.plan.blocks[i].block["block_id"],
+                "name": self.plan.blocks[i].block["name"],
                 "length_m": m,
             }
-            for i, m in sorted(miles.items(), key=lambda kv: -kv[1])
+            for i, m in sorted(walk.block_m.items(), key=lambda kv: -kv[1])
+            if m >= MIN_INCLUDE_M
         ]
         return {
-            "score": quality * loop * fit - access_cost,
-            "quality_mi": quality,
-            "loop": loop,
+            "score": walk.value * fit * gain_fit - walk.cost,
+            "quality_mi": walk.value,
             "fit": fit,
-            "access_cost": access_cost,
+            "gain_fit": gain_fit,
+            "access_cost": walk.cost,
             "sections_used": used,
         }
+
+
+def _by_variety(walks: Sequence[_T], key: Callable[[_T], Hashable]) -> Iterator[_T]:
+    """`walks` (best first) taking the best of each group by `key`, then the
+    second best of each, and so on. Walks that differ only in where they turn
+    on one stretch would otherwise crowd out the best walk over another set of
+    stretches, in the scan for completions and in the caller's pool."""
+    groups: defaultdict[Hashable, list[_T]] = defaultdict(list)
+    for walk in walks:
+        groups[key(walk)].append(walk)
+    return (w for tier in itertools.zip_longest(*groups.values()) for w in tier if w is not None)
+
+
+def _shape(traversal: Traversal) -> str:
+    """What a finished walk looks like: an out-and-back when it repeats
+    OUT_AND_BACK_REUSE_SHARE of its length, a lollipop when its end retraces its
+    start for MIN_STEM_M or more, otherwise a loop."""
+    keys = [edge.edge_key for edge, _ in traversal]
+    seen: set[int] = set()
+    repeated = total = 0.0
+    for key, (edge, _) in zip(keys, traversal):
+        total += edge.length_m
+        if key in seen:
+            repeated += edge.length_m
+        seen.add(key)
+    if total > 0 and repeated / total >= OUT_AND_BACK_REUSE_SHARE:
+        return "out_and_back"
+    stem = 0.0
+    i, j = 0, len(keys) - 1
+    while i < j and keys[i] == keys[j]:
+        stem += traversal[i][0].length_m
+        i, j = i + 1, j - 1
+    return "lollipop" if stem >= MIN_STEM_M else "loop"

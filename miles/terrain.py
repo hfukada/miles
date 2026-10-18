@@ -1261,11 +1261,12 @@ class RoutePointClass(TypedDict):
     cls: Literal["run", "grind", "hike"] | None
 
 
-def route_point_classes(conn: sqlite3.Connection, route_id: int) -> list[RoutePointClass]:
+def _classify_profile(
+    conn: sqlite3.Connection, profile: Sequence[routes_service.RouteProfilePoint]
+) -> list[RoutePointClass]:
     """Per-point runnability class for coloring. A point takes the grade of the
     segment to the next point; the last repeats the prior one to stay
-    one-to-one with the profile. Raises routes.RouteNotFoundError."""
-    profile = routes_service.get_route_profile(conn, route_id)
+    one-to-one with the profile."""
     if not profile:
         return []
     model = current_model(conn)
@@ -1283,6 +1284,31 @@ def route_point_classes(conn: sqlite3.Connection, route_id: int) -> list[RoutePo
         }
         for p, g in zip(profile, grades)
     ]
+
+
+def route_point_classes(conn: sqlite3.Connection, route_id: int) -> list[RoutePointClass]:
+    """Raises routes.RouteNotFoundError."""
+    return _classify_profile(conn, routes_service.get_route_profile(conn, route_id))
+
+
+def geometry_point_classes(
+    conn: sqlite3.Connection, geometry: Sequence[Sequence[float | None]]
+) -> list[RoutePointClass]:
+    """route_point_classes for unsaved [lat, lng, ele_m|None] points, with the
+    elevation smoothed as network.score_path does, so the classes agree with
+    the candidate's own run/grind/hike shares. A path missing any elevation
+    gets no classes."""
+    points = [(cast(float, lat), cast(float, lng), ele) for lat, lng, ele in geometry]
+    dist = gpx_parse.cumulative_distances_m(points)
+    eles: list[float | None] = [p[2] for p in points]
+    if len(points) > 1 and all(e is not None for e in eles):
+        eles = list(gpx_parse.roughness_smoothed(dist, cast("list[float]", eles))[0])
+    else:
+        eles = [None] * len(points)
+    return _classify_profile(conn, [
+        {"idx": i, "lat": lat, "lng": lng, "dist_m": d, "ele_m": e}
+        for i, ((lat, lng, _), d, e) in enumerate(zip(points, dist, eles))
+    ])
 
 
 # ---------------------------------------------------------------------------

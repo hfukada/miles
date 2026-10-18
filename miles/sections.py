@@ -2099,6 +2099,18 @@ class Block(TypedDict):
     edge_ids: list[int]
 
 
+def block_of(stretch: Section) -> Block:
+    return {
+        "block_id": stretch.section_id,
+        "section_id": cast(int, stretch.group_id),
+        "name": stretch.name,
+        "chains": [list(c) for c in stretch.data["chains"]],
+        "end_nodes": (stretch.data["end_nodes"][0], stretch.data["end_nodes"][1]),
+        "entry_nodes": stretch.data["entry_nodes"],
+        "edge_ids": stretch.edge_ids,
+    }
+
+
 def building_blocks(
     conn: sqlite3.Connection, area_id: int, section_ids: Collection[int] | None = None
 ) -> list[Block]:
@@ -2128,15 +2140,7 @@ def building_blocks(
     blocks: list[Block] = []
     lead: Block | None = None
     for s in found:
-        block: Block = {
-            "block_id": s.section_id,
-            "section_id": cast(int, s.group_id),
-            "name": s.name,
-            "chains": [list(c) for c in s.data["chains"]],
-            "end_nodes": (s.data["end_nodes"][0], s.data["end_nodes"][1]),
-            "entry_nodes": s.data["entry_nodes"],
-            "edge_ids": s.edge_ids,
-        }
+        block = block_of(s)
         if (
             lead is not None and lead["section_id"] == block["section_id"] and block["chains"]
             and lead["end_nodes"][1] == block["end_nodes"][0]

@@ -36,7 +36,7 @@ from .elevation import ElevationSampler
 if TYPE_CHECKING:
     from . import sections
 
-NETWORK_DERIVE_VERSION = 10
+NETWORK_DERIVE_VERSION = 11
 
 # Paths with no vehicle traffic: they carry no road-comfort tier.
 TRAIL_HIGHWAYS = frozenset({"path", "footway", "bridleway", "steps", "cycleway"})
@@ -350,11 +350,20 @@ def _way_allowed(highway: str, tags: dict) -> bool:
     return True
 
 
-def _oneway_value(tags: dict) -> str:
-    oneway = tags.get("oneway")
-    if oneway in ("yes", "true", "1"):
+def _oneway_value(highway: str, tags: dict) -> str:
+    """The direction a runner may go: "yes" (from the way's first node on),
+    "-1" (against it), or "no". Motor-vehicle roads are two-way for a runner
+    unless `oneway:foot` says otherwise; on paths, tracks and the like
+    `oneway:foot` wins over `oneway`. `oneway:bicycle` never applies."""
+    if "oneway:foot" in tags:
+        value = tags["oneway:foot"]
+    elif highway in ROAD_LIKE_HIGHWAYS and highway != "track":
+        return "no"
+    else:
+        value = tags.get("oneway")
+    if value in ("yes", "true", "1"):
         return "yes"
-    if oneway in ("-1", "reverse"):
+    if value in ("-1", "reverse"):
         return "-1"
     return "no"
 
@@ -927,7 +936,7 @@ def _build_network(
             "trail_kind": _trail_kind(highway, surface_class, tags),
             "structure": _structure(tags),
             "way_name": tags.get("name"),
-            "oneway": _oneway_value(tags),
+            "oneway": _oneway_value(highway, tags),
         }
         if is_road_like:
             maxspeed_mph, maxspeed_filled = _resolve_maxspeed(highway, tags)

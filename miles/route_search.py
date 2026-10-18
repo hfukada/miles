@@ -62,13 +62,18 @@ POOL_FACTOR = 3
 # after which a small network is judged exhausted.
 STAGNATION_ATTEMPTS = 40
 DIVERSITY_WEIGHT = 2.0
+# A section-built candidate scoring under this share of the best in the pool is
+# only offered after every candidate above it, however different from the rest.
+DIVERSITY_FLOOR = 0.25
+# The share of the time budget the section search may use when the random walk
+# could still have to fill in.
+SECTIONS_BUDGET_SHARE = 0.6
 # Two candidates sharing this share of the longer one's length (by original
 # edge, whatever point a piece was cut at) are one route.
 DUPLICATE_SHARE = 0.95
-# A loop adds this share to the quality of a candidate that returns by a
-# different path; the request may set it from 0 up to MAX_LOOP_BONUS.
-DEFAULT_LOOP_BONUS = 0.075
-MAX_LOOP_BONUS = 0.5
+# A stretch run again earns this share of its value; the request may set it
+# from 0 to 1.
+DEFAULT_REPEAT_VALUE = 0.5
 
 
 class Start(TypedDict):
@@ -77,6 +82,14 @@ class Start(TypedDict):
     label: NotRequired[str | None]
     drive_s: NotRequired[float | None]
     drive_time_estimated: NotRequired[bool]
+
+
+class Stop(TypedDict):
+    lat: float
+    lng: float
+    label: NotRequired[str | None]
+    # Where along the route the stop should come, in miles; absent, anywhere.
+    at_mi: NotRequired[float | None]
 
 
 class RouteSearchRequest(TypedDict):
@@ -97,9 +110,14 @@ class RouteSearchRequest(TypedDict):
     # Section ids (group, piece, or stretch) to build routes around; absent,
     # the survey's best sections for the start are used.
     sections: NotRequired[list[int] | None]
-    loop_bonus: NotRequired[float]
+    repeat_value: NotRequired[float]
+    stops: NotRequired[list[Stop] | None]
     surface_preference: NotRequired[str | None]
     unfamiliar_only: NotRequired[bool]
+    # What the run is for (survey.PURPOSES): sets the climb per mile a route is
+    # scored against and how the survey and the search weigh sections. An
+    # explicit gain range overrides the climb band.
+    purpose: NotRequired[str | None]
 
 
 class ConstraintMiss(TypedDict):
@@ -122,6 +140,7 @@ class RouteCandidateOut(TypedDict):
     built_from: NotRequired[str]
     sections_used: NotRequired[list[dict]]  # section_id, block_id, name, length_m
     ranking: NotRequired[dict]  # the terms of a section-built candidate's score
+    stops: NotRequired[list[dict]]  # each requested stop with the mile it was passed at
 
 
 class RouteSearchResult(TypedDict):
@@ -563,15 +582,11 @@ def _forward(steps: Steps) -> Traversal:
     return [(edge, frm) for edge, frm, _to in steps]
 
 
-def _retrace(steps: Steps) -> Traversal | None:
-    """The way back along steps, or None when a one-way stretch can't be
-    walked in reverse."""
-    back: Traversal = []
-    for edge, _frm, to in reversed(steps):
-        if edge.traverse(to) is None:
-            return None
-        back.append((edge, to))
-    return back
+def _way_home(graph: SearchGraph, frm: int, start_node: int) -> Traversal | None:
+    """The shortest way from `frm` to the start in the direction of travel;
+    retracing the way out fails across a one-way edge."""
+    dist_map, prev_edge, prev_node = _dijkstra(graph, frm, target=start_node)
+    return _forward(_reconstruct(start_node, prev_edge, prev_node)) if start_node in dist_map else None
 
 
 def _outbound_leg(
@@ -590,7 +605,7 @@ def _generate_out_and_back(ctx: _SearchContext, start_node: int, target_m: float
     if leg is None:
         return None
     out_steps, _dist = leg
-    back = _retrace(out_steps)
+    back = _way_home(ctx.graph, out_steps[-1][2], start_node)
     return None if back is None else _forward(out_steps) + back
 
 
@@ -602,7 +617,7 @@ def _generate_lollipop(ctx: _SearchContext, start_node: int, target_m: float, rn
     loop_steps = _generate_loop(ctx, stem_steps[-1][2], max(target_m - 2 * stem_dist, 0.0), rng)
     if loop_steps is None:
         return None
-    back = _retrace(stem_steps)
+    back = _way_home(ctx.graph, stem_steps[-1][2], start_node)
     return None if back is None else _forward(stem_steps) + loop_steps + back
 
 
@@ -719,6 +734,7 @@ class _Candidate:
     built_from: str = "walk"
     # Set on candidates assembled around sections: the terms of assemble.py's score.
     ranking: dict | None = None
+    stops: list[dict] = field(default_factory=list)
 
 
 def _quality(candidate: _Candidate, target_m: float) -> float:
@@ -726,11 +742,11 @@ def _quality(candidate: _Candidate, target_m: float) -> float:
     return closeness + _runnable_pct(candidate.score) / 100.0
 
 
-def _cover(edge_rows: Mapping[int, dict], candidate: _Candidate) -> dict[int, float]:
-    """The meters a candidate runs on each original edge: a piece cut from an
-    edge at a start or a turning point counts toward the edge it came from."""
+def _cover(edge_rows: Mapping[int, dict], segments: Sequence[tuple[int, bool]]) -> dict[int, float]:
+    """The meters a route runs on each original edge: a piece cut from an
+    edge at a start, a stop or a turning point counts toward the edge it came from."""
     cover: defaultdict[int, float] = defaultdict(float)
-    for eid, _ in candidate.segments:
+    for eid, _ in segments:
         row = edge_rows[eid]
         cover[row.get("origin", eid)] += row["length_m"]
     return cover
@@ -748,10 +764,10 @@ def _diversify(candidates: list[_Candidate], edge_rows: Mapping[int, dict], targ
     """Up to n of `candidates`, best first, each penalized for the edges it
     shares with those already selected. A section-built candidate ranks by
     its score scaled to the best in the pool, so the penalty weighs the same
-    as for a walk's quality. A candidate that duplicates a selected one is
-    dropped."""
+    as for a walk's quality, and one under DIVERSITY_FLOOR of the best waits
+    for the rest. A candidate that duplicates a selected one is dropped."""
     remaining = list(candidates)
-    covers = {id(c): _cover(edge_rows, c) for c in candidates}
+    covers = {id(c): _cover(edge_rows, c.segments) for c in candidates}
     selected: list[_Candidate] = []
     best_score = max((cast(dict, c.ranking)["score"] for c in candidates if c.ranking is not None), default=0.0)
 
@@ -768,7 +784,8 @@ def _diversify(candidates: list[_Candidate], edge_rows: Mapping[int, dict], targ
             fraction = min(shared_m / max(cast(float, c.score["distance_m"]), 1.0), 1.0)
             return base(c) - DIVERSITY_WEIGHT * fraction
 
-        best = max(remaining, key=penalized)
+        eligible = [c for c in remaining if c.ranking is None or base(c) >= DIVERSITY_FLOOR] or remaining
+        best = max(eligible, key=penalized)
         selected.append(best)
         remaining = [c for c in remaining if c is not best and not _duplicate(covers[id(c)], covers[id(best)])]
     return selected
@@ -901,9 +918,14 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     time_budget_s = request.get("time_budget_s", DEFAULT_TIME_BUDGET_S)
     if time_budget_s <= 0:
         raise ValueError("time_budget_s must be positive")
-    loop_bonus = request.get("loop_bonus", DEFAULT_LOOP_BONUS)
-    if not 0.0 <= loop_bonus <= MAX_LOOP_BONUS:
-        raise ValueError(f"loop_bonus must be between 0 and {MAX_LOOP_BONUS}")
+    repeat_value = request.get("repeat_value", DEFAULT_REPEAT_VALUE)
+    if not 0.0 <= repeat_value <= 1.0:
+        raise ValueError("repeat_value must be between 0 and 1")
+    stops_in = request.get("stops") or []
+    for stop in stops_in:
+        at_mi = stop.get("at_mi")
+        if at_mi is not None and at_mi <= 0:
+            raise ValueError("a stop's at_mi must be positive")
     seed = request.get("seed")
     if seed is None:
         seed = _default_seed(request)
@@ -916,23 +938,26 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     runnability = model.score_profile
 
     base_graph, cached_edge_rows = _cached_base_graph(conn, area_id)
+    built_at = _built_at(conn, area_id)
     # The survey behind the plan takes the search slot itself, so the plan is
     # made before this search holds it.
     plan = assemble.plan_blocks(conn, request, model)
     shapes_to_try: list[str] = [shape] if shape != "any" else ["loop", "out_and_back", "lollipop"]
     warnings = list(plan.warnings)
     with _search_lock:
-        graph = _copy_graph(base_graph)
         # Avoided ways leave the graph entirely, so no candidate can touch one.
         avoid_way_ids = (
             set(request.get("avoid_way_ids") or []) | network.avoided_way_ids(conn) | sections.excluded_way_ids(conn)
         )
-        _remove_ways(graph, cached_edge_rows, avoid_way_ids)
+        space = assemble.connector_space(area_id, built_at, base_graph, cached_edge_rows, avoid_way_ids)
+        graph = _copy_graph(space.graph)
         # Layered so splicing's synthetic rows stay request-local, off the shared cache.
         edge_rows: MutableMapping[int, dict] = ChainMap({}, cached_edge_rows)
         target_m = (request["distance_m_min"] + request["distance_m_max"]) / 2.0
         radius_m = request["distance_m_max"] / 2.0
-        _bound_graph(graph, [(s["lat"], s["lng"]) for s in starts_in], radius_m, plan.keep_nodes(cached_edge_rows))
+        _bound_graph(
+            graph, [(p["lat"], p["lng"]) for p in (*starts_in, *stops_in)], radius_m, plan.keep_nodes(cached_edge_rows)
+        )
 
         ids = itertools.count(-1, -1)
         replaced: dict[int, tuple[int, int, int, int]] = {}
@@ -944,6 +969,12 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
                 start_nodes.append((node_id, s))
         if not start_nodes:
             raise ValueError("no network found near any given start")
+        stop_nodes: list[tuple[int, Stop]] = []
+        for stop in stops_in:
+            node_id = _splice_start(graph, edge_rows, start_index, stop["lat"], stop["lng"], ids, replaced)
+            if node_id is None:
+                raise ValueError(f"no network found near stop {stop.get('label') or (stop['lat'], stop['lng'])}")
+            stop_nodes.append((node_id, stop))
 
         deadline = time.monotonic() + time_budget_s
         qualifying: dict[frozenset[int], _Candidate] = {}
@@ -952,25 +983,31 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
 
         if plan.blocks:
             assembly = assemble.Assembly(
-                plan, graph, edge_rows, replaced, start_nodes, prefs, model,
+                plan, graph, space, edge_rows, replaced, start_nodes, stop_nodes, prefs, model,
                 distance_m_min=request["distance_m_min"], distance_m_max=request["distance_m_max"],
-                shapes=shapes_to_try, loop_bonus=loop_bonus, ids=ids,
+                shapes=shapes_to_try, repeat_value=repeat_value, ids=ids,
             )
-            for built in assembly.candidates(deadline):
-                segments = _flatten(built.traversal)
+            pool_target = n * POOL_FACTOR
+            # The walk may have to fill in afterwards, so it keeps a share of the budget.
+            sections_end = deadline if plan.explicit or stops_in else deadline - (1.0 - SECTIONS_BUDGET_SHARE) * time_budget_s
+            for walk in assembly.walks(sections_end):
+                if len(qualifying) >= pool_target:
+                    break
+                segments = _flatten(walk.traversal)
                 evaluated = _evaluate(conn, area_id, request, segments, prefs, runnability, edge_rows) if segments else None
                 if evaluated is None:
                     continue
                 score, misses = evaluated
-                candidate = _Candidate(
-                    built.shape, built.start, segments, score, misses, "sections", assembly.rank(built, segments)
-                )
+                ranking = assembly.rank(walk, score["gain_m"] if score["has_elevation"] else None)
+                candidate = _Candidate(walk.shape, walk.start, segments, score, misses, "sections", ranking, walk.stops)
                 identity = _identity(edge_rows, segments)
                 pool = near_misses if misses else qualifying
                 best = pool.get(identity)
                 if best is None or cast(dict, candidate.ranking)["score"] > cast(dict, best.ranking)["score"]:
                     pool[identity] = candidate
             budget_exceeded = time.monotonic() > deadline and len(qualifying) < n
+        elif stops_in:
+            warnings.append("stops can only be passed by routes built from sections, and none lies within reach of a start")
         elif plan.explicit:
             warnings.append("none of the named sections could be built into a route: none lies within reach of a start")
         if plan.explicit and plan.blocks and not qualifying and not near_misses:
@@ -980,8 +1017,8 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
             )
 
         # The walk is the fallback for a request no section could serve; it
-        # never stands in for sections the request named.
-        walking = not plan.explicit and not qualifying and not budget_exceeded
+        # never stands in for sections the request named, and it cannot pass stops.
+        walking = not plan.explicit and not stops_in and not qualifying and not budget_exceeded
         if walking:
             contract_degree2_chains(graph, ids, protected=[node_id for node_id, _ in start_nodes])
             ctx = _SearchContext(graph=graph)
@@ -1027,7 +1064,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         selected = []
         covers: list[dict[int, float]] = []
         for c in sorted(near_misses.values(), key=near_key):
-            cover = _cover(edge_rows, c)
+            cover = _cover(edge_rows, c.segments)
             if len(selected) < n and not any(_duplicate(cover, other) for other in covers):
                 selected.append(c)
                 covers.append(cover)
@@ -1060,6 +1097,8 @@ def _persist_candidate(
         "built_from": candidate.built_from,
         "sections_used": cast(list[dict], (candidate.ranking or {}).get("sections_used", [])),
     }
+    if candidate.stops:
+        out["stops"] = candidate.stops
     if candidate.ranking is not None:
         out["ranking"] = {k: v for k, v in candidate.ranking.items() if k != "sections_used"}
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=CANDIDATE_TTL_HOURS)).isoformat()

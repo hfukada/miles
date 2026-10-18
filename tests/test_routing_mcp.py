@@ -146,7 +146,7 @@ def test_find_routes_tool_reports_the_sections_a_candidate_runs_and_takes_the_se
     lat, lng = pt(0, 0)
     args = {
         "area_id": 2, "distance_mi_min": 1.7, "distance_mi_max": 2.0, "start_lat": lat, "start_lng": lng,
-        "sections": [group_id], "loop_bonus": 0.3, "surface_preference": "singletrack", "unfamiliar_only": True,
+        "sections": [group_id], "repeat_value": 0.3, "surface_preference": "singletrack", "unfamiliar_only": True,
     }
 
     result = tool("find_routes", args)
@@ -157,9 +157,11 @@ def test_find_routes_tool_reports_the_sections_a_candidate_runs_and_takes_the_se
     used = top["sections_used"][0]
     assert set(used) == {"section_id", "block_id", "name", "miles"} and used["section_id"] == group_id
     assert used["miles"] == pytest.approx(1.49, abs=0.05)
-    assert top["ranking"]["loop_factor"] == pytest.approx(1.3)
-    assert tool("find_routes", {**args, "sections": None, "loop_bonus": 0.0})["candidates"][0]["ranking"]["loop_factor"] == 1.0
-    assert "loop_bonus" in tool("find_routes", {**args, "loop_bonus": 2.0})["error"]
+    assert top["stops"] == []
+    assert "repeat_value" in tool("find_routes", {**args, "repeat_value": 2.0})["error"]
+    stop = {"lat": lat, "lng": lng, "label": "home", "at_mi": 1}
+    with_stop = tool("find_routes", {**args, "stops": [stop]})["candidates"][0]
+    assert with_stop["stops"][0]["label"] == "home" and with_stop["stops"][0]["wanted_mi"] == 1
     assert "no section 999999" in tool("find_routes", {**args, "sections": [999999]})["error"]
 
 

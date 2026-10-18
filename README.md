@@ -222,6 +222,15 @@ bytes), `GET /api/routes/{id}/profile` (resampled points), `GET
 /api/routes/{id}`, round out the HTTP surface; the MCP tools above cover the
 same ground read-mostly for Claude Code.
 
+### Sharing route options
+
+After a route search, `share_candidates` publishes the chosen candidates as
+`candidates.html?set=<id>`: a card each with a map, elevation profile, terrain
+stats and a Save as route button. Sets and their candidates are kept for a week.
+Set `MILES_PUBLIC_URL` (for example `https://miles.example.com`, no trailing
+slash) so the tool returns an absolute link; without it the link is a path on
+the web app's own address.
+
 ## Public services
 
 Area import, geocoding, drive times, elevation, and the map pages call public

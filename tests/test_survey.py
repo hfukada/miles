@@ -60,7 +60,7 @@ def test_every_term_of_the_score_is_reported_and_the_start_on_a_section_costs_no
     assert row["access"]["approach_m"] == 0.0 and row["terms"]["access_cost"] == 0.0
     assert set(row["terms"]) == {
         "usable_m", "continuity", "scenery_bonus", "runnability", "surface", "quality", "adjustment", "adjusted_quality",
-        "access_cost",
+        "gain_fit", "access_cost",
     }
     assert row["score"] == pytest.approx(row["terms"]["adjusted_quality"])
 
@@ -620,3 +620,39 @@ def test_a_stretch_rows_quality_is_its_density_times_its_factor_over_the_usable_
     assert factor == pytest.approx(1.2) and adjustment is not None and adjustment["group_factor"] == 0.8
     assert row["terms"]["quality"] == pytest.approx(row["terms"]["usable_m"] / survey.MILE_M * survey.density(first, model, "any"))
     assert row["terms"]["adjusted_quality"] == pytest.approx(row["terms"]["quality"] * factor)
+
+
+def test_an_inbound_tree_follows_one_way_edges_in_the_direction_of_travel():
+    graph = route_search.SearchGraph()
+    graph.add_edge(route_search.GraphEdge(1, 10, 20, 100.0, "a_to_b", [(1, True)]))  # 10 -> 20 only
+    graph.add_edge(route_search.GraphEdge(2, 20, 30, 100.0, "both", [(2, True)]))
+    costs = survey.EdgeCosts({}, terrain.default_model(), {}, {})
+    costs.update({1: (100.0, None, 0.0), 2: (100.0, None, 0.0)})
+
+    out = survey.weighted_tree(graph, 20, costs, 1000.0)
+    into = survey.weighted_tree(graph, 20, costs, 1000.0, inbound=True)
+
+    assert set(out.cost) == {20, 30}  # the one-way edge cannot be left backwards
+    assert set(into.cost) == {10, 20, 30}
+    assert [(e.edge_key, frm, to) for e, frm, to in into.steps(10)] == [(1, 10, 20)]
+    assert [(e.edge_key, frm, to) for e, frm, to in into.steps(30)] == [(2, 30, 20)]
+
+
+def test_a_purpose_ranks_sections_by_their_climb_per_mile(conn: sqlite3.Connection):
+    m = Map()
+    m.line([(0, 0), (0, 400)], "residential", name="East Street", maxspeed="25 mph")
+    m.line([(0, 400), (0, 2400)], "path", name="Climbing Path")
+    m.line([(0, 0), (0, -400)], "residential", name="West Street", maxspeed="25 mph")
+    m.line([(0, -400), (2000, -400)], "path", name="Level Path")
+    m.build(conn, sampler=terrain_slope_sampler(0.06))
+
+    def order(purpose: str | None) -> list[str]:
+        rows = survey.survey(conn, 1, *START, purpose=purpose)["sections"]
+        return [r["name"] for r in sorted(rows, key=lambda r: r["rank"] or 99) if r["name"].endswith("Path")]
+
+    assert order("hilly") == ["Climbing Path", "Level Path"]
+    assert order("easy") == ["Level Path", "Climbing Path"]
+    gain_fit = {r["name"]: r["terms"]["gain_fit"] for r in survey.survey(conn, 1, *START, purpose="easy")["sections"]}
+    assert gain_fit["Level Path"] == 1.0 and gain_fit["Climbing Path"] < 0.5
+    with pytest.raises(ValueError, match="unknown purpose"):
+        survey.survey(conn, 1, *START, purpose="jog")
