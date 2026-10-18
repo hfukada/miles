@@ -13,6 +13,13 @@ from miles import familiarity, network, route_search, routing_mcp, sections, str
 START = pt(0, 0)
 
 
+@pytest.fixture(autouse=True)
+def no_fragment_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fixtures here are small; the fragment tests set the limit themselves."""
+    monkeypatch.setattr(survey, "FRAGMENT_MIN_M", 0.0)
+    monkeypatch.setattr(survey, "FRAGMENT_RUN_SHARE", 0.0)
+
+
 def two_squares(busy_west: bool = True) -> Map:
     """Two equal trail squares 400 m from the start: one over a quiet
     street, the other over a busy road."""
@@ -52,7 +59,8 @@ def test_every_term_of_the_score_is_reported_and_the_start_on_a_section_costs_no
     row = by_name(on_it)["Quiet Loop"]
     assert row["access"]["approach_m"] == 0.0 and row["terms"]["access_cost"] == 0.0
     assert set(row["terms"]) == {
-        "usable_m", "continuity", "scenery_bonus", "runnability", "quality", "adjustment", "adjusted_quality", "access_cost",
+        "usable_m", "continuity", "scenery_bonus", "runnability", "surface", "quality", "adjustment", "adjusted_quality",
+        "access_cost",
     }
     assert row["score"] == pytest.approx(row["terms"]["adjusted_quality"])
 
@@ -265,7 +273,7 @@ def test_an_excluded_sections_ways_leave_route_search_alongside_avoided_ones(con
     m.line([(0, 0), (0, 300)], "residential", name="hub east", maxspeed="25 mph")
     m.line([(0, 0), (-500, 0)], "residential", name="hub south", maxspeed="25 mph")
     m.build(conn)
-    by_section = {s.name: s for s in sections.load_sections(conn, 1) if s.kind == "trail_system"}
+    by_section = {s.name: s for s in sections.load_sections(conn, 1, level=sections.GROUP) if s.kind == "trail_system"}
     sections.exclude_section(conn, by_section["north loop"].section_id, "athlete said so")
 
     def used_ways(**extra: object) -> set[int]:
@@ -358,13 +366,257 @@ def test_the_routing_tools_listed_are_the_old_ones_plus_the_section_tools():
     assert {"find_routes", "find_trailheads", "get_route_candidate", "save_route_candidate", "set_way_override"} <= names
 
 
-def test_a_stretch_listed_as_two_kinds_points_at_the_higher_ranked_one(conn: sqlite3.Connection):
+def test_fragments_are_left_out_of_the_ranking_unless_asked_for_and_counted(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(survey, "FRAGMENT_MIN_M", 1500.0)
+    monkeypatch.setattr(survey, "FRAGMENT_RUN_SHARE", 0.15)
     m = Map()
-    m.line([(0, 0), (0, 1500)], "path", name="River Trail")
-    m.waterway([(40, -100), (40, 1600)])
+    m.line([(0, 0), (0, 400)], "residential", name="Quiet Street", maxspeed="25 mph")
+    m.square(0, 400, 400, name="Stub Loop")  # 1.6 km round
+    m.line([(0, 0), (0, -400)], "residential", name="West Street", maxspeed="25 mph")
+    m.square(0, -1900, 1500, name="Long Loop")  # 6 km
     m.build(conn)
 
-    rows = sorted(survey.survey(conn, 1, *START)["sections"], key=lambda r: r["rank"])
+    default = survey.survey(conn, 1, *START, distance_m=20_000)
+    shown = survey.survey(conn, 1, *START, distance_m=20_000, include_fragments=True)
 
-    assert {r["kind"] for r in rows} == {"trail_system", "water_path"}
-    assert rows[0]["overlaps"] == [] and rows[1]["overlaps"] == [rows[0]["section_id"]]
+    assert [r["name"] for r in default["sections"]] == ["Long Loop"]
+    assert default["fragments_hidden"] == 1 and default["fragment_limit_m"] == pytest.approx(3000)
+    assert {r["name"]: r["fragment"] for r in shown["sections"]} == {"Long Loop": False, "Stub Loop": True}
+    assert shown["fragments_hidden"] == 0
+    short = survey.survey(conn, 1, *START, distance_m=5_000)  # 15% of 5 km is under the floor
+    assert short["fragment_limit_m"] == 1500.0
+
+
+def two_surfaces(track_side: float) -> Map:
+    """A singletrack loop and a dirt-road loop, each 400 m from the start."""
+    m = Map()
+    m.line([(0, 0), (0, 400)], "residential", name="East Street", maxspeed="25 mph")
+    m.square(0, 400, 500, name="Singletrack Loop")  # 2 km
+    m.line([(0, 0), (0, -400)], "residential", name="West Street", maxspeed="25 mph")
+    m.square(0, -400 - track_side, track_side, "track", name="Canal Road Loop", tracktype="grade2")
+    return m
+
+
+def test_a_long_singletrack_system_outranks_a_shorter_dirt_road_and_a_track_preference_reverses_that(conn: sqlite3.Connection):
+    two_surfaces(350).build(conn)  # 1.4 km of track
+
+    default = by_name(survey.survey(conn, 1, *START))
+    prefer_track = by_name(survey.survey(conn, 1, *START, surface_preference="track"))
+    prefer_singletrack = by_name(survey.survey(conn, 1, *START, surface_preference="singletrack"))
+
+    assert default["Singletrack Loop"]["surface_pct"] == {"singletrack": pytest.approx(100.0)}
+    assert default["Canal Road Loop"]["surface_pct"] == {"track": pytest.approx(100.0)}
+    assert default["Canal Road Loop"]["terms"]["surface"] == pytest.approx(0.8)
+    assert default["Singletrack Loop"]["rank"] < default["Canal Road Loop"]["rank"]
+    assert prefer_track["Canal Road Loop"]["rank"] < prefer_track["Singletrack Loop"]["rank"]
+    assert prefer_singletrack["Singletrack Loop"]["rank"] < prefer_singletrack["Canal Road Loop"]["rank"]
+    assert survey.survey(conn, 1, *START, surface_preference="paved")["surface_preference"] == "paved"
+    with pytest.raises(ValueError, match="surface_preference"):
+        survey.survey(conn, 1, *START, surface_preference="gravel")
+
+
+def test_a_track_scores_below_singletrack_of_the_same_length_by_default(conn: sqlite3.Connection):
+    two_surfaces(500).build(conn)
+
+    default = by_name(survey.survey(conn, 1, *START))
+
+    assert default["Canal Road Loop"]["terms"]["surface"] < default["Singletrack Loop"]["terms"]["surface"]
+    assert default["Singletrack Loop"]["terms"]["surface"] == 1.0
+
+
+def test_familiarity_on_a_merged_section_counts_a_run_along_either_kind_s_edges_once(conn: sqlite3.Connection):
+    m = Map()
+    m.line([(0, 0), (0, 400)], "residential", name="Quiet Street", maxspeed="25 mph")
+    ways = m.square(0, 400, 400, name="River Trail")
+    m.waterway([(-40, 300), (-40, 1000)], name="Example River")
+    m.route("River Route", ways)
+    m.build(conn)
+    insert_area(conn)
+    for activity_id in (1, 2):
+        insert_activity(conn, activity_id, start_lat=ORIGIN_LAT, start_lng=ORIGIN_LNG, start_date=f"2026-09-0{activity_id}T08:00:00")
+        write_stream(activity_id, track_around(0, 400, 400))
+
+    found = sections.load_sections(conn, 1, level=sections.GROUP)
+    familiarity.update(conn, 1)
+    rows = survey.survey(conn, 1, *START)["sections"]
+
+    assert len(found) == 1 and {"trail_system", "named_route"} <= set(found[0].kinds)
+    assert len(rows) == 1 and rows[0]["familiarity"]["runs"] == 2
+
+
+def test_the_survey_tool_takes_a_surface_preference_and_include_fragments(conn: sqlite3.Connection, tool):
+    two_surfaces(350).build(conn)
+    args = {"area_id": 1, "start_lat": START[0], "start_lng": START[1]}
+
+    result = tool("survey_area", {**args, "surface_preference": "track", "include_fragments": True})
+
+    assert result["surface_preference"] == "track" and result["fragments_hidden"] == 0
+    loop = next(s for s in result["sections"] if s["name"] == "Canal Road Loop")
+    assert loop["surface_pct"] == {"track": 100} and loop["kinds"] == ["trail_system"]
+    assert "error" in tool("survey_area", {**args, "surface_preference": "gravel"})
+
+
+def big_loop() -> Map:
+    """A 6 km trail system with a river beside one of its four sides."""
+    m = Map()
+    m.line([(0, 0), (0, -400)], "residential", name="West Street", maxspeed="25 mph")
+    m.square(0, -1900, 1500, name="Big Loop")
+    m.waterway([(40, -2000), (40, -300)])
+    return m
+
+
+def test_an_overview_ranks_groups_with_single_path_lengths_and_detail_ranks_their_stretches(conn: sqlite3.Connection):
+    m = Map()
+    m.line([(-60, 0), (-60, 1500)], "path", name="South Bank Trail")
+    m.line([(60, 0), (60, 1500)], "path", name="North Bank Trail")
+    m.line([(-60, 0), (60, 0)], "path")
+    m.line([(-60, 1500), (60, 1500)], "path")
+    m.waterway([(0, -100), (0, 1600)], name="Example River")
+    m.build(conn)
+    start = pt(-60, 0)
+
+    overview = survey.survey(conn, 1, *start)
+    detail = survey.survey(conn, 1, *start, detail="detail")
+    within = survey.survey(conn, 1, *start, within=overview["sections"][0]["section_id"])
+
+    assert len(overview["sections"]) == 1
+    group = overview["sections"][0]
+    assert group["level"] == "group" and group["length_m"] == pytest.approx(group["union_m"] - 1500, rel=0.03)
+    assert group["parallel_m"] == pytest.approx(1500, rel=0.03)
+    assert sorted(detail["sections"][0]["sides"]) == ["north", "south"]
+    assert {r["level"] for r in detail["sections"]} == {"stretch"}
+    assert len(detail["sections"]) == len(sections.stretches_of(conn, group["section_id"]))
+    assert {r["section_id"] for r in within["sections"]} == {r["section_id"] for r in detail["sections"]}
+    assert within["within"] == group["section_id"]
+    with pytest.raises(ValueError, match="within"):
+        survey.survey(conn, 1, *START, within=detail["sections"][0]["section_id"])
+    with pytest.raises(ValueError, match="detail"):
+        survey.survey(conn, 1, *START, detail="everything")
+
+
+def test_the_survey_and_section_tools_take_a_group_or_a_stretch_id(conn: sqlite3.Connection, tool):
+    big_loop().build(conn)
+    args = {"area_id": 1, "start_lat": pt(0, -400)[0], "start_lng": pt(0, -400)[1], "distance_mi": 12}
+
+    overview = tool("survey_area", args)
+    group = overview["sections"][0]
+    shown = tool("get_section", {"section_id": group["section_id"]})
+    assert group["level"] == "group" and group["stretches"]["total"] >= 1
+
+    detail = tool("survey_area", {**args, "within": group["section_id"]})
+    assert {r["section_id"] for r in detail["sections"]} == {p["section_id"] for p in group["stretches"]["listed"]}
+    assert all(r["group_id"] == group["section_id"] and r["level"] == "stretch" for r in detail["sections"])
+    stretch_id = detail["sections"][0]["section_id"]
+    assert "error" in tool("survey_area", {**args, "within": stretch_id})
+
+    assert shown["level"] == "group" and len(shown["stretches"]) == group["stretches"]["total"] and shown["geometry"]
+    assert tool("get_section", {"section_id": stretch_id})["level"] == "stretch"
+    assert tool("adjust_section", {"section_id": stretch_id, "factor": 0.8, "note": "rough"})["level"] == "stretch"
+    assert tool("exclude_section", {"section_id": group["section_id"], "note": "closed"})["level"] == "group"
+
+
+def bridged_trail() -> Map:
+    """A 4 km trail with a bridge in the middle, cut into two stretches."""
+    m = Map()
+    m.line([(0, 0), (0, 2000)], "path", name="Long Trail")
+    m.line([(0, 2000), (0, 2060)], "path", name="Test Bridge", bridge="yes")
+    m.line([(0, 2060), (0, 4000)], "path", name="Long Trail")
+    return m
+
+
+def test_the_detail_survey_lists_a_groups_stretches_in_position_order_with_their_roles(conn: sqlite3.Connection):
+    bridged_trail().build(conn)
+
+    overview = survey.survey(conn, 1, *START, distance_m=20_000)
+    group = overview["sections"][0]
+    detail = survey.survey(conn, 1, *START, distance_m=20_000, within=group["section_id"])
+    all_stretches = survey.survey(conn, 1, *START, distance_m=20_000, detail="detail")
+
+    assert [s["role"] for s in group["stretches"]] == ["west end to Test Bridge", "Test Bridge to east end"]
+    assert group["stretches_total"] == 2 and group["role"] is None
+    assert [r["role"] for r in detail["sections"]] == [s["role"] for s in group["stretches"]]
+    assert [r["seq"] for r in detail["sections"]] == [1, 2]
+    assert {r["level"] for r in detail["sections"]} == {"stretch"}
+    assert all(r["group_id"] == group["section_id"] for r in detail["sections"])
+    assert sum(r["length_m"] for r in detail["sections"]) == pytest.approx(group["length_m"], abs=1)
+    assert {r["section_id"] for r in all_stretches["sections"]} == {r["section_id"] for r in detail["sections"]}
+    assert [r["rank"] for r in detail["sections"]] != [None, None]
+
+
+def test_every_stretch_is_listed_in_a_group_s_detail_even_when_short(conn: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(survey, "FRAGMENT_MIN_M", 10_000.0)
+    bridged_trail().build(conn)
+    group_id = survey.survey(conn, 1, *START, distance_m=20_000, include_fragments=True)["sections"][0]["section_id"]
+
+    within = survey.survey(conn, 1, *START, distance_m=20_000, within=group_id)
+    everywhere = survey.survey(conn, 1, *START, distance_m=20_000, detail="detail")
+
+    assert len(within["sections"]) == 2 and all(r["fragment"] for r in within["sections"])
+    assert everywhere["sections"] == [] and everywhere["fragments_hidden"] == 2
+
+
+def test_a_stretch_takes_its_own_adjustment_times_its_groups(conn: sqlite3.Connection):
+    bridged_trail().build(conn)
+    group_id = survey.survey(conn, 1, *START, distance_m=20_000)["sections"][0]["section_id"]
+    first, second = survey.survey(conn, 1, *START, distance_m=20_000, within=group_id)["sections"]
+
+    sections.adjust_section(conn, first["section_id"], 1.5, "lovely")
+    request = survey.survey(conn, 1, *START, distance_m=20_000, within=group_id, adjustments={second["section_id"]: 0.7})
+    stored = survey.survey(conn, 1, *START, distance_m=20_000, within=group_id)
+    sections.adjust_section(conn, group_id, 0.8, "busy")
+    with_group = survey.survey(conn, 1, *START, distance_m=20_000, within=group_id)
+
+    assert [r["terms"]["adjustment"] for r in stored["sections"]] == [1.5, 1.0]
+    assert request["sections"][1]["adjustment"]["source"] == "request" and request["sections"][1]["terms"]["adjustment"] == 0.7
+    assert [r["terms"]["adjustment"] for r in with_group["sections"]] == [pytest.approx(1.2), pytest.approx(0.8)]
+    assert with_group["sections"][0]["adjustment"]["group_factor"] == 0.8
+
+
+def test_a_stretch_exclusion_marks_that_stretch_and_survives_a_rebuild(conn: sqlite3.Connection):
+    bridged_trail().build(conn)
+    group_id = survey.survey(conn, 1, *START, distance_m=20_000)["sections"][0]["section_id"]
+    first, second = survey.survey(conn, 1, *START, distance_m=20_000, within=group_id)["sections"]
+    sections.exclude_section(conn, second["section_id"], "closed")
+
+    bridged_trail().build(conn)
+
+    new_group = survey.survey(conn, 1, *START, distance_m=20_000)["sections"][0]
+    rows = survey.survey(conn, 1, *START, distance_m=20_000, within=new_group["section_id"])["sections"]
+    assert [r["excluded"] for r in rows] == [False, True]
+    assert rows[1]["exclusion"]["note"] == "closed"
+    assert new_group["excluded"] is False
+
+
+def test_familiarity_is_matched_per_stretch(conn: sqlite3.Connection):
+    bridged_trail().build(conn)
+    insert_area(conn)
+    insert_activity(conn, 1, start_lat=ORIGIN_LAT, start_lng=ORIGIN_LNG, start_date="2026-09-01T08:00:00")
+    write_stream(1, [pt(0, east) for east in range(0, 2000, 10)])
+
+    familiarity.update(conn, 1)
+    group = survey.survey(conn, 1, *START, distance_m=20_000)["sections"][0]
+    first, second = survey.survey(conn, 1, *START, distance_m=20_000, within=group["section_id"])["sections"]
+    fresh = survey.survey(conn, 1, *START, distance_m=20_000, within=group["section_id"], unfamiliar_only=True)
+
+    assert first["familiarity"] == {"runs": 1, "last_run": "2026-09-01T08:00:00", "new_to_you": False}
+    assert second["familiarity"]["new_to_you"] is True
+    assert group["familiarity"]["runs"] == 1
+    assert [r["section_id"] for r in fresh["sections"]] == [second["section_id"]]
+
+
+def test_a_stretch_rows_quality_is_its_density_times_its_factor_over_the_usable_distance(conn: sqlite3.Connection):
+    bridged_trail().build(conn)
+    group_id = survey.survey(conn, 1, *START, distance_m=20_000)["sections"][0]["section_id"]
+    first, _second = sections.stretches_of(conn, group_id)
+    sections.adjust_section(conn, group_id, 0.8, "busy")
+    sections.adjust_section(conn, first.section_id, 1.5, "lovely")
+    row = survey.survey(conn, 1, *START, distance_m=20_000, within=group_id)["sections"][0]
+
+    model = terrain.current_model(conn)
+    factor, adjustment = survey.section_factor(
+        first, sections.get_section(conn, group_id), sections.judgments_for(conn, [first, sections.get_section(conn, group_id)])
+    )
+
+    assert factor == pytest.approx(1.2) and adjustment is not None and adjustment["group_factor"] == 0.8
+    assert row["terms"]["quality"] == pytest.approx(row["terms"]["usable_m"] / survey.MILE_M * survey.density(first, model, "any"))
+    assert row["terms"]["adjusted_quality"] == pytest.approx(row["terms"]["quality"] * factor)

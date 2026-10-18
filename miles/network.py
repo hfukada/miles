@@ -36,7 +36,7 @@ from .elevation import ElevationSampler
 if TYPE_CHECKING:
     from . import sections
 
-NETWORK_DERIVE_VERSION = 9
+NETWORK_DERIVE_VERSION = 10
 
 # Paths with no vehicle traffic: they carry no road-comfort tier.
 TRAIL_HIGHWAYS = frozenset({"path", "footway", "bridleway", "steps", "cycleway"})
@@ -111,6 +111,11 @@ class RoadExposure(TypedDict):
 class PathScore(TypedDict):
     distance_m: float
     trail_distance_m: float
+    # The part of the distance on ways sections.py counts as trail, split by
+    # kind: footpath-width singletrack and road-width tracks. Neither is
+    # exclusive of trail_distance_m or unpaved_road_distance_m.
+    singletrack_distance_m: float
+    track_distance_m: float
     unpaved_road_distance_m: float
     paved_distance_m: float
     # Access spurs to a trailhead or parking; counted in neither trail, unpaved
@@ -197,7 +202,9 @@ def init_network_schema(conn: sqlite3.Connection) -> None:
             maxspeed_filled         INTEGER,
             lanes                   INTEGER,
             has_separation          INTEGER,
-            points_blob             BLOB NOT NULL
+            points_blob             BLOB NOT NULL,
+            trail_kind              TEXT,
+            structure               TEXT
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_net_edges_area ON net_edges(area_id)")
@@ -363,6 +370,62 @@ def _surface_class(highway: str, tags: dict) -> str:
     return "unpaved_road" if surface in UNPAVED_SURFACE_VALUES else "paved"
 
 
+TRAIL_KIND_SINGLETRACK = "singletrack"
+TRAIL_KIND_TRACK = "track"
+
+# A way at least this wide (meters) is a road-width track, whatever it is
+# tagged; one at most TRAIL_NARROW_WIDTH_M is a footpath-width trail.
+TRAIL_WIDE_WIDTH_M = 2.5
+TRAIL_NARROW_WIDTH_M = 1.5
+# Highways that are track-like unless a tag says otherwise.
+_TRACK_HIGHWAYS = frozenset({"track", "cycleway"})
+# trail_visibility values that describe a path a person has to look for.
+_FAINT_VISIBILITY = frozenset({"intermediate", "bad", "horrible", "no"})
+# Vehicle access tags that mark a maintenance or farm road.
+_VEHICLE_ACCESS_VALUES = frozenset({"yes", "designated", "permissive", "agricultural", "forestry"})
+_VEHICLE_ACCESS_KEYS = ("motor_vehicle", "vehicle", "agricultural", "forestry")
+# Engineered unpaved surfaces: a path built to this and shared with bicycles
+# is a graded multi-use path, not a footpath.
+_ENGINEERED_SURFACES = frozenset({"gravel", "fine_gravel", "compacted", "pebblestone"})
+_WIDTH_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(?:m)?\s*$")
+
+
+def _way_width_m(tags: dict) -> float | None:
+    match = _WIDTH_RE.match(tags.get("width") or "")
+    return float(match.group(1)) if match else None
+
+
+def _trail_kind(highway: str, surface_class: str, tags: dict) -> str | None:
+    """"singletrack" or "track" for a way that counts as trail, else None.
+
+    Trail is what sections.py counts: unpaved non-sidewalk ways of
+    TRAIL_HIGHWAYS, and unpaved tracks. A track is road-width and engineered:
+    a wide way, a highway=track or cycleway, one with a tracktype or a
+    vehicle-access tag, or a bicycle-designated path on a graded surface.
+    Singletrack is the rest, and a footpath-width way or one with a hiking or
+    mountain-bike difficulty grade or a faint visibility stays singletrack
+    even where it is mapped as a track."""
+    if surface_class == "trail":
+        pass
+    elif not (highway == "track" and surface_class == "unpaved_road"):
+        return None
+    width = _way_width_m(tags)
+    if width is not None and width >= TRAIL_WIDE_WIDTH_M:
+        return TRAIL_KIND_TRACK
+    if (
+        "sac_scale" in tags or "mtb:scale" in tags or tags.get("trail_visibility") in _FAINT_VISIBILITY
+        or (width is not None and width <= TRAIL_NARROW_WIDTH_M)
+    ):
+        return TRAIL_KIND_SINGLETRACK
+    if (
+        highway in _TRACK_HIGHWAYS or "tracktype" in tags
+        or any(tags.get(k) in _VEHICLE_ACCESS_VALUES for k in _VEHICLE_ACCESS_KEYS)
+        or (tags.get("bicycle") == "designated" and tags.get("surface") in _ENGINEERED_SURFACES)
+    ):
+        return TRAIL_KIND_TRACK
+    return TRAIL_KIND_SINGLETRACK
+
+
 # footway covers both trails and street sidewalks/crossings; these values
 # on the footway say which.
 _SIDEWALK_FOOTWAY_SUBTAGS = frozenset({"sidewalk", "crossing", "traffic_island"})
@@ -452,6 +515,16 @@ def _has_separation(tags: dict) -> bool:
         if value and value.lower() in _SEPARATION_VALUES:
             return True
     return False
+
+
+def _structure(tags: dict) -> str | None:
+    """'bridge' or 'tunnel' for a way that carries its path over or under
+    something else, which is where a section is naturally cut."""
+    if tags.get("bridge") not in (None, "", "no"):
+        return "bridge"
+    if tags.get("tunnel") not in (None, "", "no"):
+        return "tunnel"
+    return None
 
 
 def _amenity_kind(tags: dict) -> str | None:
@@ -577,7 +650,7 @@ class EdgeSplit(TypedDict):
 # The way-level columns every piece of a cut edge inherits.
 _WAY_COLUMNS = (
     "way_id", "way_name", "highway", "surface_class", "oneway", "maxspeed_mph", "maxspeed_filled", "lanes",
-    "has_separation",
+    "has_separation", "trail_kind", "structure",
 )
 
 
@@ -674,6 +747,8 @@ _DEFAULT_EDGE_ATTRS: dict[str, object] = {
     "maxspeed_filled": 0,
     "lanes": None,
     "has_separation": 0,
+    "trail_kind": None,
+    "structure": None,
 }
 
 
@@ -849,6 +924,8 @@ def _build_network(
             "way_id": way_id,
             "highway": highway,
             "surface_class": surface_class,
+            "trail_kind": _trail_kind(highway, surface_class, tags),
+            "structure": _structure(tags),
             "way_name": tags.get("name"),
             "oneway": _oneway_value(tags),
         }
@@ -1057,7 +1134,7 @@ def score_path(
     way_ids = sorted({rows[eid]["way_id"] for eid in edge_ids if eid in rows})
     overrides = get_way_overrides(conn, way_ids)
 
-    distance_m = trail_m = unpaved_m = paved_m = connector_m = 0.0
+    distance_m = trail_m = unpaved_m = paved_m = connector_m = singletrack_m = track_m = 0.0
     elevation_m = 0.0
     # Consecutive edges with elevation form one profile, as one stored route
     # would; an edge without it ends the stretch.
@@ -1072,6 +1149,11 @@ def score_path(
         length_m = row["length_m"]
         distance_m += length_m
         surface_class = row["surface_class"]
+        trail_kind = row["trail_kind"]
+        if trail_kind == TRAIL_KIND_SINGLETRACK:
+            singletrack_m += length_m
+        elif trail_kind == TRAIL_KIND_TRACK:
+            track_m += length_m
         if surface_class == "trail":
             trail_m += length_m
         elif surface_class == "unpaved_road":
@@ -1122,6 +1204,8 @@ def score_path(
     return {
         "distance_m": distance_m,
         "trail_distance_m": trail_m,
+        "singletrack_distance_m": singletrack_m,
+        "track_distance_m": track_m,
         "unpaved_road_distance_m": unpaved_m,
         "paved_distance_m": paved_m,
         "connector_distance_m": connector_m,

@@ -207,7 +207,7 @@ def connection(opener: Callable[[], sqlite3.Connection] | None = None) -> Iterat
         conn.close()
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def add_missing_columns(conn: sqlite3.Connection, table: str, *columns: str) -> bool:
@@ -648,6 +648,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     init_drive_schema(conn)
     init_search_schema(conn)
     init_section_schema(conn)
+    # Graphs and sections built before the trail kind, bridge marks and
+    # stretches carry none of these; their areas rebuild on the next
+    # NETWORK_DERIVE_VERSION check. A judgment stored before sections had
+    # levels was made on a whole section, which is a group now.
+    add_missing_columns(conn, "net_edges", "trail_kind TEXT", "structure TEXT")
+    add_missing_columns(conn, "net_sections", "level TEXT NOT NULL DEFAULT 'group'", "group_id INTEGER")
+    add_missing_columns(conn, "net_section_judgments", "level TEXT NOT NULL DEFAULT 'group'")
+    conn.execute("UPDATE net_section_judgments SET level = 'group' WHERE level = 'piece'")
     if previous_version == 0:
         _settle_routes_deleted_before_tombstones(conn)
 

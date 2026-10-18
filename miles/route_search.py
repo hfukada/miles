@@ -1,7 +1,8 @@
-"""Route search over an area's network graph (adr/0003-terrain-model-and-route-search.md):
-bound the graph around each start, contract degree-2 chains, generate
-randomized candidates per shape, score each through network.score_path, and
-diversify.
+"""Route search over an area's network graph (adr/0003-terrain-model-and-route-search.md,
+adr/0004-section-first-route-search.md): bound the graph around each start,
+build candidates around chosen sections (assemble.py) or, when none qualify,
+by randomized walks over the contracted graph, score each through
+network.score_path, and diversify.
 
 A search never writes to the network graph: a start point is spliced into an
 in-memory copy. Candidates are kept behind a TTL until saved
@@ -61,6 +62,10 @@ POOL_FACTOR = 3
 # after which a small network is judged exhausted.
 STAGNATION_ATTEMPTS = 40
 DIVERSITY_WEIGHT = 2.0
+# A loop adds this share to the quality of a candidate that returns by a
+# different path; the request may set it from 0 up to MAX_LOOP_BONUS.
+DEFAULT_LOOP_BONUS = 0.075
+MAX_LOOP_BONUS = 0.5
 
 
 class Start(TypedDict):
@@ -86,6 +91,12 @@ class RouteSearchRequest(TypedDict):
     n: NotRequired[int]
     time_budget_s: NotRequired[float]
     seed: NotRequired[int | None]
+    # Section ids (group, piece, or stretch) to build routes around; absent,
+    # the survey's best sections for the start are used.
+    sections: NotRequired[list[int] | None]
+    loop_bonus: NotRequired[float]
+    surface_preference: NotRequired[str | None]
+    unfamiliar_only: NotRequired[bool]
 
 
 class ConstraintMiss(TypedDict):
@@ -103,6 +114,11 @@ class RouteCandidateOut(TypedDict):
     missed_constraints: list[ConstraintMiss]
     geometry: list[list[float | None]]  # [lat, lng, ele_m|None] triples
     ways: list[dict]  # consecutive runs of one OSM way: way_id, name, surface_class, length_m
+    # "sections" for candidates assembled around sections, "walk" for the
+    # randomized fallback; absent on candidates stored before sections existed.
+    built_from: NotRequired[str]
+    sections_used: NotRequired[list[dict]]  # section_id, block_id, name, length_m
+    ranking: NotRequired[dict]  # the terms of a section-built candidate's score
 
 
 class RouteSearchResult(TypedDict):
@@ -110,6 +126,7 @@ class RouteSearchResult(TypedDict):
     near_miss: bool
     budget_exceeded: bool
     seed: int
+    warnings: list[str]
 
 
 class CandidateNotFoundError(LookupError):
@@ -291,14 +308,18 @@ def _remove_ways(graph: SearchGraph, edge_rows: Mapping[int, dict], way_ids: set
             graph.remove_edge(edge)
 
 
-def _bound_graph(graph: SearchGraph, centers: Sequence[tuple[float, float]], radius_m: float) -> None:
+def _bound_graph(
+    graph: SearchGraph, centers: Sequence[tuple[float, float]], radius_m: float, keep_nodes: Collection[int] = ()
+) -> None:
     """Drop every node farther than radius_m from all centers, and any edge that
     loses an endpoint. Straight-line distance stands in for graph distance,
-    which isn't known until the graph is built."""
+    which isn't known until the graph is built. keep_nodes survive regardless:
+    a section's long edge must not vanish because its far end lies outside."""
     def _keep(node: NodeInfo) -> bool:
         return any(routes_spatial.equirect_distance_m(node.lat, node.lng, clat, clng) <= radius_m for clat, clng in centers)
 
-    dropped = {n for n, info in graph.nodes.items() if not _keep(info)}
+    kept = set(keep_nodes)
+    dropped = {n for n, info in graph.nodes.items() if n not in kept and not _keep(info)}
     for edge in list(graph.edges_by_key.values()):
         if edge.a in dropped or edge.b in dropped:
             graph.remove_edge(edge)
@@ -322,12 +343,14 @@ def _edge_index(edge_rows: Mapping[int, dict], edge_ids: Iterable[int]) -> route
 
 def _splice_start(
     graph: SearchGraph, edge_rows: MutableMapping[int, dict], index: routes_spatial.NearestIndex,
-    lat: float, lng: float, ids: Iterable[int],
+    lat: float, lng: float, ids: Iterable[int], replaced: MutableMapping[int, tuple[int, int, int, int]] | None = None,
 ) -> int | None:
     """Snap (lat, lng) onto the graph's nearest edge and cut it there, in memory
     only. index covers the graph's current edges and is updated with each cut.
-    Returns the start's node id, or None when nothing is within
-    START_SNAP_RADIUS_M.
+    replaced, if given, records each cut edge's key against its two pieces'
+    keys (before, after, in the cut edge's stored direction) and its end
+    nodes (a, b). Returns the
+    start's node id, or None when nothing is within START_SNAP_RADIUS_M.
     """
     cut = network.splice_at(edge_rows, index, lat, lng, START_SNAP_RADIUS_M, ids)
     if cut is None:
@@ -339,6 +362,8 @@ def _splice_start(
 
     node_id = next(iter(ids))
     graph.nodes[node_id] = NodeInfo(split["node_lat"], split["node_lng"], "start")
+    if replaced is not None:
+        replaced[cut.edge_key] = (cut.before_key, cut.after_key, edge.a, edge.b)
     graph.remove_edge(edge)
     graph.add_edge(
         GraphEdge(cut.before_key, edge.a, node_id, split["before"]["length_m"], edge.allowed, [(cut.before_key, True)])
@@ -686,6 +711,9 @@ class _Candidate:
     segments: list[tuple[int, bool]]
     score: dict
     missed: list[ConstraintMiss]
+    built_from: str = "walk"
+    # Set on candidates assembled around sections: the terms of assemble.py's score.
+    ranking: dict | None = None
 
 
 def _quality(candidate: _Candidate, target_m: float) -> float:
@@ -694,19 +722,30 @@ def _quality(candidate: _Candidate, target_m: float) -> float:
 
 
 def _diversify(candidates: list[_Candidate], edge_rows: Mapping[int, dict], target_m: float, n: int) -> list[_Candidate]:
+    """Up to n of `candidates`, best first, each penalized for the edges it
+    shares with those already selected. A section-built candidate ranks by
+    its score scaled to the best in the pool, so the penalty weighs the same
+    as for a walk's quality."""
     remaining = list(candidates)
     selected: list[_Candidate] = []
+    best_score = max((cast(dict, c.ranking)["score"] for c in candidates if c.ranking is not None), default=0.0)
+
+    def base(c: _Candidate) -> float:
+        if c.ranking is None:
+            return _quality(c, target_m)
+        return c.ranking["score"] / best_score if best_score > 0 else c.ranking["score"]
+
     while remaining and len(selected) < n:
         def penalized(c: _Candidate) -> float:
             if not selected:
-                return _quality(c, target_m)
+                return base(c)
             c_ids = {eid for eid, _ in c.segments}
             shared_m = 0.0
             for s in selected:
                 s_ids = {eid for eid, _ in s.segments}
                 shared_m += sum(edge_rows.get(eid, {}).get("length_m", 0.0) for eid in c_ids & s_ids)
             fraction = min(shared_m / max(cast(float, c.score["distance_m"]), 1.0), 1.0)
-            return _quality(c, target_m) - DIVERSITY_WEIGHT * fraction
+            return base(c) - DIVERSITY_WEIGHT * fraction
 
         best = max(remaining, key=penalized)
         selected.append(best)
@@ -800,7 +839,26 @@ def start_graph(
     return graph, edge_rows, node_id
 
 
+def _evaluate(
+    conn: sqlite3.Connection, area_id: int, request: RouteSearchRequest, segments: list[tuple[int, bool]],
+    prefs: dict, runnability: network.RunnabilityFn, edge_rows: MutableMapping[int, dict],
+) -> tuple[dict, list[ConstraintMiss]] | None:
+    """A path's score and the soft constraints it misses, or None when it
+    cannot be scored or breaks the road-exposure limit."""
+    try:
+        score = cast(dict, network.score_path(conn, area_id, segments, prefs, runnability, extra_edges=edge_rows))
+    except ValueError:
+        return None
+    if score["road_exposure"]["violations"]:
+        return None
+    touched_way_ids = {edge_rows[eid]["way_id"] for eid, _ in segments if eid in edge_rows}
+    return score, _soft_misses(score, request, touched_way_ids)
+
+
 def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteSearchResult:
+    # assemble imports survey, which imports this module.
+    from . import assemble
+
     starts_in = request["starts"]
     if not starts_in:
         raise ValueError("find_routes needs at least one start")
@@ -817,6 +875,9 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     time_budget_s = request.get("time_budget_s", DEFAULT_TIME_BUDGET_S)
     if time_budget_s <= 0:
         raise ValueError("time_budget_s must be positive")
+    loop_bonus = request.get("loop_bonus", DEFAULT_LOOP_BONUS)
+    if not 0.0 <= loop_bonus <= MAX_LOOP_BONUS:
+        raise ValueError(f"loop_bonus must be between 0 and {MAX_LOOP_BONUS}")
     seed = request.get("seed")
     if seed is None:
         seed = _default_seed(request)
@@ -829,6 +890,11 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
     runnability = model.score_profile
 
     base_graph, cached_edge_rows = _cached_base_graph(conn, area_id)
+    # The survey behind the plan takes the search slot itself, so the plan is
+    # made before this search holds it.
+    plan = assemble.plan_blocks(conn, request, model)
+    shapes_to_try: list[str] = [shape] if shape != "any" else ["loop", "out_and_back", "lollipop"]
+    warnings = list(plan.warnings)
     with _search_lock:
         graph = _copy_graph(base_graph)
         # Avoided ways leave the graph entirely, so no candidate can touch one.
@@ -840,72 +906,100 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         edge_rows: MutableMapping[int, dict] = ChainMap({}, cached_edge_rows)
         target_m = (request["distance_m_min"] + request["distance_m_max"]) / 2.0
         radius_m = request["distance_m_max"] / 2.0
-        _bound_graph(graph, [(s["lat"], s["lng"]) for s in starts_in], radius_m)
+        _bound_graph(graph, [(s["lat"], s["lng"]) for s in starts_in], radius_m, plan.keep_nodes(cached_edge_rows))
 
         ids = itertools.count(-1, -1)
+        replaced: dict[int, tuple[int, int, int, int]] = {}
         start_index = _edge_index(edge_rows, graph.edges_by_key)
         start_nodes: list[tuple[int, Start]] = []
         for s in starts_in:
-            node_id = _splice_start(graph, edge_rows, start_index, s["lat"], s["lng"], ids)
+            node_id = _splice_start(graph, edge_rows, start_index, s["lat"], s["lng"], ids, replaced)
             if node_id is not None:
                 start_nodes.append((node_id, s))
         if not start_nodes:
             raise ValueError("no network found near any given start")
 
-        contract_degree2_chains(graph, ids, protected=[node_id for node_id, _ in start_nodes])
-        ctx = _SearchContext(graph=graph)
-
-        # Handed to score_path as extra_edges so it never re-queries net_edges.
-        extra_edges = edge_rows
-        shapes_to_try: list[str] = [shape] if shape != "any" else ["loop", "out_and_back", "lollipop"]
-
         deadline = time.monotonic() + time_budget_s
         qualifying: dict[frozenset[int], _Candidate] = {}
         near_misses: dict[frozenset[int], _Candidate] = {}
         budget_exceeded = False
-        attempts = 0
-        # Generate well past n so diversification has a pool to choose from.
-        pool_target = n * POOL_FACTOR
-        attempts_since_new = 0
-        while len(qualifying) < pool_target and attempts < MAX_GENERATION_ATTEMPTS:
-            if len(qualifying) >= n and attempts_since_new >= STAGNATION_ATTEMPTS:
-                break
-            if time.monotonic() > deadline:
-                budget_exceeded = len(qualifying) < n
-                break
-            attempts += 1
-            attempts_since_new += 1
-            gen_shape = rng.choice(shapes_to_try)
-            start_node, start_info = rng.choice(start_nodes)
-            traversal = _GENERATORS[gen_shape](ctx, start_node, target_m, rng)
-            if not traversal:
-                continue
-            segments = _flatten(traversal)
-            if not segments:
-                continue
-            try:
-                score = cast(dict, network.score_path(conn, area_id, segments, prefs, runnability, extra_edges=extra_edges))
-            except ValueError:
-                continue
-            if score["road_exposure"]["violations"]:
-                continue
-            touched_way_ids = {edge_rows[eid]["way_id"] for eid, _ in segments if eid in edge_rows}
-            misses = _soft_misses(score, request, touched_way_ids)
-            candidate = _Candidate(gen_shape, start_info, segments, score, misses)
-            # The same set of edges walked in either direction is one route.
-            identity = frozenset(eid for eid, _ in segments)
-            pool = near_misses if misses else qualifying
-            if identity not in pool:
-                pool[identity] = candidate
-                if not misses:
-                    attempts_since_new = 0
+
+        if plan.blocks:
+            assembly = assemble.Assembly(
+                plan, graph, edge_rows, replaced, start_nodes, prefs, model,
+                distance_m_min=request["distance_m_min"], distance_m_max=request["distance_m_max"],
+                shapes=shapes_to_try, loop_bonus=loop_bonus, ids=ids,
+            )
+            for built in assembly.candidates(deadline):
+                segments = _flatten(built.traversal)
+                evaluated = _evaluate(conn, area_id, request, segments, prefs, runnability, edge_rows) if segments else None
+                if evaluated is None:
+                    continue
+                score, misses = evaluated
+                candidate = _Candidate(
+                    built.shape, built.start, segments, score, misses, "sections", assembly.rank(built, segments)
+                )
+                identity = frozenset(eid for eid, _ in segments)
+                pool = near_misses if misses else qualifying
+                best = pool.get(identity)
+                if best is None or cast(dict, candidate.ranking)["score"] > cast(dict, best.ranking)["score"]:
+                    pool[identity] = candidate
+            budget_exceeded = time.monotonic() > deadline and len(qualifying) < n
+        elif plan.explicit:
+            warnings.append("none of the named sections could be built into a route: none lies within reach of a start")
+        if plan.explicit and plan.blocks and not qualifying and not near_misses:
+            warnings.append(
+                "no route could be assembled around the named sections: none could be reached within the approach "
+                "limit from a start, or every attempt broke the road-exposure limit"
+            )
+
+        # The walk is the fallback for a request no section could serve; it
+        # never stands in for sections the request named.
+        walking = not plan.explicit and not qualifying and not budget_exceeded
+        if walking:
+            contract_degree2_chains(graph, ids, protected=[node_id for node_id, _ in start_nodes])
+            ctx = _SearchContext(graph=graph)
+            attempts = 0
+            # Generate well past n so diversification has a pool to choose from.
+            pool_target = n * POOL_FACTOR
+            attempts_since_new = 0
+            while len(qualifying) < pool_target and attempts < MAX_GENERATION_ATTEMPTS:
+                if len(qualifying) >= n and attempts_since_new >= STAGNATION_ATTEMPTS:
+                    break
+                if time.monotonic() > deadline:
+                    budget_exceeded = len(qualifying) < n
+                    break
+                attempts += 1
+                attempts_since_new += 1
+                gen_shape = rng.choice(shapes_to_try)
+                start_node, start_info = rng.choice(start_nodes)
+                traversal = _GENERATORS[gen_shape](ctx, start_node, target_m, rng)
+                if not traversal:
+                    continue
+                segments = _flatten(traversal)
+                if not segments:
+                    continue
+                evaluated = _evaluate(conn, area_id, request, segments, prefs, runnability, edge_rows)
+                if evaluated is None:
+                    continue
+                score, misses = evaluated
+                candidate = _Candidate(gen_shape, start_info, segments, score, misses)
+                # The same set of edges walked in either direction is one route.
+                identity = frozenset(eid for eid, _ in segments)
+                pool = near_misses if misses else qualifying
+                if identity not in pool:
+                    pool[identity] = candidate
+                    if not misses:
+                        attempts_since_new = 0
 
     if qualifying:
         selected = _diversify(list(qualifying.values()), edge_rows, target_m, n)
         near_miss = False
     else:
-        ranked = sorted(near_misses.values(), key=lambda c: (len(c.missed), -_quality(c, target_m)))
-        selected = ranked[:n]
+        def near_key(c: _Candidate) -> tuple[int, int, float]:
+            return (len(c.missed), c.built_from != "sections", -(c.ranking["score"] if c.ranking else _quality(c, target_m)))
+
+        selected = sorted(near_misses.values(), key=near_key)[:n]
         near_miss = True
 
     result_candidates = [_persist_candidate(conn, area_id, edge_rows, c) for c in selected]
@@ -915,6 +1009,7 @@ def find_routes(conn: sqlite3.Connection, request: RouteSearchRequest) -> RouteS
         "near_miss": near_miss,
         "budget_exceeded": budget_exceeded,
         "seed": seed,
+        "warnings": warnings,
     }
 
 
@@ -932,7 +1027,11 @@ def _persist_candidate(
         "missed_constraints": candidate.missed,
         "geometry": [list(p) for p in _geometry(edge_rows, candidate.segments)],
         "ways": _ways(edge_rows, candidate.segments),
+        "built_from": candidate.built_from,
+        "sections_used": cast(list[dict], (candidate.ranking or {}).get("sections_used", [])),
     }
+    if candidate.ranking is not None:
+        out["ranking"] = {k: v for k, v in candidate.ranking.items() if k != "sections_used"}
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=CANDIDATE_TTL_HOURS)).isoformat()
     conn.execute(
         "INSERT INTO net_candidates (candidate_id, expires_at, data) VALUES (?, ?, ?)",

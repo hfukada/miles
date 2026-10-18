@@ -1,6 +1,6 @@
 ---
 name: route-finder
-description: Finds runnable routes in an area from open map data and the athlete's own terrain model — "I'm staying at X, find me a runnable 13 with 6+ miles of trail", "what's good to run around here?", "anything within a 20-minute drive?", "how runnable is this route?". Imports the area if needed, surveys it for the stretches worth running (trail systems, riverside paths, named routes, park paths, quiet roads), runs the miles route search around the athlete's picks, and presents a few candidates with their trade-offs. Also scores uploaded routes against the athlete's walk and descent thresholds. Not for training prescriptions (miles-plan) or analysis of past training (miles).
+description: Finds runnable routes in an area from open map data and the athlete's own terrain model — "I'm staying at X, find me a runnable 13 with 6+ miles of trail", "what's good to run around here?", "anything within a 20-minute drive?", "how runnable is this route?". Imports the area if needed, surveys it for the stretches worth running (trail systems, riverside paths, named routes, park paths, quiet roads), builds routes around the athlete's picks, and presents a few candidates with their trade-offs. Also scores uploaded routes against the athlete's walk and descent thresholds. Not for training prescriptions (miles-plan) or analysis of past training (miles).
 ---
 
 # route-finder — Route Finding
@@ -31,6 +31,9 @@ line so they can correct it:
 |---|---|
 | "13 miles", "about 2 hours" | `distance_mi_min`/`max` (±5–10%; convert time via recent easy pace) |
 | "loop" / "out and back" / "don't care" | `shape` |
+| "I'd rather a loop", "prefer loops" | `loop_bonus` ≈ 0.3; "don't care" → 0; omit for the default 0.075 |
+| "somewhere I haven't run" | `unfamiliar_only=true` |
+| "real trails", "paved is fine" | `surface_preference` (`singletrack`, `track`, `paved`) |
 | "at least 6 on trail", "mostly trail" | `min_trail_mi` |
 | "highly runnable" | `min_runnable_pct` ≈ 90; "runnable" ≈ 80; "I don't mind hiking" → omit |
 | "hilly", "some climbing", "flat" | `gain_ft_min`/`max`, scaled to distance |
@@ -78,14 +81,37 @@ comes from `get_route_candidate`'s `ways` too.
    - Offer `pinned=true` for home; travel areas expire on their own.
 2. **Survey the area before searching.** Once the area is `ready`, call `survey_area`
    with the start (and `distance_mi` when they named one) and open with what the area
-   offers, not with routes. Section kinds are `trail_system`, `water_path`,
+   offers, not with routes. The default `detail="overview"` ranks *groups*: each is
+   everything that covers one stretch of ground, listed once (the riverside path as a
+   trail system and as a route, both banks, the loops inside a park). A group is cut
+   into *stretches* (at bridges, busy roads, trailheads, and other junctions), listed
+   under `stretches` with a `role`. When the athlete picks an area, or asks "which
+   part", drill in with `within=<group section_id>`: it lists the group's stretches in
+   order with a `role` ("between the bridge and the trailhead"; for a network of trails, a
+   region named for its main trails), single-path length, `sides`, `notes` (short spurs it
+   includes, which count toward its length), approach, and familiarity. Offer them as "which part". A group's `length_mi` is one way along it; when
+   `parallel_paths` is present the area holds paths side by side, so don't add them up. Section kinds are `trail_system`, `water_path`,
    `named_route`, `park_paths`, and `quiet_road`. Present them grouped by kind, a few per
    group, best first, each in a line or two: name, length, surface mix, scenery tags
-   (water, park, summit, viewpoint, a named route), run/grind/hike percent for *this*
+   (water, park, summit, viewpoint, a named route), surface, run/grind/hike percent for *this*
    athlete, how far the approach is and how much of it is uncomfortable road, and
    whether they have run it (`familiarity.runs`, `new_to_you`). Lead with how a section
-   differs from the others, and name its trade-offs. A stretch can appear as two kinds
-   (`same_stretch_as` points at the higher-ranked twin): say it is one stretch.
+   differs from the others, and name its trade-offs. A stretch that fits several kinds is
+   one section (`kinds` lists them; `also_called` has its other names).
+   - **Say what the surface is.** `surface_pct` separates `singletrack` (footpath-width
+     natural trail) from `track` (dirt road, canal or levee bank, fire road): call them
+     "singletrack" and "dirt road" and never merge them into "trail". A mostly-track
+     section is not a trail run to someone asking for trails. By default a track counts
+     0.8 of singletrack; when the athlete asks for one ("technical", "real trails",
+     "something flat and gravelly", "paved is fine"), pass `surface_preference`
+     (`singletrack`, `track`, `paved`; `any` is the default) and say you did.
+     `find_routes` candidates report `singletrack_mi` and `dirt_road_or_track_mi` too;
+     `min_trail_mi` counts both.
+   - `parallel_paths` on a section means its length counts two paths side by side (both
+     banks of a river); quote `single_path_mi` as how far one can run along it.
+   - Short stubs and connectors (under 1.5 miles or 15% of the run, whichever is more)
+     are left out; `fragments_hidden` counts them. Pass `include_fragments=true` only if
+     the athlete asks for short options.
    - If they want somewhere new, run it again with `unfamiliar_only=true`. If
      `familiarity.activities_pending` is above zero, activity tracks are still being
      matched and "new to you" may be wrong; say so.
@@ -101,7 +127,11 @@ comes from `get_route_candidate`'s `ways` too.
      say that you did it and why. It is never stored by default. If the athlete agrees it
      is worth keeping, offer to store it with `adjust_section` as `source="research"`
      with a link to where it came from; with no link, do not store it.
-   - **The athlete's own verdicts** are stored only when they say so: call
+   - **The athlete's own verdicts** are stored at the level they mean: "the part past the
+     bridge is overgrown" is a stretch id, "that whole park is dull" the group id. A
+     stretch's adjustment multiplies with its group's; a group's applies to everything in
+     it, and a group exclusion removes all its ways, so exclude a stretch when only part
+     of a place is ruled out. They are stored only when they say so: call
      `adjust_section` (`source="athlete"`) when they tell you a section is better or worse
      than it measures, and `exclude_section` only when they explicitly tell you to rule a
      place out. Never exclude on your own judgment or from research.
@@ -110,12 +140,29 @@ comes from `get_route_candidate`'s `ways` too.
      again rather than reuse old ids after one.
    - A survey measures access from the one point you give it. For a drive, survey from
      the trailhead the athlete would use (`find_trailheads`), not from where they sleep.
-   - `get_section(section_id)` returns a section's ways and a simplified geometry. Once
-     the athlete picks a section, build the route around it with `find_routes`, passing
-     its way ids as `include_way_ids` (soft, so check each candidate's
-     `missed_constraints`) and the distance they want. Say which section each
-     candidate is built around. Searching is still the same one-at-a-time process below.
-3. **Search.** `find_routes` with the mapped constraints. For a drive budget, candidates
+   - `get_section(section_id)` returns a section's ways and a simplified geometry (a
+     group also lists its stretches). To build routes around what the athlete picks,
+     pass the ids to `find_routes` as `sections=[...]` (groups or stretches):
+     it assembles routes around exactly those. Say which section each candidate is built
+     around (`sections_used`: the section, its stretch, and the miles run on it).
+     Naming sections means no random walk: if none can be reached, `warnings` says so.
+     Searching is still the same one-at-a-time process below.
+3. **Search.** `find_routes` with the mapped constraints, and `sections=[...]` once the
+   athlete has picked from the survey. Without `sections`, miles builds around the
+   survey's best sections for the start and distance, and the random walk only fills in
+   when none of them gives a route (`built_from` is `"sections"` or `"walk"` on each
+   candidate; say when one came from the walk, since it is not built around anything in
+   particular). A section-built candidate is an approach, a run along one or more
+   stretches, and a return: an out-and-back turning where the distance fits, a loop, or
+   a lollipop (a stem and a loop inside the section; a loop whose way home rejoins the
+   way out also reads as one). Present
+   `sections_used` for each. A candidate's `ranking` explains its order: section quality
+   (the miles run on sections, weighted by their survey quality) times a loop factor
+   times how well the distance fits, less the cost of reaching the section and getting
+   home. `loop_bonus` is how much a loop or lollipop gains over an out-and-back
+   of the same sections: "prefer loops" is about 0.3, "I don't care" is 0, the default
+   0.075 lets a loop win only a close call, and a clearly better out-and-back still wins
+   at any value. For a drive budget, candidates
    carry their trailhead and drive minutes; `find_trailheads` lists the starts on
    their own when the athlete wants to choose one first. The drive budget is at most
    90 minutes. If a start has `drive_time_estimated: true`, the routing service was

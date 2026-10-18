@@ -48,12 +48,27 @@ def _candidate_summary(candidate: route_search.RouteCandidateOut) -> dict:
     gain_m = score.get("gain_m")
     loss_m = score.get("loss_m")
     exposure = score["road_exposure"]
+    ranking = candidate.get("ranking")
     return {
         "candidate_id": candidate["candidate_id"],
         "shape": candidate["shape"],
+        "built_from": candidate.get("built_from", "walk"),
+        "sections_used": [
+            {"section_id": u["section_id"], "block_id": u["block_id"], "name": u["name"], "miles": _round(u["length_m"] / MILE_M)}
+            for u in candidate.get("sections_used", [])
+        ],
+        "ranking": None if ranking is None else {
+            "score": _round(ranking["score"]),
+            "section_quality_miles": _round(ranking["quality_mi"]),
+            "access_cost": _round(ranking["access_cost"]),
+            "loop_factor": _round(ranking["loop"], 3),
+            "distance_fit": _round(ranking["fit"], 2),
+        },
         "start": _start_view(candidate["start"]),
         "distance_mi": candidate["distance_m"] / MILE_M,
         "trail_mi": score["trail_distance_m"] / MILE_M,
+        "singletrack_mi": score.get("singletrack_distance_m", 0.0) / MILE_M,
+        "dirt_road_or_track_mi": score.get("track_distance_m", 0.0) / MILE_M,
         "unpaved_road_mi": score["unpaved_road_distance_m"] / MILE_M,
         "paved_mi": score["paved_distance_m"] / MILE_M,
         "connector_mi": score["connector_distance_m"] / MILE_M,
@@ -92,7 +107,7 @@ def _section_row_view(row: survey.SurveyRow) -> dict:
     """A survey row in miles and feet, with the scenery trimmed to what a
     conversation needs."""
     scenery = row["scenery"]
-    miles = row["length_m"] / MILE_M
+    miles = row["union_m"] / MILE_M
     runnability = row["runnability"]
     access = row["access"]
     terms = row["terms"]
@@ -100,11 +115,12 @@ def _section_row_view(row: survey.SurveyRow) -> dict:
     view: dict = {
         "section_id": row["section_id"],
         "rank": row["rank"],
-        "same_stretch_as": row["overlaps"],
         "excluded": row["excluded"],
         "kind": row["kind"],
+        "kinds": row["kinds"],
         "name": row["name"],
-        "length_mi": _round(miles),
+        "level": row["level"],
+        "length_mi": _round(row["length_m"] / MILE_M),
         "surface_pct": {k: round(v) for k, v in row["surface_pct"].items()},
         "junctions_per_mi": _round(row["junctions"] / max(miles, 0.25), 1),
         "busy_road_crossings": row["crossings"],
@@ -135,12 +151,36 @@ def _section_row_view(row: survey.SurveyRow) -> dict:
             "continuity": _round(terms["continuity"], 3),
             "scenery_bonus": _round(terms["scenery_bonus"], 3),
             "runnability": _round(terms["runnability"], 3),
+            "surface": _round(terms["surface"], 3),
             "quality": _round(terms["quality"]),
             "adjustment": terms["adjustment"],
             "access_cost": _round(terms["access_cost"]),
         },
         "score": _round(row["score"]),
     }
+    if row["group_id"] is not None:
+        view["group_id"] = row["group_id"]
+    if row["stretches"]:
+        view["stretches"] = {"total": row["stretches_total"], "listed": [
+            {"section_id": st["section_id"], "role": st["role"], "length_mi": _round(st["length_m"] / MILE_M)}
+            for st in row["stretches"]]}
+    if row["role"]:
+        view["role"] = row["role"]
+    if row["sides"]:
+        view["sides"] = row["sides"]
+    if row["notes"]:
+        view["notes"] = row["notes"]
+    if row["other_names"]:
+        view["also_called"] = row["other_names"]
+    if row["parallel_m"] > 0:
+        view["parallel_paths"] = {
+            "parallel_mi": _round(row["parallel_m"] / MILE_M),
+            "union_mi": _round(row["union_m"] / MILE_M),
+            "note": "parallel paths (such as both banks of a waterway) lie within the section; length_mi is "
+                    "one way along it, union_mi counts every path",
+        }
+    if row["fragment"]:
+        view["fragment"] = True
     exclusion = row.get("exclusion")
     if exclusion:
         view["exclusion"] = exclusion
@@ -212,7 +252,7 @@ def register_routing_tools(mcp: FastMCP) -> None:
 
     @mcp.tool()
     @threaded
-    @reporting(ValueError)
+    @reporting(ValueError, sections.SectionNotFoundError)
     def find_routes(
         area_id: int,
         distance_mi_min: float,
@@ -231,6 +271,10 @@ def register_routing_tools(mcp: FastMCP) -> None:
         n: int = 5,
         starts: list[route_search.Start] | None = None,
         seed: int | None = None,
+        sections: list[int] | None = None,
+        loop_bonus: float = route_search.DEFAULT_LOOP_BONUS,
+        surface_preference: str | None = None,
+        unfamiliar_only: bool = False,
     ) -> str:
         """
         Find candidate running routes over an imported area's network graph
@@ -258,6 +302,32 @@ def register_routing_tools(mcp: FastMCP) -> None:
         the distance range, min_trail_mi, min_runnable_pct (run plus grind,
         i.e. not hiking), the gain_ft_min/gain_ft_max range, and
         include_way_ids (so a candidate can still lack an included way).
+
+        Routes are built around sections (survey_area): with sections=[ids]
+        (group or stretch ids, from survey_area or get_section), around
+        exactly those; without, around the survey's best sections for the
+        start and distance, and the randomized walk fills in only when those
+        give fewer than n routes (built_from says which: "sections" or
+        "walk"). Each section-built candidate is an approach, a run along one
+        or more stretches, and a return: an out-and-back (turning where the
+        distance fits), a loop, or a lollipop (a stem and a loop inside the
+        section), a short stretch continuing over the next within reach.
+        Naming sections never falls back to
+        the walk: if none can be reached, warnings says so. sections_used lists
+        what each candidate runs: section_id, block_id, name and the miles on
+        it (an out-and-back counts a mile each way).
+
+        Section-built candidates rank by ranking.score = section quality
+        x loop_factor x distance_fit - access_cost, in quality-miles: the
+        adjusted survey quality of the miles run on sections, a loop bonus
+        for returning by a different path, 1 inside the distance range and
+        falling outside it, less the weighted cost of reaching the section
+        and getting home. loop_bonus (default 0.075, 0 to 0.5) is the share
+        a loop or lollipop adds: 0.3 when the athlete prefers loops,
+        0 when they do not care, and a better out-and-back still beats a
+        lesser loop at any value. surface_preference ("singletrack", "track",
+        "paved", "any") and unfamiliar_only are survey_area's, used to
+        choose the sections when none are named.
 
         Returns up to n candidates (default 5): start, distance, trail/road
         mix, runnability, road exposure, and a candidate_id for
@@ -302,17 +372,22 @@ def register_routing_tools(mcp: FastMCP) -> None:
                 "avoid_way_ids": avoid_way_ids,
                 "include_way_ids": include_way_ids,
                 "seed": seed,
+                "sections": sections,
+                "loop_bonus": loop_bonus,
+                "surface_preference": surface_preference,
+                "unfamiliar_only": unfamiliar_only,
             }
             result = route_search.find_routes(conn, request)
 
-        return json.dumps(
-            {
-                "candidates": [_candidate_summary(c) for c in result["candidates"]],
-                "near_miss": result["near_miss"],
-                "budget_exceeded": result["budget_exceeded"],
-                "seed": result["seed"],
-            }
-        )
+        out: dict = {
+            "candidates": [_candidate_summary(c) for c in result["candidates"]],
+            "near_miss": result["near_miss"],
+            "budget_exceeded": result["budget_exceeded"],
+            "seed": result["seed"],
+        }
+        if result["warnings"]:
+            out["warnings"] = result["warnings"]
+        return json.dumps(out)
 
     @mcp.tool()
     @reporting(route_search.CandidateNotFoundError)
@@ -350,6 +425,10 @@ def register_routing_tools(mcp: FastMCP) -> None:
         unfamiliar_only: bool = False,
         adjustments: dict[str, float] | None = None,
         n: int = 10,
+        surface_preference: str | None = None,
+        include_fragments: bool = False,
+        detail: str = "overview",
+        within: int | None = None,
     ) -> str:
         """
         Survey an imported area for stretches worth running before building a
@@ -358,14 +437,31 @@ def register_routing_tools(mcp: FastMCP) -> None:
         route conversation with this, then build routes around what the
         athlete picks.
 
-        A section is a stretch of the map run as a unit. kinds (any subset to
-        filter by): trail_system (a connected cluster of natural-surface
+        A section is a part of the map run as a unit. The survey has two
+        levels. detail="overview" (the default) ranks groups: one group is
+        everything that covers one stretch of ground (a riverside path that is
+        also a trail system and a named route, both banks, the loops inside
+        it), listed once with its single-path length_mi, the best approach to
+        any of its stretches, and its stretches under "stretches" (section_id,
+        role, length_mi). A group is cut into stretches (at bridges, busy
+        roads, trailheads and other junctions; a network of trails is divided
+        into regions of a few miles, named for their main trails): the parts
+        of it a route can be built around. A stretch's notes list the short
+        spurs it includes, which count toward its length. detail="detail" ranks the stretches instead, and
+        within=<group section_id> (which implies detail) lists just that
+        group's stretches in order, each with a role such as "between X and
+        Y", its sides, approach and familiarity: use it when the athlete picks
+        an area or asks which part. Every id works with get_section,
+        adjust_section, exclude_section and clear_section_adjustment. kinds
+        (any subset to filter by): trail_system (a connected cluster of natural-surface
         trails), water_path (paths along a river, stream, canal, or lake),
         named_route (a mapped walking, hiking, cycling, or running route),
         park_paths (paths inside one park or protected area), quiet_road (a
-        run of comfortable road with few junctions). A way can be in sections
-        of different kinds. Section ids last until the area's network is next
-        rebuilt; survey again after that.
+        run of comfortable road with few junctions). A stretch that fits more
+        than one kind (a named path along a river) is one section: kind is its
+        main kind, kinds lists all of them, and the kinds filter matches any.
+        Section ids last until the area's network is next rebuilt; survey
+        again after that.
 
         distance_mi (optional) is the intended run length; it bounds how far
         an approach may be (a quarter of it, each way) and how much of a
@@ -374,6 +470,17 @@ def register_routing_tools(mcp: FastMCP) -> None:
         matched, which fills in over time (see familiarity in the result).
         n is how many ranked sections to return (default 10, at most 25).
 
+        surface_preference is "singletrack", "track", "paved", or "any" (the
+        default). Sections report singletrack (footpath-width natural-surface
+        trail) and track (road-width dirt road, canal or levee bank, fire
+        road) separately in surface_pct. By default a track counts 0.8 of
+        singletrack toward quality; pass "singletrack" or "track" when the
+        athlete asks for one ("technical trails", "a flat dirt road") or
+        "paved" for the opposite. include_fragments=True also ranks the stubs
+        and connectors left out by default (under 1.5 miles or 15% of the
+        run distance, whichever is more; judged per group in an overview, per
+        stretch in detail); fragments_hidden counts them.
+
         adjustments is {section_id: factor} for this request only, nothing
         stored: use it for what you know of a place that the map lacks, with
         factors between 0.5 and 2.0. Say where the knowledge came from; offer
@@ -381,23 +488,22 @@ def register_routing_tools(mcp: FastMCP) -> None:
         if the athlete agrees. Stored adjustments appear on each section with
         their source and note.
 
-        Each section reports: length_mi, surface_pct, junctions_per_mi,
+        Each section reports: length_mi (one way along it: parallel_paths says
+        when it also holds paths beside the main one, such as the other bank,
+        and gives the union), surface_pct, junctions_per_mi,
         busy_road_crossings, scenery (tags, water, parks, routes, summits,
-        viewpoints), same_stretch_as (higher-ranked listed sections covering
-        half or more of it, so one stretch seen as two kinds is not counted
-        twice), runnability for this athlete (run/grind/hike percent and
+        viewpoints), runnability for this athlete (run/grind/hike percent and
         an estimated pace from their terrain model), gain_ft_per_mi,
-        familiarity (runs that covered it, last run, new_to_you), access
-        (approach_mi from the start, uncomfortable_mi of it, steepest pitch),
-        the adjustment, every term of the score, and the score. Sections whose
+        familiarity (runs that covered it, last run, new_to_you; a group is
+        matched over its whole extent), access (approach_mi from the start to
+        the nearest of its stretches, uncomfortable_mi of it, steepest pitch),
+        the adjustment (a stretch's includes its group's), every term of the score, and the score. Sections whose
         approach is too long or has more continuous uncomfortable road than
         the route preferences allow are not ranked (ruled_out lists a few).
         Sections the athlete excluded are listed last with excluded=true.
 
-        To build a route around a section before section-aware search
-        exists, pass its way ids (get_section) as include_way_ids to
-        find_routes; that is soft, so check each candidate's
-        missed_constraints.
+        To build routes around what the athlete picks, pass the section ids
+        to find_routes as sections.
         """
         with db.connection() as conn:
             result = survey.survey(
@@ -410,6 +516,10 @@ def register_routing_tools(mcp: FastMCP) -> None:
                 unfamiliar_only=unfamiliar_only,
                 adjustments=adjustments,
                 n=n,
+                surface_preference=surface_preference,
+                include_fragments=include_fragments,
+                detail=detail,
+                within=within,
             )
         return json.dumps(_survey_view(result))
 
@@ -418,9 +528,11 @@ def register_routing_tools(mcp: FastMCP) -> None:
     @reporting(ValueError, sections.SectionNotFoundError)
     def get_section(section_id: int) -> str:
         """
-        One section from survey_area in detail: its ways (OSM way id, name,
-        length_mi, longest first) and a simplified geometry as a list of
-        [lat, lng] polylines for drawing or steering. The way ids work as
+        One section from survey_area in detail, a group or stretch: its
+        ways (OSM way id, name, length_mi, longest first) and a simplified
+        geometry as a list of [lat, lng] polylines for drawing or steering. For
+        a group it also lists its stretches in order (section_id, role,
+        length_mi) so one can be picked. The way ids work as
         find_routes' include_way_ids (soft: a candidate can still miss them)
         and as set_way_override targets; pass avoid_way_ids only for ways the
         athlete wants kept out of a route.
@@ -428,13 +540,21 @@ def register_routing_tools(mcp: FastMCP) -> None:
         with db.connection() as conn:
             section = sections.get_section(conn, section_id)
             geometry = sections.section_geometry(conn, section)
+            stretches = sections.stretches_of(conn, section_id) if section.level == sections.GROUP else []
         return json.dumps(
             {
                 "section_id": section.section_id,
                 "area_id": section.area_id,
                 "kind": section.kind,
+                "kinds": section.kinds,
+                "level": section.level,
+                "group_id": section.group_id,
                 "name": section.name,
-                "length_mi": _round(section.length_m / MILE_M),
+                "length_mi": _round(section.single_path_m / MILE_M),
+                "stretches": [
+                    {"section_id": st.section_id, "role": st.data.get("role") or st.name, "length_mi": _round(st.single_path_m / MILE_M)}
+                    for st in stretches
+                ],
                 "ways": [
                     {"way_id": w[0], "name": w[2], "length_mi": _round(w[1] / MILE_M)} for w in section.data["ways"]
                 ],
@@ -451,7 +571,11 @@ def register_routing_tools(mcp: FastMCP) -> None:
         Store a judgment about a section that the map cannot show: a factor on
         its measured quality, kept across rebuilds. Only store one when the
         athlete says so, or confirms one you proposed; a guess belongs in
-        survey_area's per-request adjustments. factor is clamped to 0.5-2.0
+        survey_area's per-request adjustments. section_id is a group or a
+        stretch: a group's factor applies to all its stretches, a stretch's to
+        that stretch alone (and multiplies with its group's); store it at the
+        level the athlete means ("the whole riverside path" is a group, "the
+        part past the bridge" a stretch). factor is clamped to 0.5-2.0
         (1.0 is no change; 1.5 is notably better than it measures, 0.7
         somewhat worse). source is "athlete" for their own verdict, or
         "research" for what you or a search found, which needs a url to the
@@ -468,8 +592,9 @@ def register_routing_tools(mcp: FastMCP) -> None:
         Rule a section out of every route search until undone: its ways leave
         the graph, as ways marked "avoid" do. ONLY on the athlete's explicit
         instruction to rule a place out; never on your own judgment or
-        research (use a low adjustment for those). The section stays listed
-        in survey_area, marked excluded. note says why.
+        research (use a low adjustment for those). A stretch's ways leave the
+        graph; a group's exclusion removes all its stretches' ways. The section
+        stays listed in survey_area, marked excluded. note says why.
         """
         with db.connection() as conn:
             return json.dumps(sections.exclude_section(conn, section_id, note))

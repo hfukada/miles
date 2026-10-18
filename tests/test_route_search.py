@@ -7,7 +7,7 @@ import time
 import pytest
 from helpers import FakeSampler, ImmediateThread, WayBuilder, climbing_sampler, lerp, none_sampler
 
-from miles import areas, db, network, route_search, routes as routes_service
+from miles import areas, assemble, db, network, route_search, routes as routes_service
 
 
 # A diamond-shaped trail ring (corners N/E/S/W, each side split into six
@@ -23,6 +23,13 @@ W_LL = (40.0, -105.004)
 
 BUSY_WAY_TAGS = {"name": "Busy Rd", "maxspeed": "50 mph"}
 QUIET_WAY_TAGS = {"name": "Quiet Rd"}
+
+
+@pytest.fixture(autouse=True)
+def walk_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the random-walk generator; test_assemble.py covers
+    candidates built around sections."""
+    monkeypatch.setattr(assemble, "plan_blocks", lambda conn, request, model: assemble.BlockPlan())
 
 
 def _add_ring(builder: WayBuilder) -> None:

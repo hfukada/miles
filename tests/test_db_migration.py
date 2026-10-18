@@ -68,6 +68,7 @@ _SCHEMA_HASHES = {
     1: "aea5ae73e40fa9e1797a71628ba98d85203433a908c53572313b52db2ef83721",
     2: "026d105719904fe53a70183f867fca94de39b6f86128bb8fce245dda37931648",
     3: "261b879550f49105a9791fb512e2a6e0b5000ae14353509b1f457083923ceef4",
+    4: "3cd68e80241e18807b486e21dee57602c2414598d2e7396143cb5fc1379f813a",
 }
 
 
@@ -151,6 +152,40 @@ def test_a_version_1_database_upgrades_to_the_schema_a_fresh_one_gets(conn: sqli
     assert old.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     row = old.execute("SELECT name, location, location_source FROM routes WHERE route_id = 7").fetchone()
     assert (row["name"], row["location"], row["location_source"]) == ("Ridge", None, None)
+
+
+def test_a_version_3_database_gains_the_section_and_edge_columns_and_keeps_its_rows(conn: sqlite3.Connection, tmp_path: Path):
+    old = _release_database(tmp_path / "v3.db")
+    db.init_db(old)
+    for table, column in (
+        ("net_edges", "structure"), ("net_edges", "trail_kind"), ("net_sections", "group_id"),
+        ("net_sections", "level"), ("net_section_judgments", "level"),
+    ):
+        old.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+    old.execute(
+        "INSERT INTO net_edges (edge_id, area_id, way_id, highway, surface_class, from_node_id, to_node_id, length_m, "
+        "has_elevation, points_blob) VALUES (3, 1, 9, 'path', 'trail', 1, 2, 10, 0, x'')"
+    )
+    old.execute(
+        "INSERT INTO net_sections (section_id, area_id, kind, name, length_m, centroid_lat, centroid_lng, south, west, north, east, data, edges) "
+        "VALUES (7, 1, 'trail_system', 'Loop', 100, 0, 0, 0, 0, 0, 0, '{}', x'')"
+    )
+    old.execute(
+        "INSERT INTO net_section_judgments (judgment_id, judgment, section_kind, factor, source, created_at) "
+        "VALUES (5, 'adjust', 'trail_system', 1.2, 'athlete', '2026-01-01')"
+    )
+    old.execute("PRAGMA user_version = 3")
+    old.commit()
+
+    db.init_db(old)
+
+    assert _layout(old) == _layout(conn)
+    assert old.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    edge = old.execute("SELECT trail_kind, structure FROM net_edges WHERE edge_id = 3").fetchone()
+    assert (edge["trail_kind"], edge["structure"]) == (None, None)
+    section = old.execute("SELECT level, group_id FROM net_sections WHERE section_id = 7").fetchone()
+    assert (section["level"], section["group_id"]) == ("group", None)
+    assert old.execute("SELECT level FROM net_section_judgments WHERE judgment_id = 5").fetchone()["level"] == "group"
 
 
 class _RacingConnection:

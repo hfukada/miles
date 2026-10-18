@@ -2,9 +2,10 @@
 section of an area, matched from the raw streams already on disk.
 
 Matching is incremental. An activity is matched against an area's sections
-once; the result lives in net_section_visits until a rebuild replaces the
-sections, which clears it (sections.delete_area_sections) and so re-matches
-everything. A query never matches anything itself: it reads the visits and
+(groups, pieces, and stretches alike) once; the result lives in
+net_section_visits until a rebuild replaces the sections, which clears it
+(sections.delete_area_sections) and so re-matches everything. A stretch counts
+as covered by the share of its single-path length the activity ran. A query never matches anything itself: it reads the visits and
 reports how many activities are still waiting.
 """
 
@@ -103,7 +104,7 @@ def update(conn: sqlite3.Connection, area_id: int, max_activities: int | None = 
         return status(conn, area_id)
 
     section_of_edge: dict[int, list[int]] = defaultdict(list)
-    section_length = {s.section_id: s.length_m for s in all_sections}
+    section_length = {s.section_id: s.single_path_m for s in all_sections}
     for s in all_sections:
         for edge_id in s.edge_ids:
             section_of_edge[edge_id].append(s.section_id)
