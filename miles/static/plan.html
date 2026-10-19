@@ -254,6 +254,8 @@
        weekday-column idiom only exists on the grid. */
     .plan-view .mcal-week { border: 1px solid var(--gridline); border-radius: 8px; overflow: hidden; background: var(--surface); }
     .plan-view .mcal-week.current { background: var(--pr-bg); }
+    /* Clears the sticky #plan-tabs row when scrolled to (scrollToCurrentWeek). */
+    .plan-view .mcal-week { scroll-margin-top: 4rem; }
     .plan-view .mcal-week-head { padding: 0.5rem 0.75rem; background: var(--bg); border-bottom: 1px solid var(--gridline); }
     .plan-view .mcal-week.current .mcal-week-head { background: var(--pr-bg-hover); }
     .plan-view .mcal-week-range { font-size: 0.8125rem; font-weight: 650; color: var(--text); }
@@ -916,6 +918,16 @@
     document.querySelectorAll('.tab-panel').forEach(el => { el.hidden = el.id !== `tab-${key}`; });
     if (TAB_CHARTS[key]) TAB_CHARTS[key].forEach(c => c.resize());
     history.replaceState(null, '', `#${key}`);
+    if (key === 'plan') requestAnimationFrame(scrollToCurrentWeek);
+  }
+
+  // Mobile calendar only: the desktop grid (.cal) leaves .cal-cards hidden,
+  // so offsetParent is null there and the page stays put.
+  function scrollToCurrentWeek() {
+    const week = document.querySelector('.plan-view .mcal-week.current');
+    if (!week || !week.offsetParent) return;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    week.scrollIntoView({ behavior: reduce ? 'auto' : 'smooth', block: 'start' });
   }
 
   // -----------------------------------------------------------------------

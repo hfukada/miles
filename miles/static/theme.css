@@ -290,6 +290,9 @@ body {
 @media (min-width: 640px) {
   .tabbar, .tabbar-sheet, .tabbar-sheet-backdrop { display: none; }
 }
+/* Keep Leaflet's pane/control z-indexes (400-1000) inside the map so they
+   don't paint over the tab bar and sheet. */
+.leaflet-container { isolation: isolate; }
 
 main { max-width: 1600px; margin: 0 auto; padding: 1rem; }
 
