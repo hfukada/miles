@@ -116,10 +116,23 @@ function renderNav() {
   header.appendChild(nav);
 
   // --- sync button ---
+  // Two buttons, one state: the header's (desktop) and the phone tab bar's,
+  // whose narrow cell gets a short label with the full text as its title.
   const syncBtn = document.createElement("button");
   syncBtn.className = "sync-btn";
-  syncBtn.title = "Sync from Strava";
-  syncBtn.textContent = "↻ Sync";
+  const tabSyncBtn = document.createElement("button");
+  tabSyncBtn.type = "button";
+  tabSyncBtn.className = "tabbar-item tabbar-sync";
+  const syncBtns = [syncBtn, tabSyncBtn];
+
+  function setSync(full, short, { disabled = true, title = null } = {}) {
+    syncBtn.textContent = full;
+    tabSyncBtn.textContent = short;
+    syncBtn.title = title ?? "Sync from Strava";
+    tabSyncBtn.title = title ?? (disabled ? full : "Sync from Strava");
+    tabSyncBtn.setAttribute("aria-label", tabSyncBtn.title);
+    for (const b of syncBtns) b.disabled = disabled;
+  }
 
   // Button text while running is driven entirely by /api/sync/status's phase/
   // done/total, so a page-load poll (below) can resume mid-run with the same text
@@ -132,28 +145,35 @@ function renderNav() {
     return `↻ ${data.phase}`;
   }
 
-  function showError(message) {
-    syncBtn.textContent = "✗ Error";
-    syncBtn.title = message || "Sync failed";
-    setTimeout(() => resetSync("↻ Sync"), 8000);
+  function formatPhaseShort(data) {
+    if (data.phase === "waiting") return "↻ Wait";
+    if (data.total != null && data.done != null) return `↻ ${data.done}/${data.total}`;
+    if (data.done != null) return `↻ ${data.done}`;
+    return "↻ …";
   }
 
-  function resetSync(label) {
-    syncBtn.disabled = false;
-    syncBtn.title = "Sync from Strava";
-    syncBtn.textContent = label;
+  function showRunning(data) {
+    setSync(formatPhase(data), formatPhaseShort(data));
+  }
+
+  function showError(message) {
+    setSync("✗ Error", "✗ Error", { title: message || "Sync failed" });
+    setTimeout(resetSync, 8000);
+  }
+
+  function resetSync() {
+    setSync("↻ Sync", "↻ Sync", { disabled: false });
   }
 
   async function startSync() {
-    syncBtn.disabled = true;
-    syncBtn.textContent = "↻ Syncing…";
+    setSync("↻ Syncing…", "↻ …");
     try {
       const res = await fetch("/api/sync", { method: "POST" });
       const data = await res.json();
       if (data.status === "running" || data.status === "started") {
         pollSync();
       } else {
-        resetSync("↻ Sync");
+        resetSync();
       }
     } catch {
       showError("Network error starting sync");
@@ -165,24 +185,24 @@ function renderNav() {
       const res = await fetch("/api/sync/status");
       const data = await res.json();
       if (data.status === "running") {
-        syncBtn.disabled = true;
-        syncBtn.textContent = formatPhase(data);
+        showRunning(data);
         setTimeout(pollSync, 1000);
       } else if (data.status === "error") {
         showError(data.error);
       } else if (data.status === "done") {
         const n = data.new_activities || 0;
-        syncBtn.textContent = n > 0 ? `✓ ${n} new` : "✓ up to date";
+        setSync(n > 0 ? `✓ ${n} new` : "✓ up to date", n > 0 ? `✓ ${n} new` : "✓");
         setTimeout(() => { location.reload(); }, 2000);
       } else {
-        resetSync("↻ Sync");
+        resetSync();
       }
     } catch {
       showError("Network error checking sync status");
     }
   }
 
-  syncBtn.addEventListener("click", startSync);
+  resetSync();
+  for (const b of syncBtns) b.addEventListener("click", startSync);
   header.insertBefore(syncBtn, nav);
 
   // Resume the polling state on a fresh page load if a sync kicked off from
@@ -193,8 +213,7 @@ function renderNav() {
       const res = await fetch("/api/sync/status");
       const data = await res.json();
       if (data.status === "running") {
-        syncBtn.disabled = true;
-        syncBtn.textContent = formatPhase(data);
+        showRunning(data);
         setTimeout(pollSync, 1000);
       }
     } catch {
@@ -227,16 +246,18 @@ function renderNav() {
   // --- end build/version info ---
 
   document.body.insertBefore(header, document.body.firstChild);
-  document.body.appendChild(renderTabbar(path));
+  document.body.appendChild(renderTabbar(path, tabSyncBtn));
 }
 
-// Phone bottom bar (theme.css hides it from 640px): the flat NAV_LINKS as
-// tabs, then "More" opening a sheet with the grouped links and Workbook.
-function renderTabbar(path) {
+// Phone bottom bar (theme.css hides it from 640px, and hides the header
+// below it): Sync, the flat NAV_LINKS as tabs, then "More" opening a sheet
+// with the grouped links and Workbook.
+function renderTabbar(path, syncBtn) {
   const frag = document.createDocumentFragment();
   const bar = document.createElement("nav");
   bar.className = "tabbar";
   bar.setAttribute("aria-label", "Primary");
+  bar.appendChild(syncBtn);
 
   const sheetLinks = [{ href: "/workbook.html", label: "Workbook" }];
   for (const entry of NAV_LINKS) {

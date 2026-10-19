@@ -32,6 +32,9 @@
   --route-hike: #e5254b;
   --route-neutral: #1b1b1f;
 
+  /* Phone bottom tab bar height (44px touch target). */
+  --tabbar-h: 2.75rem;
+
   --pr-bg: #f0fdf4;
   --pr-bg-hover: #dcfce7;
   --sub3-bg: #fafffe;
@@ -85,35 +88,26 @@ body {
   color: var(--text);
   min-height: 100vh;
   /* Room for the fixed .tabbar. */
-  padding-bottom: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+  padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px));
 }
 @media (min-width: 640px) {
   body { padding-bottom: 0; }
 }
 
-/* Shared chrome, injected by nav.js. Phones get brand + Sync up top and
-   the links in the bottom .tabbar; nav and the workbook icon return at
-   640px. */
-.site-header {
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  padding: 0.5rem 1rem;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-}
-.site-header nav, .site-header .workbook-link, .build-version { display: none; }
-.site-header .sync-btn { margin-left: auto; min-height: 2.75rem; padding: 0 0.875rem; }
+/* Shared chrome, injected by nav.js. Phones have no header at all: Sync
+   and the links live in the bottom .tabbar. The header returns at 640px. */
+.site-header { display: none; }
 @media (min-width: 640px) {
   .site-header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
     padding: 1.25rem 2rem;
+    display: flex;
     align-items: baseline;
     gap: 1.5rem;
     flex-wrap: wrap;
   }
   .site-header nav { display: flex; }
-  .site-header .workbook-link, .build-version { display: inline; }
-  .site-header .sync-btn { margin-left: 0; min-height: 0; padding: 2px 8px; }
 }
 .site-header .brand {
   font-size: 1.125rem;
@@ -223,9 +217,9 @@ body {
   white-space: nowrap;
 }
 
-/* Phone bottom tab bar (nav.js): primary links plus a "More" sheet holding
-   the History group and Workbook. Hidden from 640px, where the header nav
-   takes over. */
+/* Phone bottom tab bar (nav.js): Sync, the primary links, and a "More"
+   sheet holding the History group and Workbook. Hidden from 640px, where
+   the header takes over. */
 .tabbar {
   position: fixed;
   left: 0;
@@ -233,7 +227,7 @@ body {
   bottom: 0;
   z-index: 90;
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   background: var(--surface);
   border-top: 1px solid var(--border);
   padding-bottom: env(safe-area-inset-bottom, 0px);
@@ -245,7 +239,11 @@ body {
   color: var(--muted);
   background: none;
   border: none;
-  min-height: 3.5rem;
+  min-height: var(--tabbar-h);
+  padding: 0 0.25rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -253,6 +251,8 @@ body {
   cursor: pointer;
 }
 .tabbar-item.active { color: var(--accent); font-weight: 600; }
+.tabbar-sync { color: var(--text-secondary); }
+.tabbar-sync:disabled { opacity: 0.6; cursor: default; }
 .tabbar-sheet-backdrop {
   position: fixed;
   inset: 0;
@@ -263,7 +263,7 @@ body {
   position: fixed;
   left: 0;
   right: 0;
-  bottom: calc(3.5rem + env(safe-area-inset-bottom, 0px));
+  bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px));
   z-index: 90;
   display: flex;
   flex-direction: column;
