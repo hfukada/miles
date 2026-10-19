@@ -227,6 +227,69 @@ function renderNav() {
   // --- end build/version info ---
 
   document.body.insertBefore(header, document.body.firstChild);
+  document.body.appendChild(renderTabbar(path));
+}
+
+// Phone bottom bar (theme.css hides it from 640px): the flat NAV_LINKS as
+// tabs, then "More" opening a sheet with the grouped links and Workbook.
+function renderTabbar(path) {
+  const frag = document.createDocumentFragment();
+  const bar = document.createElement("nav");
+  bar.className = "tabbar";
+  bar.setAttribute("aria-label", "Primary");
+
+  const sheetLinks = [{ href: "/workbook.html", label: "Workbook" }];
+  for (const entry of NAV_LINKS) {
+    if (entry.children) {
+      sheetLinks.unshift(...entry.children);
+      continue;
+    }
+    const a = document.createElement("a");
+    a.href = entry.href;
+    a.className = "tabbar-item";
+    a.textContent = entry.label;
+    if (isLinkActive(entry.href, path)) a.classList.add("active");
+    bar.appendChild(a);
+  }
+
+  const backdrop = document.createElement("div");
+  backdrop.className = "tabbar-sheet-backdrop";
+  backdrop.hidden = true;
+  const sheet = document.createElement("div");
+  sheet.className = "tabbar-sheet";
+  sheet.id = "tabbar-sheet";
+  sheet.hidden = true;
+  for (const link of sheetLinks) {
+    const a = document.createElement("a");
+    a.href = link.href;
+    a.textContent = link.label;
+    if (isLinkActive(link.href, path)) a.classList.add("active");
+    sheet.appendChild(a);
+  }
+
+  const more = document.createElement("button");
+  more.type = "button";
+  more.className = "tabbar-item";
+  more.textContent = "More";
+  more.setAttribute("aria-haspopup", "true");
+  more.setAttribute("aria-expanded", "false");
+  more.setAttribute("aria-controls", sheet.id);
+  if (sheetLinks.some((link) => isLinkActive(link.href, path))) more.classList.add("active");
+  bar.appendChild(more);
+
+  function setOpen(open) {
+    sheet.hidden = !open;
+    backdrop.hidden = !open;
+    more.setAttribute("aria-expanded", String(open));
+  }
+  more.addEventListener("click", () => setOpen(sheet.hidden));
+  backdrop.addEventListener("click", () => setOpen(false));
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") setOpen(false);
+  });
+
+  frag.append(backdrop, sheet, bar);
+  return frag;
 }
 
 // Reads theme.css custom properties so ECharts options can follow light/dark
@@ -236,6 +299,9 @@ function chartTheme() {
   const v = (name) => css.getPropertyValue(name).trim();
   return {
     isDark: window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false,
+    // Phone layout (theme.css's 640px chrome breakpoint): charts tighten
+    // their grid and thin their axis labels.
+    compact: window.matchMedia?.("(max-width: 639px)").matches ?? false,
     text: v("--text"),
     textSecondary: v("--text-secondary"),
     muted: v("--muted"),
