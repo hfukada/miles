@@ -32,8 +32,8 @@
   --route-hike: #e5254b;
   --route-neutral: #1b1b1f;
 
-  /* Phone bottom tab bar height (44px touch target). */
-  --tabbar-h: 2.75rem;
+  /* Phone bottom tab bar height. */
+  --tabbar-h: 3rem;
 
   --pr-bg: #f0fdf4;
   --pr-bg-hover: #dcfce7;
@@ -227,7 +227,8 @@ body {
   bottom: 0;
   z-index: 90;
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  /* Sync hugs its label; the four tabs share the rest. */
+  grid-template-columns: auto repeat(4, minmax(0, 1fr));
   background: var(--surface);
   border-top: 1px solid var(--border);
   padding-bottom: env(safe-area-inset-bottom, 0px);
@@ -240,6 +241,7 @@ body {
   background: none;
   border: none;
   min-height: var(--tabbar-h);
+  position: relative;
   padding: 0 0.25rem;
   white-space: nowrap;
   overflow: hidden;
@@ -251,7 +253,16 @@ body {
   cursor: pointer;
 }
 .tabbar-item.active { color: var(--accent); font-weight: 600; }
-.tabbar-sync { color: var(--text-secondary); }
+/* Inset hairline between neighboring items. */
+.tabbar-item + .tabbar-item::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 25%;
+  bottom: 25%;
+  border-left: 1px solid var(--border);
+}
+.tabbar-sync { color: var(--text-secondary); padding: 0 0.625rem; }
 .tabbar-sync:disabled { opacity: 0.6; cursor: default; }
 .tabbar-sheet-backdrop {
   position: fixed;
@@ -289,6 +300,12 @@ body {
 .tabbar-sheet-backdrop[hidden], .tabbar-sheet[hidden] { display: none; }
 @media (min-width: 640px) {
   .tabbar, .tabbar-sheet, .tabbar-sheet-backdrop { display: none; }
+}
+/* Safety net for pages not yet converted to mobile-first: horizontal
+   overflow widens the layout viewport past the screen, which pushes the
+   fixed tab bar off the bottom. */
+@media (max-width: 639px) {
+  html { overflow-x: clip; }
 }
 /* Keep Leaflet's pane/control z-indexes (400-1000) inside the map so they
    don't paint over the tab bar and sheet. */
@@ -416,9 +433,14 @@ tr.sub3:hover td { background: var(--sub3-bg-hover); }
   gap: 0.25rem;
   margin-bottom: 0.75rem;
 }
+/* Phones: a row too long for the screen scrolls sideways on its own. */
+@media (max-width: 639px) {
+  .mode-tabs { overflow-x: auto; scrollbar-width: none; }
+  .mode-tab { flex-shrink: 0; }
+}
 .mode-tab {
-  min-height: 2.75rem;
-  padding: 0 1rem;
+  min-height: 2rem;
+  padding: 0 0.75rem;
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--bg);
@@ -445,8 +467,8 @@ tr.sub3:hover td { background: var(--sub3-bg-hover); }
   margin-bottom: 1rem;
 }
 .chip {
-  min-height: 2.5rem;
-  padding: 0.3rem 0.875rem;
+  min-height: 2rem;
+  padding: 0.25rem 0.75rem;
   border: 1px solid var(--border);
   border-radius: 999px;
   background: var(--surface);
