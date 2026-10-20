@@ -343,3 +343,107 @@ async function getJson(url) {
     return { error: 'Network error.' };
   }
 }
+
+// Load / injury-risk charts (/api/load), shared by training.html and
+// plan.html's Trends tab: acute:chronic ratio over shaded risk bands, and
+// monotony with its 2.0 line. Returns the instances (for resize) and a
+// one-line caption for the latest day.
+const ACWR_BANDS = [
+  { from: 0, to: 0.8, key: 'low', label: 'Low' },
+  { from: 0.8, to: 1.3, key: 'optimal', label: 'Optimal' },
+  { from: 1.3, to: 1.5, key: 'caution', label: 'Caution' },
+  { from: 1.5, to: 3, key: 'high', label: 'High' },
+];
+const MONOTONY_HIGH = 2.0;
+
+function renderLoadCharts(acwrEl, monotonyEl, data) {
+  const theme = chartTheme();
+  const good = getComputedStyle(document.documentElement).getPropertyValue('--good').trim();
+  const bandColor = { low: theme.baseline, optimal: good, caution: theme.series[2], high: theme.series[5] };
+  const bandLabel = Object.fromEntries(ACWR_BANDS.map(b => [b.key, b.label]));
+  const dayLabel = d => new Date(d + 'T00:00:00').toLocaleString('en-US', { month: 'short', day: 'numeric' });
+
+  function tooltip(params) {
+    const d = data.days[params[0].dataIndex];
+    const lines = [
+      d.acwr != null ? `Ratio: ${d.acwr.toFixed(2)} (${bandLabel[d.acwr_band]})` : 'Ratio: not enough history',
+      `Day load: ${Math.round(d.load)}`,
+      `7-day load: ${Math.round(d.acute)}`,
+      d.chronic_weekly != null ? `28-day weekly avg: ${Math.round(d.chronic_weekly)}` : null,
+      d.monotony != null ? `Monotony: ${d.monotony.toFixed(2)}` : null,
+      d.strain != null ? `Strain: ${d.strain}` : null,
+    ].filter(Boolean);
+    return `<div style="font-weight:600;margin-bottom:2px;color:${theme.text}">${dayLabel(d.date)}</div>${lines.join('<br>')}`;
+  }
+
+  function base(extraY, series) {
+    return {
+      animation: false,
+      grid: { top: 12, right: 16, bottom: 28, left: 48 },
+      tooltip: chartAxisTooltip(theme, tooltip),
+      xAxis: {
+        type: 'time',
+        axisLine: { lineStyle: { color: theme.gridline } },
+        axisTick: { show: false },
+        axisLabel: { fontSize: 11, color: theme.muted },
+        ...(theme.compact ? { splitNumber: 4 } : {}),
+      },
+      yAxis: Object.assign({
+        type: 'value',
+        axisLine: { show: false },
+        axisTick: { show: false },
+        splitLine: { lineStyle: { color: theme.gridline } },
+        axisLabel: { fontSize: 11, color: theme.muted },
+      }, extraY),
+      series,
+    };
+  }
+
+  const yMax = Math.ceil(Math.max(1.6, ...data.days.map(d => d.acwr ?? 0)) * 10) / 10;
+  const acwrChart = echarts.init(acwrEl);
+  acwrChart.setOption(base({ min: 0, max: yMax }, [{
+    name: 'Acute:chronic',
+    type: 'line',
+    data: data.days.map(d => [d.date, d.acwr]),
+    showSymbol: false,
+    connectNulls: false,
+    lineStyle: { color: theme.text, width: 1.75 },
+    itemStyle: { color: theme.text },
+    markArea: {
+      silent: true,
+      data: ACWR_BANDS.map(b => ([
+        {
+          yAxis: b.from,
+          itemStyle: { color: withAlpha(bandColor[b.key], theme.isDark ? 0.18 : 0.12) },
+          label: { show: true, position: 'insideRight', formatter: b.label, fontSize: 10, color: theme.muted },
+        },
+        { yAxis: Math.min(b.to, yMax) },
+      ])),
+    },
+  }]));
+
+  const monotonyChart = echarts.init(monotonyEl);
+  monotonyChart.setOption(base({ min: 0 }, [{
+    name: 'Monotony',
+    type: 'line',
+    data: data.days.map(d => [d.date, d.monotony]),
+    showSymbol: false,
+    connectNulls: false,
+    lineStyle: { color: theme.series[4], width: 1.5 },
+    itemStyle: { color: theme.series[4] },
+    markLine: {
+      silent: true,
+      symbol: ['none', 'none'],
+      data: [{ yAxis: MONOTONY_HIGH }],
+      lineStyle: { color: theme.series[5], type: 'dashed', width: 1 },
+      label: { formatter: String(MONOTONY_HIGH), fontSize: 10, color: theme.muted },
+    },
+  }]));
+
+  const c = data.current;
+  const parts = [];
+  if (c && c.acwr != null) parts.push(`Today: ratio ${c.acwr.toFixed(2)} (${bandLabel[c.acwr_band].toLowerCase()})`);
+  if (c && c.monotony != null) parts.push(`monotony ${c.monotony.toFixed(2)}${c.monotony > MONOTONY_HIGH ? ' (high)' : ''}`);
+  if (data.estimated_runs) parts.push(`${data.estimated_runs} run${data.estimated_runs === 1 ? '' : 's'} without HR charged the median rate`);
+  return { charts: [acwrChart, monotonyChart], captionText: parts.join(' · ') };
+}

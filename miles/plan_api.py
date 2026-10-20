@@ -19,7 +19,7 @@ from typing_extensions import TypedDict
 
 from fastapi import APIRouter, HTTPException
 
-from . import db, plan, plan_adherence
+from . import db, heat, plan, plan_adherence
 from .builds import Build
 from .classifier import classify_workout
 from .derive import CHECKPOINT_PACE_COL, connect_derived as _conn, predicted_pace_for_race
@@ -790,6 +790,7 @@ def get_plan_adherence() -> PlanAdherenceResponse | None:
 class WeekEasyOut(TypedDict):
     week_start: str
     avg_pace_min_per_mile: float | None
+    avg_pace_heat_adj_min_per_mile: float | None  # heat.py; equals the raw pace for runs without weather
     avg_hr: float | None
     avg_apparent_temp_f: float | None
     weather_attribution: str | None
@@ -855,23 +856,39 @@ def _easy_progression(conn: sqlite3.Connection, week_starts: list[str]) -> list[
     """, sport_params + [start, end]).fetchall()
     by_week = {r["monday"]: r for r in rows}
 
+    run_rows = conn.execute(f"""
+        SELECT {db.monday_sql("a.start_date")} AS monday, a.moving_time_s, w.temp_c_avg, w.humidity_avg
+        FROM activities a
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
+        WHERE {sport_clause} AND {effective} = 'easy'
+          AND DATE(a.start_date) >= ? AND DATE(a.start_date) <= ?
+    """, sport_params + [start, end]).fetchall()
+    adj_time_by_week: dict[str, float] = {}
+    for rr in run_rows:
+        if rr["moving_time_s"]:
+            adj = float(rr["moving_time_s"]) / heat.heat_factor(rr["temp_c_avg"], rr["humidity_avg"])
+            adj_time_by_week[rr["monday"]] = adj_time_by_week.get(rr["monday"], 0.0) + adj
+
     out: list[WeekEasyOut] = []
     for ws in week_starts:
         r = by_week.get(ws)
         if r is None or not r["total_distance_m"]:
             out.append(WeekEasyOut(
-                week_start=ws, avg_pace_min_per_mile=None, avg_hr=None,
+                week_start=ws, avg_pace_min_per_mile=None, avg_pace_heat_adj_min_per_mile=None, avg_hr=None,
                 avg_apparent_temp_f=None, weather_attribution=None, run_count=0,
             ))
             continue
         distance_mi = float(r["total_distance_m"]) / MILE_M
         pace = (float(r["total_time_s"]) / 60.0) / distance_mi if r["total_time_s"] and distance_mi > 0 else None
+        adj_time = adj_time_by_week.get(ws)
+        adj_pace = (adj_time / 60.0) / distance_mi if adj_time and distance_mi > 0 else None
         hr = round(float(r["hr_weighted"]) / float(r["hr_weight"]), 1) if r["hr_weight"] else None
         temp_c = r["avg_apparent_temp_c"]
         temp_f = round(float(temp_c) * 9.0 / 5 + 32) if temp_c is not None else None
         out.append(WeekEasyOut(
             week_start=ws,
             avg_pace_min_per_mile=round(pace, 2) if pace is not None else None,
+            avg_pace_heat_adj_min_per_mile=round(adj_pace, 2) if adj_pace is not None else None,
             avg_hr=hr,
             avg_apparent_temp_f=temp_f,
             weather_attribution=WEATHER_ATTRIBUTION if temp_f is not None else None,
