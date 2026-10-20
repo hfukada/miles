@@ -20,10 +20,70 @@
     .activities-view .entity-link { color: inherit; text-decoration: none; }
     .activities-view .entity-link:hover { text-decoration: underline; }
     .activities-view .run-type { font-size: 0.6875rem; color: var(--muted); text-transform: capitalize; }
+
+    /* Phones: each row is a card (name + type, then the figures on one
+       wrapped line), the whole card tapping through to the activity. The
+       table layout returns at 640px. */
+    .activities-view .act-table thead { display: none; }
+    .activities-view .act-table, .activities-view .act-table tbody { display: block; }
+    .activities-view .act-table tr {
+      position: relative;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 0.125rem 0.625rem;
+      padding: 0.625rem 0.875rem;
+      border-bottom: 1px solid var(--gridline);
+    }
+    .activities-view .act-table tr:last-child { border-bottom: none; }
+    .activities-view .act-table tbody td {
+      padding: 0;
+      border: none;
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-align: left;
+    }
+    .activities-view .act-table td.act-name {
+      flex: 1 1 0;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .activities-view .act-table td.act-type { order: 1; }
+    /* Line break between the name row and the figures row. */
+    .activities-view .act-table tr::before { content: ""; order: 2; flex-basis: 100%; }
+    .activities-view .act-table td.act-date, .activities-view .act-table td.act-fig { order: 3; }
+    .activities-view .act-table tbody td.dash { display: none; }
+    .activities-view .act-table .entity-link::after { content: ""; position: absolute; inset: 0; }
+    @media (min-width: 640px) {
+      .activities-view .act-table { display: table; }
+      .activities-view .act-table tbody { display: table-row-group; }
+      .activities-view .act-table thead { display: table-header-group; }
+      .activities-view .act-table tr { position: static; display: table-row; padding: 0; border: none; }
+      .activities-view .act-table tr::before { content: none; }
+      .activities-view .act-table .act-unit { display: none; }
+      .activities-view .act-table tbody td {
+        display: table-cell;
+        padding: 0.25rem 0.75rem;
+        border-bottom: 1px solid var(--gridline);
+        color: var(--text-secondary);
+      }
+      .activities-view .act-table tbody td.act-name { overflow: visible; font-size: 0.75rem; font-weight: 400; color: var(--text-secondary); }
+      .activities-view .act-table tbody td.r { text-align: right; }
+      .activities-view .act-table tbody td.dash { display: table-cell; text-align: right; color: var(--baseline); }
+      .activities-view .act-table tbody tr:last-child td { border-bottom: none; }
+      .activities-view .act-table .entity-link::after { content: none; }
+    }
+
     .activities-view .load-more-row { text-align: center; padding: 1rem 0; }
     .activities-view .load-more-btn {
-      font-size: 0.75rem;
+      font-size: 0.8125rem;
       font-weight: 600;
+      width: 100%;
+      min-height: 2.75rem;
       padding: 0.5rem 1.25rem;
       border: 1px solid var(--border);
       border-radius: 6px;
@@ -33,6 +93,9 @@
     }
     .activities-view .load-more-btn:hover { background: var(--pr-bg-hover); }
     .activities-view .load-more-btn:disabled { opacity: 0.5; cursor: default; }
+    @media (min-width: 640px) {
+      .activities-view .load-more-btn { width: auto; min-height: 0; font-size: 0.75rem; }
+    }
   </style>
 </head>
 <body>
@@ -45,7 +108,7 @@
 
   <div id="section-activities" style="display:none">
     <div class="scroll dense">
-      <table>
+      <table class="act-table">
         <thead>
           <tr>
             <th>Date</th>
@@ -87,13 +150,13 @@
     const body = document.getElementById('body-activities');
     body.insertAdjacentHTML('beforeend', rows.map(r => `
       <tr>
-        <td>${esc(r.start_date ? r.start_date.slice(0, 10) : '—')}</td>
-        <td><a class="entity-link" href="/activity.html?id=${r.id}">${esc(r.name ?? 'Untitled')}</a></td>
-        <td><span class="run-type">${esc(r.run_type)}</span></td>
-        ${td(r.distance_mi != null ? `${r.distance_mi.toFixed(2)} mi` : null)}
-        ${td(fmt.time(r.moving_time_s))}
-        ${td(r.pace_min_per_mile != null ? `${fmt.pace(r.pace_min_per_mile)}/mi` : null)}
-        ${td(r.avg_hr)}
+        <td class="act-date">${esc(r.start_date ? r.start_date.slice(0, 10) : '—')}</td>
+        <td class="act-name"><a class="entity-link" href="/activity.html?id=${r.id}">${esc(r.name ?? 'Untitled')}</a></td>
+        <td class="act-type"><span class="run-type">${esc(r.run_type)}</span></td>
+        ${td(r.distance_mi != null ? `${r.distance_mi.toFixed(2)} mi` : null, 'r act-fig')}
+        ${td(fmt.time(r.moving_time_s), 'r act-fig')}
+        ${td(r.pace_min_per_mile != null ? `${fmt.pace(r.pace_min_per_mile)}/mi` : null, 'r act-fig')}
+        ${td(r.avg_hr != null ? `${r.avg_hr}<span class="act-unit"> bpm</span>` : null, 'r act-fig')}
       </tr>
     `).join(''));
   }

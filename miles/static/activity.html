@@ -15,7 +15,7 @@
       font-weight: 650;
       letter-spacing: -0.02em;
     }
-    .activity-view .activity-head { display: flex; align-items: baseline; gap: 0.75rem; margin-bottom: 0.25rem; }
+    .activity-view .activity-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.25rem 0.75rem; margin-bottom: 0.25rem; }
     .activity-view .strava-link { font-size: 0.75rem; font-weight: 500; color: var(--accent); text-decoration: none; }
     .activity-view .strava-link:hover { text-decoration: underline; }
     .activity-view .subtitle { font-size: 0.8125rem; color: var(--muted); margin-bottom: 0.75rem; }
@@ -36,10 +36,10 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 0.75rem 1.25rem;
+      padding: 0.75rem 0.875rem;
       margin-bottom: 1.5rem;
     }
-    .activity-view .classify-field { display: flex; flex-direction: column; gap: 0.25rem; }
+    .activity-view .classify-field { display: flex; flex-direction: column; gap: 0.25rem; flex: 1 1 8rem; }
     .activity-view .classify-field label {
       font-size: 0.625rem;
       font-weight: 600;
@@ -48,7 +48,8 @@
       color: var(--muted);
     }
     .activity-view .classify-field select {
-      font-size: 0.8125rem;
+      min-height: 2.75rem;
+      font-size: 1rem;
       padding: 0.3125rem 0.5rem;
       border-radius: 6px;
       border: 1px solid var(--border);
@@ -56,6 +57,7 @@
       color: var(--text);
     }
     .activity-view .classify-save {
+      min-height: 2.75rem;
       font-size: 0.8125rem;
       font-weight: 600;
       padding: 0.375rem 0.875rem;
@@ -67,41 +69,18 @@
     }
     .activity-view .classify-save:disabled { opacity: 0.5; cursor: default; }
     .activity-view .classify-status { font-size: 0.75rem; color: var(--muted); }
-
-    .activity-view .stat-strip {
-      display: flex;
-      flex-wrap: wrap;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      margin-bottom: 1.5rem;
+    @media (min-width: 640px) {
+      .activity-view .classify-panel { padding: 0.75rem 1.25rem; }
+      .activity-view .classify-field { flex: 0 1 auto; }
+      .activity-view .classify-field select, .activity-view .classify-save { min-height: 0; }
+      .activity-view .classify-field select { font-size: 0.8125rem; }
     }
-    .activity-view .stat { padding: 0.625rem 1.25rem; }
-    .activity-view .stat + .stat { border-left: 1px solid var(--border); }
-    .activity-view .stat-label {
-      font-size: 0.625rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--muted);
-      margin-bottom: 0.1875rem;
-    }
-    .activity-view .stat-value {
-      display: flex;
-      align-items: baseline;
-      gap: 0.375rem;
-      font-size: 1.0625rem;
-      font-weight: 700;
-      font-variant-numeric: tabular-nums;
-      color: var(--text);
-    }
-    .activity-view .stat-sub { font-size: 0.6875rem; font-weight: 400; color: var(--muted); }
 
     .activity-view .chart-panel {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 8px;
-      padding: 0.875rem 1.25rem 1rem;
+      padding: 0.75rem 0.75rem 0.875rem;
       margin-bottom: 1rem;
     }
     .activity-view .chart-panel-head {
@@ -130,22 +109,32 @@
       border-radius: 2px;
       flex-shrink: 0;
     }
-    .activity-view #chart-main { height: 380px; }
-    .activity-view #chart-elevation { height: 140px; }
+    .activity-view #chart-main { height: 280px; }
+    .activity-view #chart-elevation { height: 120px; }
     .activity-view #map-route {
-      height: 320px;
+      height: 260px;
       border-radius: 6px;
       background: var(--bg);
     }
     .activity-view .leaflet-tile-pane { filter: saturate(0.85); }
+    @media (min-width: 640px) {
+      .activity-view .chart-panel { padding: 0.875rem 1.25rem 1rem; }
+      .activity-view #chart-main { height: 380px; }
+      .activity-view #chart-elevation { height: 140px; }
+      .activity-view #map-route { height: 320px; }
+    }
     .activity-view .route-arrow {
       color: var(--accent, #3b82f6);
       font-size: 14px;
       line-height: 1;
       transform-origin: center;
     }
-    .activity-view .dense tbody td { padding: 0.25rem 0.75rem; font-size: 0.75rem; }
-    .activity-view .dense thead th { padding: 0.375rem 0.75rem; font-size: 0.625rem; }
+    .activity-view .dense tbody td { padding: 0.375rem 0.5rem; font-size: 0.75rem; }
+    .activity-view .dense thead th { padding: 0.375rem 0.5rem; font-size: 0.625rem; }
+    @media (min-width: 640px) {
+      .activity-view .dense tbody td { padding: 0.25rem 0.75rem; }
+      .activity-view .dense thead th { padding: 0.375rem 0.75rem; }
+    }
     .activity-view .terrain-note { font-size: 0.75rem; color: var(--muted); font-style: italic; margin-bottom: 0.5rem; }
   </style>
 </head>
@@ -276,12 +265,12 @@
                   <th>Lap</th>
                   <th class="r">Distance</th>
                   <th class="r">Duration</th>
-                  <th class="r">Min Pace</th>
-                  <th class="r">Median Pace</th>
-                  <th class="r">Max Pace</th>
-                  <th class="r">Min HR</th>
-                  <th class="r">Median HR</th>
-                  <th class="r">Max HR</th>
+                  <th class="r hide-sm">Min Pace</th>
+                  <th class="r"><span class="hide-sm">Median </span>Pace</th>
+                  <th class="r hide-sm">Max Pace</th>
+                  <th class="r hide-sm">Min HR</th>
+                  <th class="r"><span class="hide-sm">Median </span>HR</th>
+                  <th class="r hide-sm">Max HR</th>
                 </tr>
               </thead>
               <tbody id="body-laps"></tbody>
@@ -707,9 +696,10 @@
     if (!mainChart) mainChart = echarts.init(document.getElementById('chart-main'));
     mainChart.setOption({
       animation: false,
-      grid: { top: 24, right: 56, bottom: 32, left: 56 },
+      grid: theme.compact ? { top: 24, right: 36, bottom: 32, left: 40 } : { top: 24, right: 56, bottom: 32, left: 56 },
       tooltip: {
         trigger: 'axis',
+        confine: theme.compact,
         backgroundColor: theme.surface,
         borderColor: theme.gridline,
         textStyle: { fontSize: 12, color: theme.text },
@@ -740,6 +730,7 @@
         type: 'value',
         min: 0,
         max: t.length ? t[t.length - 1] : undefined,
+        splitNumber: theme.compact ? 4 : undefined,
         axisLabel: { formatter: (v) => fmtElapsed(v), color: theme.muted, fontSize: 10 },
         axisLine: { lineStyle: { color: theme.gridline } },
         splitLine: { show: false },
@@ -769,9 +760,10 @@
     if (!elevChart) elevChart = echarts.init(document.getElementById('chart-elevation'));
     elevChart.setOption({
       animation: false,
-      grid: { top: 12, right: 56, bottom: 28, left: 56 },
+      grid: theme.compact ? { top: 12, right: 36, bottom: 28, left: 40 } : { top: 12, right: 56, bottom: 28, left: 56 },
       tooltip: {
         trigger: 'axis',
+        confine: theme.compact,
         backgroundColor: theme.surface,
         borderColor: theme.gridline,
         textStyle: { fontSize: 12, color: theme.text },
@@ -785,6 +777,7 @@
         type: 'value',
         min: 0,
         max: t.length ? t[t.length - 1] : undefined,
+        splitNumber: theme.compact ? 4 : undefined,
         axisLabel: { formatter: (v) => fmtElapsed(v), color: theme.muted, fontSize: 10 },
         axisLine: { lineStyle: { color: theme.gridline } },
         splitLine: { show: false },
@@ -848,12 +841,12 @@
         <td>${m.lap_index}</td>
         <td class="r">${m.own_distance_mi != null ? `${m.own_distance_mi.toFixed(2)} mi` : '—'}</td>
         <td class="r">${m.duration_s != null ? fmtElapsed(m.duration_s) : '—'}</td>
-        <td class="r">${m.min_pace_min_per_mile != null ? `${fmt.pace(m.min_pace_min_per_mile)}/mi` : '—'}</td>
+        <td class="r hide-sm">${m.min_pace_min_per_mile != null ? `${fmt.pace(m.min_pace_min_per_mile)}/mi` : '—'}</td>
         <td class="r">${m[medianField] != null ? `${fmt.pace(m[medianField])}/mi` : '—'}</td>
-        <td class="r">${m.max_pace_min_per_mile != null ? `${fmt.pace(m.max_pace_min_per_mile)}/mi` : '—'}</td>
-        <td class="r">${m.min_hr != null ? Math.round(m.min_hr) : '—'}</td>
+        <td class="r hide-sm">${m.max_pace_min_per_mile != null ? `${fmt.pace(m.max_pace_min_per_mile)}/mi` : '—'}</td>
+        <td class="r hide-sm">${m.min_hr != null ? Math.round(m.min_hr) : '—'}</td>
         <td class="r">${m.median_hr != null ? Math.round(m.median_hr) : '—'}</td>
-        <td class="r">${m.max_hr != null ? Math.round(m.max_hr) : '—'}</td>
+        <td class="r hide-sm">${m.max_hr != null ? Math.round(m.max_hr) : '—'}</td>
       </tr>
     `).join('');
   }
@@ -890,12 +883,12 @@
       return `
         <tr>
           <td>${c.kind === 'climb' ? 'Climb' : 'Descent'}</td>
-          <td class="r">${startMi} mi</td>
-          <td class="r">${lengthMi} mi</td>
+          <td class="r hide-sm">${startMi} mi</td>
+          <td class="r hide-sm">${lengthMi} mi</td>
           <td class="r">${c.avg_grade_pct.toFixed(1)}%</td>
           <td class="r">${actualPace != null ? `${actualPace}/mi` : '—'}</td>
           <td class="r">${expectedPace}/mi</td>
-          <td class="r">${c.percentile != null ? fmt.ordinal(Math.round(c.percentile)) : '—'}</td>
+          <td class="r hide-sm">${c.percentile != null ? fmt.ordinal(Math.round(c.percentile)) : '—'}</td>
         </tr>
       `;
     }).join('') : '<tr><td colspan="7" class="dash">No sustained climbs or descents.</td></tr>';
@@ -911,12 +904,12 @@
             <thead>
               <tr>
                 <th>Kind</th>
-                <th class="r">Start</th>
-                <th class="r">Length</th>
+                <th class="r hide-sm">Start</th>
+                <th class="r hide-sm">Length</th>
                 <th class="r">Grade</th>
                 <th class="r">Actual Pace</th>
                 <th class="r">Expected Pace</th>
-                <th class="r">Percentile</th>
+                <th class="r hide-sm">Percentile</th>
               </tr>
             </thead>
             <tbody>${rows}</tbody>

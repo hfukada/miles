@@ -20,16 +20,20 @@
 
     .dist-empty { font-size: 0.8125rem; color: var(--muted); padding: 1rem 0; }
 
-    /* Stat strip — ported from lab/variant-c.js, scoped to distance tabs. */
-    .dist-view .stat-strip {
-      display: flex;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      margin-bottom: 1.25rem;
+    /* Stat strip — ported from lab/variant-c.js, scoped to distance tabs.
+       Phones use theme.css's shared two-column .stat-strip. */
+    .dist-view .stat-strip { margin-bottom: 1.25rem; }
+    @media (min-width: 640px) {
+      .dist-view .stat-strip {
+        display: flex;
+        flex-wrap: nowrap;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+      }
+      .dist-view .stat { padding: 0.625rem 1.25rem; }
+      .dist-view .stat + .stat { border-left: 1px solid var(--border); }
     }
-    .dist-view .stat { padding: 0.625rem 1.25rem; }
-    .dist-view .stat + .stat { border-left: 1px solid var(--border); }
     .dist-view .stat-label {
       font-size: 0.625rem;
       font-weight: 600;
