@@ -23,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
 from starlette.types import Scope
 
-from . import areas, db, outbound, plan, route_search, routes, strava_budget, strava_client, streams, sync, terrain
+from . import areas, db, heat, outbound, plan, route_search, routes, strava_budget, strava_client, streams, sync, terrain
 from .build_paces import PaceClaim, pace_claims
 from .fitness import FT_PER_M
 from .classifier import LAP_MIN_DISTANCE_M, LAP_MIN_MOVING_TIME_S, WORKOUT_LABEL_PATTERNS, classify_workout
@@ -39,6 +39,7 @@ from .areas_api import router as areas_api_router
 from .candidates_api import router as candidates_api_router
 from .fitness_api import router as fitness_api_router
 from .health_api import router as health_api_router
+from .load_api import router as load_api_router
 from .plan_api import router as plan_api_router
 from .routes_api import router as routes_api_router
 from .terrain_api import router as terrain_api_router
@@ -1387,6 +1388,7 @@ class HrPacePoint(TypedDict):
     year: int
     hr_bucket: int  # bpm, bucket lower bound
     pace_bucket: int  # seconds/mile, bucket lower bound
+    pace_bucket_heat_adj: int  # same, from the heat-adjusted pace (heat.py); equals pace_bucket without weather
 
 
 @app.get("/api/hr-pace-heatmap")
@@ -1402,6 +1404,7 @@ def get_hr_pace_heatmap() -> list[HrPacePoint]:
     rows = conn.execute(f"""
         SELECT
             CAST(strftime('%Y', a.start_date) AS INTEGER) AS year,
+            a.activity_id AS activity_id,
             l.average_heartrate AS hr,
             l.distance_m AS distance_m,
             l.moving_time_s AS moving_time_s
@@ -1413,13 +1416,16 @@ def get_hr_pace_heatmap() -> list[HrPacePoint]:
           AND l.moving_time_s >= {LAP_MIN_MOVING_TIME_S}
     """, tp).fetchall()
 
+    factors = heat.activity_heat_factors(conn, list({int(r["activity_id"]) for r in rows}))
     out: list[HrPacePoint] = []
     for r in rows:
         miles = r["distance_m"] / 1609.34
         pace_s_per_mile = r["moving_time_s"] / miles
+        adj_pace_s_per_mile = pace_s_per_mile / factors.get(int(r["activity_id"]), 1.0)
         hr_bucket = int(r["hr"] // _HR_BUCKET_WIDTH) * _HR_BUCKET_WIDTH
         pace_bucket = int(pace_s_per_mile // _PACE_BUCKET_WIDTH_S) * _PACE_BUCKET_WIDTH_S
-        out.append(HrPacePoint(year=r["year"], hr_bucket=hr_bucket, pace_bucket=pace_bucket))
+        adj_bucket = int(adj_pace_s_per_mile // _PACE_BUCKET_WIDTH_S) * _PACE_BUCKET_WIDTH_S
+        out.append(HrPacePoint(year=r["year"], hr_bucket=hr_bucket, pace_bucket=pace_bucket, pace_bucket_heat_adj=adj_bucket))
     return out
 
 
@@ -1511,6 +1517,7 @@ app.include_router(candidates_api_router)
 app.include_router(distance_builds_router)
 app.include_router(fitness_api_router)
 app.include_router(health_api_router)
+app.include_router(load_api_router)
 app.include_router(plan_api_router)
 app.include_router(routes_api_router)
 app.include_router(terrain_api_router)

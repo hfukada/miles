@@ -178,7 +178,7 @@ Opens a local web interface at `http://localhost:8000` with six pages:
 - **Races** — race history and PRs, with a build-comparison chart and dense per-build pace tables broken out by distance (5K/10K/Half/Marathon/50K/Other)
 - **Builds** — every detected training build, one row per race, with shape sparklines and volume/workout stats
 - **Compare** — put up to four builds (same distance bucket) side by side, chart and stat table
-- **Training** — training periods, weekly volume with race markers, and a fitness-trend chart with evidence drill-down
+- **Training** — training periods, weekly volume with race markers, a fitness-trend chart with evidence drill-down, load (acute:chronic ratio and monotony from HR-weighted TRIMP), weekly easy/moderate/hard time by HR and by pace, and the HR-vs-pace efficiency chart with an optional heat adjustment
 - **Years** — year-by-year volume comparison
 - **Plan** — the active training plan vs reality. A **Today** view (today's session, the week at a glance, how the week is going, and a same-weekday comparison to last week) and an **Overall** view (planned-vs-actual weekly chart with adherence bands, color-coded weekly calendar with clickable day details, progression charts, version history); becomes a race retrospective once the goal race is run. Plans are drafted incrementally in conversation via the `miles:miles-plan` skill
 
@@ -186,7 +186,7 @@ Opens a local web interface at `http://localhost:8000` with six pages:
 
 The tool descriptions the server publishes are the reference; ask Claude Code what a tool does.
 They cover training analysis (mileage, activities, blocks, periods, consistency), races and
-builds, fitness estimates, workouts and laps, weather, training plans (draft, commit, adherence),
+builds, fitness estimates, intensity distribution and training load (injury-risk ratios), workouts and laps, weather, training plans (draft, commit, adherence),
 stored routes (compare, compose, junctions, proximity), the terrain model, area import, area
 surveys (the stretches worth running around a start, with the athlete's own adjustments and
 exclusions) and route search (routes assembled around chosen sections, with a random walk as

@@ -6,13 +6,13 @@
 const NAV_LINKS = [
   { href: "/plan.html", label: "Plan" },
   { href: "/activities.html", label: "Activities" },
-  { href: "/races.html", label: "Races" },
+  { href: "/training.html", label: "Training" },
   {
     label: "History",
     children: [
       { href: "/builds.html", label: "Builds" },
       { href: "/compare.html", label: "Compare" },
-      { href: "/training.html", label: "Training" },
+      { href: "/races.html", label: "Races" },
       { href: "/years.html", label: "Years" },
       { href: "/terrain.html", label: "Terrain" },
     ],
