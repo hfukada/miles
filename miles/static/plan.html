@@ -1829,7 +1829,7 @@
     rootEl('trends').insertAdjacentHTML('beforeend', `
       <section id="section-progression-easy">
         <h2>Easy HR/pace progression</h2>
-        <p class="desc">Distance-weighted average over each week's easy runs · gaps are weeks with no easy run synced · hover for average apparent temperature</p>
+        <p class="desc">Distance-weighted average over each week's easy runs · gaps are weeks with no easy run synced · hover for average apparent temperature · heat-adjusted corrects each run to cool conditions (temperature + dew point); click the legend to toggle</p>
         <div style="display:flex;gap:1rem;flex-wrap:wrap">
           <div style="flex:1;min-width:280px">
             <div class="subchart-label">Pace</div>
@@ -1846,6 +1846,7 @@
 
     const theme = chartTheme();
     const paceData = weeks.map((ws, i) => [ws, easy[i].avg_pace_min_per_mile]);
+    const paceAdjData = weeks.map((ws, i) => [ws, easy[i].avg_pace_heat_adj_min_per_mile]);
     const hrData = weeks.map((ws, i) => [ws, easy[i].avg_hr]);
 
     function tooltipFor(params) {
@@ -1854,6 +1855,9 @@
       if (!e) return '';
       const parts = [];
       if (e.avg_pace_min_per_mile != null) parts.push(`Pace: ${fmt.pace(e.avg_pace_min_per_mile)}/mi`);
+      if (e.avg_pace_heat_adj_min_per_mile != null && e.avg_pace_heat_adj_min_per_mile !== e.avg_pace_min_per_mile) {
+        parts.push(`Heat-adjusted: ${fmt.pace(e.avg_pace_heat_adj_min_per_mile)}/mi`);
+      }
       if (e.avg_hr != null) parts.push(`HR: ${e.avg_hr}`);
       if (e.avg_apparent_temp_f != null) parts.push(`Feels like: ${Math.round(e.avg_apparent_temp_f)}°F`);
       parts.push(`${e.run_count} easy run${e.run_count === 1 ? '' : 's'}`);
@@ -1899,7 +1903,20 @@
     }
 
     const paceChart = echarts.init(document.getElementById('chart-easy-pace'));
-    paceChart.setOption(baseOption('Easy pace', paceData, { inverse: true, axisLabel: { fontSize: 10, color: theme.muted, formatter: fmt.pace } }));
+    const paceOption = baseOption('Easy pace', paceData, { inverse: true, axisLabel: { fontSize: 10, color: theme.muted, formatter: fmt.pace } });
+    paceOption.series.push({
+      name: 'Heat-adjusted',
+      type: 'line',
+      data: paceAdjData,
+      connectNulls: false,
+      showSymbol: true,
+      symbolSize: 5,
+      lineStyle: { color: theme.series[1], width: 1.5, type: 'dashed' },
+      itemStyle: { color: theme.series[1] },
+    });
+    paceOption.legend = { top: 0, right: 0, textStyle: { fontSize: 10, color: theme.muted }, itemWidth: 14, itemHeight: 8 };
+    paceOption.grid = { ...paceOption.grid, top: 28 };
+    paceChart.setOption(paceOption);
     TAB_CHARTS.trends.push(paceChart);
 
     const hrChart = echarts.init(document.getElementById('chart-easy-hr'));
@@ -2070,6 +2087,28 @@
   // -----------------------------------------------------------------------
 
   const RECENT_MILEAGE_WEEKS = 16;
+  const LOAD_WEEKS = 9; // ~2 months
+
+  function renderLoad(loadData, loadError) {
+    if (!loadData && !loadError) return;
+    rootEl('trends').insertAdjacentHTML('beforeend', `
+      <section id="section-load">
+        <h2>Load</h2>
+        <p class="desc">Last 2 months · acute:chronic ratio — 7-day TRIMP load ÷ the 28-day weekly average · shaded: under 0.8 low, 0.8–1.3 optimal, 1.3–1.5 caution, over 1.5 high · population heuristics, not a diagnosis</p>
+        <div class="chart-wrap-small"><div id="chart-acwr" style="width:100%;height:100%"></div></div>
+        <div class="subchart-label" style="margin-top:0.75rem">Monotony (over 2 = little day-to-day variation)</div>
+        <div class="chart-wrap-small"><div id="chart-monotony" style="width:100%;height:100%"></div></div>
+        <p class="chart-caption" id="load-caption"></p>
+      </section>`);
+    const caption = document.getElementById('load-caption');
+    if (loadError) { caption.textContent = `Error loading load: ${loadError.message}`; return; }
+    if (loadData.note || !loadData.days.length) { caption.textContent = loadData.note ?? ''; return; }
+    const { charts, captionText } = renderLoadCharts(
+      document.getElementById('chart-acwr'), document.getElementById('chart-monotony'), loadData);
+    caption.textContent = captionText;
+    TAB_CHARTS.trends.push(...charts);
+    window.addEventListener('resize', () => charts.forEach(c => c.resize()));
+  }
 
   function renderRecentMileage(weeklyHistory) {
     if (!weeklyHistory || !weeklyHistory.weeks.length) return;
@@ -2680,6 +2719,12 @@
     return res.json();
   }
 
+  async function loadLoad() {
+    const res = await fetch(`/api/load?weeks=${LOAD_WEEKS}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
   async function loadWeeklyHistory() {
     const res = await fetch('/api/weekly-history');
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -2712,8 +2757,9 @@
       loadToday().catch(() => null),
       loadWeeklyHistory().catch(() => null),
       progressionPromise.catch(() => null),
+      loadLoad().then(d => ({ data: d, error: null }), err => ({ data: null, error: err })),
     ]);
-  }).then(([data, versions, adherence, retrospective, readiness, today, weeklyHistory, progression]) => {
+  }).then(([data, versions, adherence, retrospective, readiness, today, weeklyHistory, progression, load]) => {
     const status = data ? data.plan.status : null;
 
     // actualByDate merges /api/today's map on top of the plan's own (when
@@ -2758,6 +2804,7 @@
     renderProgressionEasy(progression);
     renderProgressionWorkouts(progression);
     renderRecentMileage(weeklyHistory);
+    renderLoad(load.data, load.error);
     renderFitnessStrip(progression);
 
     activatePlanTab((location.hash || '#today').replace('#', ''));

@@ -7,7 +7,7 @@ from typing import Literal, Sequence, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import areas_mcp, db, elevation, outbound, outbound_mcp, route_locations, routing_mcp
+from . import areas_mcp, db, elevation, heat, load_mcp, outbound, outbound_mcp, route_locations, routing_mcp
 from . import routes as routes_service
 from .terrain_mcp import register_terrain_tools
 from .weather import ATTRIBUTION as WEATHER_ATTRIBUTION
@@ -88,6 +88,7 @@ _PACE_KEYS = frozenset({
     "pace_min_per_mile", "avg_pace_min_per_mile", "avg_pace",
     "avg_rep_pace", "best_rep_pace", "pace_min_mi", "avg_pace_min_mi",
     "first_half_pace", "second_half_pace", "pace_lo", "pace_hi",
+    "avg_pace_heat_adj_min_mi",
 })
 
 
@@ -1356,6 +1357,9 @@ def get_easy_hr_trend(months: int = 36) -> str:
     Returns months with avg_hr, avg_pace_min_mi, run_count. When the athlete has a configured
     max HR, each month also carries avg_pct_max (avg_hr as % of max HR) — conventionally,
     easy running sits around 70-80% of max. Omitted entirely when no max HR is configured.
+    avg_pace_heat_adj_min_mi is the same average with each run's pace corrected to cool
+    conditions by the temperature + dew point rule (equals the raw pace for runs with no
+    weather); compare the two before reading a summer slowdown as lost fitness.
     Filtered to easy-tagged runs only.
     """
     conn = _conn()
@@ -1380,6 +1384,23 @@ def get_easy_hr_trend(months: int = 36) -> str:
     """, type_params + [cutoff]).fetchall()
 
     results = [dict(r) for r in rows]
+    adj_speeds: dict[str, list[float]] = {}
+    for r in conn.execute(f"""
+        SELECT strftime('%Y-%m', a.start_date) AS month, a.average_speed_mps, w.temp_c_avg, w.humidity_avg
+        FROM activities a
+        LEFT JOIN weather w ON w.activity_id = a.activity_id
+        WHERE {type_clause}
+          AND a.run_type = 'easy'
+          AND a.average_heartrate IS NOT NULL
+          AND a.average_speed_mps > 0
+          AND a.start_date >= ?
+    """, type_params + [cutoff]).fetchall():
+        adj_speeds.setdefault(r["month"], []).append(
+            float(r["average_speed_mps"]) * heat.heat_factor(r["temp_c_avg"], r["humidity_avg"])
+        )
+    for r in results:
+        speeds = adj_speeds.get(cast(str, r["month"]))
+        r["avg_pace_heat_adj_min_mi"] = round(26.8224 / (sum(speeds) / len(speeds)), 2) if speeds else None
     athlete = db.get_athlete(conn)
     max_hr = athlete["max_hr"] if athlete else None
     if max_hr:
@@ -2836,6 +2857,7 @@ register_terrain_tools(mcp)
 areas_mcp.register_area_tools(mcp)
 outbound_mcp.register_outbound_tools(mcp)
 routing_mcp.register_routing_tools(mcp)
+load_mcp.register_load_tools(mcp)
 
 
 def main() -> None:
