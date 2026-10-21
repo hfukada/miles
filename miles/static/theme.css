@@ -633,3 +633,31 @@ tr.sub3:hover td { background: var(--sub3-bg-hover); }
 @media (prefers-reduced-motion: reduce) {
   .skeleton { animation: none; }
 }
+
+/* Route-candidate cards (candidate-cards.js), inside a .cand-view page. */
+.cand-view { max-width: 760px; }
+.cand-view .subtitle { margin-bottom: 1rem; }
+.cand-view h2 { font-size: 1rem; font-weight: 650; letter-spacing: -0.01em; }
+.cand-view .cand-sub { font-size: 0.8125rem; color: var(--muted); margin-bottom: 0.5rem; }
+.cand-view .cand-miss { font-size: 0.8125rem; color: var(--series-6); margin-bottom: 0.5rem; }
+.cand-view .cand-note { font-size: 0.875rem; color: var(--text-secondary); margin-bottom: 0.75rem; white-space: pre-wrap; }
+.cand-view .stat-strip { margin-bottom: 0.75rem; }
+.cand-view .cand-start { font-size: 0.8125rem; color: var(--text-secondary); margin-bottom: 0.75rem; }
+.cand-view .cand-map { height: 280px; border-radius: 6px; }
+.cand-view .cand-elev { height: 160px; margin-top: 0.5rem; }
+.cand-view .cand-why { margin-top: 0.75rem; font-size: 0.8125rem; }
+.cand-view .cand-why summary { cursor: pointer; color: var(--text-secondary); }
+.cand-view .cand-why dl { display: grid; grid-template-columns: 1fr auto; gap: 0.125rem 1rem; margin: 0.5rem 0 0; max-width: 360px; }
+.cand-view .cand-why dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+.cand-view .cand-actions { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem; font-size: 0.8125rem; }
+.cand-view .cand-actions button {
+  font: inherit; padding: 0.4375rem 0.875rem;
+  color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+}
+.cand-view .cand-actions button:disabled { color: var(--muted); cursor: default; }
+.cand-view .cand-actions .error { padding: 0; color: var(--series-6); }
+@media (max-width: 640px) {
+  .cand-view .chart-panel { padding: 0.75rem; }
+  .cand-view .stat { padding: 0.5rem 0.75rem; flex: 1 1 30%; }
+  .cand-view .cand-map { height: 240px; }
+}

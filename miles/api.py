@@ -42,6 +42,7 @@ from .health_api import router as health_api_router
 from .load_api import router as load_api_router
 from .plan_api import router as plan_api_router
 from .routes_api import router as routes_api_router
+from .searches_api import router as searches_api_router
 from .terrain_api import router as terrain_api_router
 from .builds import Build, detect_builds
 from .derive import connect_derived as _conn, derive_all
@@ -1617,6 +1618,7 @@ app.include_router(health_api_router)
 app.include_router(load_api_router)
 app.include_router(plan_api_router)
 app.include_router(routes_api_router)
+app.include_router(searches_api_router)
 app.include_router(terrain_api_router)
 
 # Lift the MCP transport's exact-path /mcp route onto this app directly.

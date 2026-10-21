@@ -1,4 +1,4 @@
-"""HTTP receiving end of miles-area-import. No auth, like every other endpoint."""
+"""HTTP area list and the receiving end of miles-area-import. No auth, like every other endpoint."""
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -23,6 +23,12 @@ class ImportTilesBody(BaseModel):
     tiles: list[ImportTileBody]
     pinned: bool | None = None
     source: str = "extract:cli"
+
+
+@router.get("/api/areas")
+def list_areas() -> list[areas_service.AreaSummary]:
+    with db.connection() as conn:
+        return areas_service.list_areas(conn)
 
 
 @router.post("/api/areas/import-tiles")

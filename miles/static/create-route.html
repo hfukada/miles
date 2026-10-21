@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Miles · Create a route</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏃</text></svg>">
+  <link rel="stylesheet" href="/theme.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
+  <style>
+    .cand-view .lede { margin-bottom: 1rem; }
+    .cand-view .form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: 0.75rem; margin-top: 0.75rem; }
+    .cand-view .field { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.75rem; color: var(--text-secondary); min-width: 0; }
+    .cand-view .field input, .cand-view .field select {
+      font: inherit; font-size: 0.875rem; padding: 0.375rem 0.5rem; min-width: 0;
+      color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+    }
+    .cand-view .field input[type=range] { padding: 0; }
+    .cand-view .start-map { height: 220px; border-radius: 6px; }
+    .cand-view .start-hint { font-size: 0.75rem; color: var(--muted); margin: 0.375rem 0 0; }
+    .cand-view .primary {
+      font: inherit; font-size: 0.875rem; font-weight: 600; padding: 0.5rem 1.25rem; margin-top: 1rem;
+      color: #fff; background: var(--accent); border: 0; border-radius: 6px; cursor: pointer;
+    }
+    .cand-view .primary:disabled { opacity: 0.5; cursor: default; }
+    .cand-view .secondary {
+      font: inherit; font-size: 0.8125rem; padding: 0.375rem 0.875rem;
+      color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+    }
+    .cand-view .secondary:disabled { color: var(--muted); cursor: default; }
+    .cand-view .status-line { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; font-size: 0.875rem; }
+    .cand-view .status-note { font-size: 0.8125rem; color: var(--muted); margin: 0.375rem 0 0; }
+    .cand-view .skeleton-field { height: 2.25rem; }
+  </style>
+</head>
+<body>
+<script src="/nav.js"></script>
+<script src="/charts.js"></script>
+<script src="/map.js"></script>
+<script src="/candidate-cards.js"></script>
+
+<main class="cand-view page-view">
+  <h1>Create a route</h1>
+  <p class="subtitle lede">Search an imported area for runs that fit a distance, with no other weighting.</p>
+
+  <section class="chart-panel" id="form-panel">
+    <div class="skeleton skeleton-field"></div>
+  </section>
+
+  <div id="status"></div>
+  <div id="results"></div>
+</main>
+
+<script>
+  const formPanel = document.getElementById('form-panel');
+  const statusEl = document.getElementById('status');
+  const resultsEl = document.getElementById('results');
+
+  let areas = [];
+  let startMap = null;
+  let startMarker = null;
+  let areaCircle = null;
+  let runToken = 0;
+
+  const option = (value, label, selected) => `<option value="${value}"${selected ? ' selected' : ''}>${esc(label)}</option>`;
+  const choice = (id, label, values) =>
+    `<label class="field">${label}<select id="${id}">${values.map(([v, l]) => option(v, l)).join('')}</select></label>`;
+
+  function renderForm() {
+    formPanel.innerHTML = `
+      <div class="form-grid">
+        <label class="field">Area<select id="area">${areas.map(a => option(a.area_id, a.label)).join('')}</select></label>
+        <label class="field">Distance min (mi)<input id="dmin" type="number" min="0.5" step="0.5" value="5"></label>
+        <label class="field">Distance max (mi)<input id="dmax" type="number" min="0.5" step="0.5" value="8"></label>
+        ${choice('purpose', 'Purpose', [['', 'None'], ['easy', 'Easy'], ['workout', 'Workout'], ['long', 'Long'], ['hilly', 'Hilly']])}
+        ${choice('surface', 'Surface', [['', 'Any'], ['singletrack', 'Singletrack'], ['track', 'Track'], ['paved', 'Paved']])}
+        ${choice('shape', 'Shape', [['any', 'Any'], ['loop', 'Loop'], ['out_and_back', 'Out and back'], ['lollipop', 'Lollipop']])}
+        <label class="field">Routes to find<input id="n" type="number" min="1" max="10" step="1" value="5"></label>
+        <label class="field"><span>Repeats: <span id="repeat-out">0.5</span></span>
+          <input id="repeat" type="range" min="0" max="1" step="0.05" value="0.5"></label>
+      </div>
+      <div class="chart-panel-title" style="margin-top:1rem">Start</div>
+      <div id="start-map" class="start-map"></div>
+      <p class="start-hint" id="start-hint"></p>
+      <button class="primary" id="generate" type="button">Generate</button>`;
+
+    document.getElementById('repeat').addEventListener('input', (e) => {
+      document.getElementById('repeat-out').textContent = e.target.value;
+    });
+    document.getElementById('area').addEventListener('change', centerOnArea);
+    document.getElementById('generate').addEventListener('click', generate);
+
+    startMap = L.map('start-map');
+    addBaseLayer(startMap);
+    startMap.on('click', (e) => setStart(e.latlng));
+    centerOnArea();
+  }
+
+  const selectedArea = () => areas.find(a => String(a.area_id) === document.getElementById('area').value);
+
+  function setStart(latlng) {
+    startMarker.setLatLng(latlng);
+    document.getElementById('start-hint').textContent =
+      `Start ${latlng.lat.toFixed(4)}, ${latlng.lng.toFixed(4)}. Click the map to move it.`;
+  }
+
+  function centerOnArea() {
+    const area = selectedArea();
+    const center = L.latLng(area.center_lat, area.center_lng);
+    areaCircle?.remove();
+    startMap.setView(center, 13);  // a circle can only be added to a map that has a view
+    areaCircle = L.circle(center, { radius: area.radius_km * 1000, color: '#2563eb', weight: 2, fill: false, interactive: false }).addTo(startMap);
+    startMap.fitBounds(areaCircle.getBounds());
+    startMarker ??= L.marker(center).addTo(startMap);
+    setStart(center);
+  }
+
+  const formatElapsed = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+  function requestBody() {
+    const value = (id) => document.getElementById(id).value;
+    const at = startMarker.getLatLng();
+    return {
+      area_id: Number(value('area')),
+      start_lat: at.lat,
+      start_lng: at.lng,
+      distance_mi_min: Number(value('dmin')),
+      distance_mi_max: Number(value('dmax')),
+      purpose: value('purpose') || null,
+      surface_preference: value('surface') || null,
+      shape: value('shape'),
+      n: Number(value('n')),
+      repeat_value: Number(value('repeat')),
+      seed: Math.floor(Math.random() * 2 ** 31),
+    };
+  }
+
+  async function post(url, body) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      return res.ok ? { data: await res.json() } : { error: await failure(res) };
+    } catch (e) {
+      return { error: 'Network error.' };
+    }
+  }
+
+  function showError(message) {
+    statusEl.innerHTML = `<section class="chart-panel"><div class="error">${esc(message)}</div></section>`;
+  }
+
+  async function generate() {
+    const button = document.getElementById('generate');
+    const token = ++runToken;
+    button.disabled = true;
+    disposeCards();
+    resultsEl.innerHTML = '';
+    statusEl.innerHTML = '<section class="chart-panel"><div class="skeleton skeleton-field"></div></section>';
+
+    const started = await post('/api/searches', requestBody());
+    if (token !== runToken) return;
+    if (started.error) {
+      button.disabled = false;
+      showError(started.error);
+      return;
+    }
+
+    let view = started.data;
+    const received = Date.now();
+    const base = view.elapsed_s;
+    const tick = setInterval(() => {
+      const el = document.getElementById('elapsed');
+      if (el) el.textContent = formatElapsed(base + (Date.now() - received) / 1000);
+    }, 1000);
+    try {
+      while (token === runToken && (view.status === 'queued' || view.status === 'running')) {
+        renderWaiting(view, token);
+        const res = await getJson(`/api/searches/${view.search_id}?wait_s=5`);
+        if (token !== runToken) return;
+        if (res.error) {
+          showError(res.error);
+          button.disabled = false;
+          return;
+        }
+        view = res.data;
+      }
+    } finally {
+      clearInterval(tick);
+    }
+    button.disabled = false;
+    renderFinal(view);
+  }
+
+  function renderWaiting(view, token) {
+    const phase = view.status === 'queued' ? 'Waiting for another search to finish' : 'Searching';
+    if (statusEl.querySelector('#elapsed')) {
+      document.getElementById('qualifying').textContent = view.qualifying;
+      document.getElementById('phase').textContent = phase;
+      return;
+    }
+    statusEl.innerHTML = `
+      <section class="chart-panel">
+        <div class="status-line">
+          <span><strong id="phase"></strong> · <span id="elapsed">${formatElapsed(view.elapsed_s)}</span>
+            · <span id="qualifying">${view.qualifying}</span> qualifying so far</span>
+          <button class="secondary" id="cancel" type="button">Cancel</button>
+        </div>
+        <p class="status-note">Searches can take a few minutes. Routes appear when it finishes.</p>
+      </section>`;
+    document.getElementById('phase').textContent = phase;
+    document.getElementById('cancel').addEventListener('click', async (e) => {
+      if (token !== runToken) return;
+      e.currentTarget.disabled = true;
+      e.currentTarget.textContent = 'Cancelling…';
+      runToken++;
+      const res = await post(`/api/searches/${view.search_id}/cancel`);
+      document.getElementById('generate').disabled = false;
+      if (res.error) showError(res.error);
+      else renderFinal(res.data);
+    });
+  }
+
+  function renderFinal(view) {
+    disposeCards();
+    const generateButton = document.getElementById('generate');
+    generateButton.textContent = 'Regenerate';
+    resultsEl.innerHTML = view.candidates.map(cardHtml).join('');
+    mountCards(resultsEl);
+    if (view.status === 'error') {
+      showError(view.error ?? 'The search failed.');
+      return;
+    }
+    const notes = [];
+    if (view.status === 'cancelled') notes.push(`Cancelled with ${view.candidates.length} found.`);
+    if (!view.candidates.length) notes.push('No routes found. Try a wider distance range or another start.');
+    else if (view.near_miss) notes.push('No route met every constraint; these are the closest.');
+    if (view.budget_exceeded) notes.push('The time budget ran out before enough routes qualified, so the results may be thin.');
+    statusEl.innerHTML = notes.length
+      ? `<section class="chart-panel">${notes.map(n => `<div class="status-note">${esc(n)}</div>`).join('')}</section>`
+      : '';
+  }
+
+  async function main() {
+    const res = await getJson('/api/areas');
+    if (res.error) {
+      formPanel.innerHTML = `<div class="error">Could not load areas: ${esc(res.error)}</div>`;
+      return;
+    }
+    areas = res.data.filter(a => a.status === 'ready');
+    if (!areas.length) {
+      formPanel.innerHTML = '<div class="loading">No imported areas are ready. Import one first.</div>';
+      return;
+    }
+    renderForm();
+  }
+
+  main();
+</script>
+</body>
+</html>

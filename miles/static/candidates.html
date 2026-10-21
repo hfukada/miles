@@ -9,38 +9,12 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H" crossorigin="anonymous">
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.6.0/dist/echarts.min.js" integrity="sha384-pPi0zxBAoDu6+JXW/C68UZLvBUUtU+7zonhif43rqj7pxsGyqyqzcian2Rj37Rss" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH" crossorigin="anonymous"></script>
-  <style>
-    .cand-view { max-width: 760px; }
-    .cand-view .subtitle { margin-bottom: 1rem; }
-    .cand-view h2 { font-size: 1rem; font-weight: 650; letter-spacing: -0.01em; }
-    .cand-view .cand-sub { font-size: 0.8125rem; color: var(--muted); margin-bottom: 0.5rem; }
-    .cand-view .cand-note { font-size: 0.875rem; color: var(--text-secondary); margin-bottom: 0.75rem; white-space: pre-wrap; }
-    .cand-view .stat-strip { margin-bottom: 0.75rem; }
-    .cand-view .cand-start { font-size: 0.8125rem; color: var(--text-secondary); margin-bottom: 0.75rem; }
-    .cand-view .cand-map { height: 280px; border-radius: 6px; }
-    .cand-view .cand-elev { height: 160px; margin-top: 0.5rem; }
-    .cand-view .cand-why { margin-top: 0.75rem; font-size: 0.8125rem; }
-    .cand-view .cand-why summary { cursor: pointer; color: var(--text-secondary); }
-    .cand-view .cand-why dl { display: grid; grid-template-columns: 1fr auto; gap: 0.125rem 1rem; margin: 0.5rem 0 0; max-width: 360px; }
-    .cand-view .cand-why dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
-    .cand-view .cand-actions { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem; font-size: 0.8125rem; }
-    .cand-view .cand-actions button {
-      font: inherit; padding: 0.4375rem 0.875rem;
-      color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
-    }
-    .cand-view .cand-actions button:disabled { color: var(--muted); cursor: default; }
-    .cand-view .cand-actions .error { padding: 0; color: var(--series-6); }
-    @media (max-width: 640px) {
-      .cand-view .chart-panel { padding: 0.75rem; }
-      .cand-view .stat { padding: 0.5rem 0.75rem; flex: 1 1 30%; }
-      .cand-view .cand-map { height: 240px; }
-    }
-  </style>
 </head>
 <body>
 <script src="/nav.js"></script>
 <script src="/charts.js"></script>
 <script src="/map.js"></script>
+<script src="/candidate-cards.js"></script>
 
 <main class="cand-view page-view">
   <div id="root"><div class="loading">Loading…</div></div>
@@ -49,11 +23,6 @@
 <script>
   const setId = new URLSearchParams(location.search).get('set');
   const root = document.getElementById('root');
-  const charts = [];
-  const maps = [];
-
-  const miles = (m) => (m / MILE_METERS).toFixed(1);
-  const shapeLabel = (shape) => shape.replace(/_/g, ' ');
 
   async function main() {
     if (!setId) {
@@ -73,132 +42,8 @@
         · ${set.candidates.length} option${set.candidates.length === 1 ? '' : 's'}</div>
       ${set.candidates.map(cardHtml).join('')}
     `;
-    // Each card draws its map and profile when it nears the viewport.
-    const observer = new IntersectionObserver((entries) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue;
-        observer.unobserve(entry.target);
-        loadCard(entry.target);
-      }
-    }, { rootMargin: '400px' });
-    root.querySelectorAll('.cand-card').forEach(card => {
-      observer.observe(card);
-      card.querySelector('button').addEventListener('click', (e) => saveCandidate(card, e.currentTarget));
-    });
+    mountCards(root);
   }
-
-  const RANKING_LABELS = {
-    score: 'Score',
-    value_per_mile: 'Value per mile',
-    connector_cost_per_mile: 'Connector cost per mile',
-    repeats_effect: 'Repeats effect',
-    distance_fit: 'Distance fit',
-    gain_fit: 'Gain fit',
-    shape: 'Shape',
-  };
-
-  function rankingValue(v) {
-    if (typeof v !== 'number') return String(v);
-    return Number.isInteger(v) ? String(v) : v.toFixed(Math.abs(v) < 10 ? 2 : 1);
-  }
-
-  function rankingHtml(ranking) {
-    const terms = Object.entries(ranking ?? {}).filter(([, v]) => v != null && typeof v !== 'object');
-    if (!terms.length) return '';
-    const rows = terms.map(([k, v]) => `<dt>${esc(RANKING_LABELS[k] ?? k)}</dt><dd>${esc(rankingValue(v))}</dd>`).join('');
-    return `<details class="cand-why"><summary>Why this score</summary><dl>${rows}</dl></details>`;
-  }
-
-  function cardHtml(c, i) {
-    const gain = c.gain_m != null ? ` · ${Math.round(c.gain_m * FT_PER_METER)} ft gain` : '';
-    const drive = c.start.drive_minutes != null ? ` · ${Math.round(c.start.drive_minutes)} min drive` : '';
-    const sections = c.sections_used.map(s => `${esc(s.name ?? 'unnamed')} (${miles(s.length_m)} mi)`).join(', ');
-    return `
-      <section class="chart-panel cand-card" data-id="${esc(c.candidate_id)}">
-        <h2>${i + 1}. ${esc(shapeLabel(c.shape))}</h2>
-        <div class="cand-sub">${miles(c.distance_m)} mi${gain}</div>
-        ${c.note ? `<div class="cand-note">${esc(c.note)}</div>` : ''}
-        <div class="stat-strip">
-          ${statTile('Run', c.run_pct.toFixed(0), '%')}
-          ${statTile('Grind', c.grind_pct.toFixed(0), '%')}
-          ${statTile('Hike', c.hike_pct.toFixed(0), '%')}
-          ${statTile('Singletrack', miles(c.singletrack_m), 'mi')}
-          ${statTile('Track', miles(c.track_m), 'mi')}
-          ${statTile('Paved', miles(c.paved_m), 'mi')}
-        </div>
-        <div class="cand-start">Start: ${esc(c.start.label ?? `${c.start.lat.toFixed(4)}, ${c.start.lng.toFixed(4)}`)}${drive}</div>
-        ${sections ? `<div class="cand-start">Runs: ${sections}</div>` : ''}
-        <div class="cand-map skeleton"></div>
-        <div class="legend"><span class="skeleton"></span></div>
-        <div class="cand-elev skeleton"></div>
-        ${rankingHtml(c.ranking)}
-        <div class="cand-actions"><button type="button">Save as route</button><span class="cand-result"></span></div>
-      </section>`;
-  }
-
-  function panelError(el, message) {
-    el.classList.remove('skeleton');
-    el.style.height = 'auto';
-    el.innerHTML = `<div class="error">${esc(message)}</div>`;
-  }
-
-  async function loadCard(card) {
-    const mapEl = card.querySelector('.cand-map');
-    const elevEl = card.querySelector('.cand-elev');
-    const legendEl = card.querySelector('.legend');
-    const res = await getJson(`/api/candidates/${encodeURIComponent(card.dataset.id)}`);
-    if (res.error) {
-      panelError(mapEl, `Could not load the route line: ${res.error}`);
-      panelError(elevEl, `Could not load the elevation profile: ${res.error}`);
-      legendEl.remove();
-      return;
-    }
-    const points = res.data;
-    const theme = chartTheme();
-
-    mapEl.classList.remove('skeleton');
-    const map = L.map(mapEl, { scrollWheelZoom: false });
-    maps.push(map);
-    addBaseLayer(map, { withTerrainData: true });
-    const bounds = L.latLngBounds(drawClassedRoute(L.layerGroup().addTo(map), points, theme));
-    map.fitBounds(bounds, { padding: [16, 16] });
-
-    if (points.some(p => p.cls)) legendEl.innerHTML = classLegendHtml(theme);
-    else legendEl.textContent = 'No elevation data: runnability colors unavailable.';
-
-    if (points.filter(p => p.ele_m != null).length < 2) {
-      panelError(elevEl, 'No elevation profile available.');
-      return;
-    }
-    elevEl.classList.remove('skeleton');
-    const chart = echarts.init(elevEl);
-    charts.push(chart);
-    chart.setOption(classedElevationOption(theme, points));
-    linkChartToMap(chart, () => map, () => points);
-  }
-
-  async function saveCandidate(card, button) {
-    const result = card.querySelector('.cand-result');
-    button.disabled = true;
-    button.textContent = 'Saving…';
-    result.innerHTML = '';
-    try {
-      const res = await fetch(`/api/candidates/${encodeURIComponent(card.dataset.id)}/save`, { method: 'POST' });
-      if (!res.ok) throw new Error(await failure(res));
-      const saved = await res.json();
-      button.textContent = 'Saved';
-      result.innerHTML = `<a href="/route.html?id=${saved.route_id}">Open route</a>`;
-    } catch (e) {
-      button.disabled = false;
-      button.textContent = 'Save as route';
-      result.innerHTML = `<span class="error">${esc(e.message || 'Could not save.')}</span>`;
-    }
-  }
-
-  window.addEventListener('resize', () => {
-    charts.forEach(c => c.resize());
-    maps.forEach(m => m.invalidateSize());
-  });
 
   main();
 </script>

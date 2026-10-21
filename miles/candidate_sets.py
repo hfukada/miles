@@ -42,6 +42,7 @@ class CandidateCard(TypedDict):
     sections_used: list[dict]
     start: CandidateStart
     ranking: dict | None  # the terms of the search's score; absent on walk routes
+    missed_constraints: list[route_search.ConstraintMiss]  # empty unless a near miss
 
 
 class CandidateSetView(TypedDict):
@@ -90,7 +91,7 @@ def create_set(
     return set_id, expires_at
 
 
-def _card(candidate: route_search.RouteCandidateOut, note: str | None) -> CandidateCard:
+def card(candidate: route_search.RouteCandidateOut, note: str | None) -> CandidateCard:
     score = candidate["score"]
     runnability = score["runnability"]
     start = candidate["start"]
@@ -109,6 +110,7 @@ def _card(candidate: route_search.RouteCandidateOut, note: str | None) -> Candid
         "paved_m": score["paved_distance_m"],
         "sections_used": candidate.get("sections_used", []),
         "ranking": candidate.get("ranking"),
+        "missed_constraints": candidate["missed_constraints"],
         "start": {
             "label": start.get("label"),
             "lat": start["lat"],
@@ -132,6 +134,6 @@ def get_set(conn: sqlite3.Connection, set_id: str) -> CandidateSetView:
         "created_at": row["created_at"],
         "expires_at": row["expires_at"],
         "candidates": [
-            _card(route_search.get_route_candidate(conn, cid), data["notes"].get(cid)) for cid in data["candidate_ids"]
+            card(route_search.get_route_candidate(conn, cid), data["notes"].get(cid)) for cid in data["candidate_ids"]
         ],
     }

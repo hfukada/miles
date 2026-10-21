@@ -7,6 +7,7 @@ const NAV_LINKS = [
   { href: "/plan.html", label: "Plan" },
   { href: "/activities.html", label: "Activities" },
   { href: "/training.html", label: "Training" },
+  { href: "/routes.html", label: "Routes", sheetOnPhone: true },  // the phone tab bar fits four tabs and More
   {
     label: "History",
     children: [
@@ -263,6 +264,10 @@ function renderTabbar(path, syncBtn) {
   for (const entry of NAV_LINKS) {
     if (entry.children) {
       sheetLinks.unshift(...entry.children);
+      continue;
+    }
+    if (entry.sheetOnPhone) {
+      sheetLinks.unshift(entry);
       continue;
     }
     const a = document.createElement("a");
