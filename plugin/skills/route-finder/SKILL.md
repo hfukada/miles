@@ -29,7 +29,7 @@ line so they can correct it:
 
 | They say | Parameter |
 |---|---|
-| "13 miles", "about 2 hours" | `distance_mi_min`/`max` (±5–10%; convert time via recent easy pace) |
+| "13 miles", "about 2 hours" | `distance_mi_min`/`max` (±10% by default, so "a 10 miler" is 9–11; narrower only when they say exact, as in "exactly 10" or "10 on the nose"; convert time via recent easy pace) |
 | "loop" / "out and back" / "don't care" | `shape` |
 | "don't mind repeating", "happy to retrace the good part" | `repeat_value` 0.8–1; "no repeats", "no out-and-back" → 0; omit for the default 0.5 |
 | "refill at home around mile 8", "pass the lot halfway", "bottles at the car" | `stops=[{"lat", "lng", "label", "at_mi"}]`: the point, a label, and roughly how far along it should come (omit `at_mi` for "anywhere") |

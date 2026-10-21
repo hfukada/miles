@@ -41,6 +41,7 @@ class CandidateCard(TypedDict):
     paved_m: float
     sections_used: list[dict]
     start: CandidateStart
+    ranking: dict | None  # the terms of the search's score; absent on walk routes
 
 
 class CandidateSetView(TypedDict):
@@ -107,6 +108,7 @@ def _card(candidate: route_search.RouteCandidateOut, note: str | None) -> Candid
         "track_m": score.get("track_distance_m", 0.0),
         "paved_m": score["paved_distance_m"],
         "sections_used": candidate.get("sections_used", []),
+        "ranking": candidate.get("ranking"),
         "start": {
             "label": start.get("label"),
             "lat": start["lat"],

@@ -19,6 +19,10 @@
     .cand-view .cand-start { font-size: 0.8125rem; color: var(--text-secondary); margin-bottom: 0.75rem; }
     .cand-view .cand-map { height: 280px; border-radius: 6px; }
     .cand-view .cand-elev { height: 160px; margin-top: 0.5rem; }
+    .cand-view .cand-why { margin-top: 0.75rem; font-size: 0.8125rem; }
+    .cand-view .cand-why summary { cursor: pointer; color: var(--text-secondary); }
+    .cand-view .cand-why dl { display: grid; grid-template-columns: 1fr auto; gap: 0.125rem 1rem; margin: 0.5rem 0 0; max-width: 360px; }
+    .cand-view .cand-why dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
     .cand-view .cand-actions { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.75rem; font-size: 0.8125rem; }
     .cand-view .cand-actions button {
       font: inherit; padding: 0.4375rem 0.875rem;
@@ -83,6 +87,28 @@
     });
   }
 
+  const RANKING_LABELS = {
+    score: 'Score',
+    value_per_mile: 'Value per mile',
+    connector_cost_per_mile: 'Connector cost per mile',
+    repeats_effect: 'Repeats effect',
+    distance_fit: 'Distance fit',
+    gain_fit: 'Gain fit',
+    shape: 'Shape',
+  };
+
+  function rankingValue(v) {
+    if (typeof v !== 'number') return String(v);
+    return Number.isInteger(v) ? String(v) : v.toFixed(Math.abs(v) < 10 ? 2 : 1);
+  }
+
+  function rankingHtml(ranking) {
+    const terms = Object.entries(ranking ?? {}).filter(([, v]) => v != null && typeof v !== 'object');
+    if (!terms.length) return '';
+    const rows = terms.map(([k, v]) => `<dt>${esc(RANKING_LABELS[k] ?? k)}</dt><dd>${esc(rankingValue(v))}</dd>`).join('');
+    return `<details class="cand-why"><summary>Why this score</summary><dl>${rows}</dl></details>`;
+  }
+
   function cardHtml(c, i) {
     const gain = c.gain_m != null ? ` · ${Math.round(c.gain_m * FT_PER_METER)} ft gain` : '';
     const drive = c.start.drive_minutes != null ? ` · ${Math.round(c.start.drive_minutes)} min drive` : '';
@@ -105,6 +131,7 @@
         <div class="cand-map skeleton"></div>
         <div class="legend"><span class="skeleton"></span></div>
         <div class="cand-elev skeleton"></div>
+        ${rankingHtml(c.ranking)}
         <div class="cand-actions"><button type="button">Save as route</button><span class="cand-result"></span></div>
       </section>`;
   }
@@ -147,6 +174,7 @@
     const chart = echarts.init(elevEl);
     charts.push(chart);
     chart.setOption(classedElevationOption(theme, points));
+    linkChartToMap(chart, () => map, () => points);
   }
 
   async function saveCandidate(card, button) {

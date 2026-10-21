@@ -76,6 +76,9 @@ SECTIONS_BUDGET_SHARE = 0.6
 # Two candidates sharing this share of the longer one's length (by original
 # edge, whatever point a piece was cut at) are one route.
 DUPLICATE_SHARE = 0.95
+# A returned candidate sharing more than this share of its own length with one
+# ranked above it is only returned to fill n when nothing more distinct remains.
+SIMILAR_SHARE = 0.6
 # A stretch run again earns this share of its value; the request may set it
 # from 0 to 1.
 DEFAULT_REPEAT_VALUE = 0.5
@@ -792,7 +795,9 @@ def _diversify(candidates: list[_Candidate], edge_rows: Mapping[int, dict], targ
     shares with those already selected. A section-built candidate ranks by
     its score scaled to the best in the pool, so the penalty weighs the same
     as for a walk's quality, and one under DIVERSITY_FLOOR of the best waits
-    for the rest. A candidate that duplicates a selected one is dropped."""
+    for the rest. A candidate that duplicates a selected one is dropped, and
+    one sharing more than SIMILAR_SHARE of its length with a selected one waits
+    for the candidates that do not."""
     remaining = list(candidates)
     covers = {id(c): _cover(edge_rows, c.segments) for c in candidates}
     selected: list[_Candidate] = []
@@ -811,8 +816,12 @@ def _diversify(candidates: list[_Candidate], edge_rows: Mapping[int, dict], targ
             fraction = min(shared_m / max(cast(float, c.score["distance_m"]), 1.0), 1.0)
             return base(c) - DIVERSITY_WEIGHT * fraction
 
+        def similar(c: _Candidate) -> bool:
+            own = max(sum(covers[id(c)].values()), 1.0)
+            return any(_shared_m(covers[id(c)], covers[id(s)]) > SIMILAR_SHARE * own for s in selected)
+
         eligible = [c for c in remaining if c.ranking is None or base(c) >= DIVERSITY_FLOOR] or remaining
-        best = max(eligible, key=penalized)
+        best = max([c for c in eligible if not similar(c)] or eligible, key=penalized)
         selected.append(best)
         remaining = [c for c in remaining if c is not best and not _duplicate(covers[id(c)], covers[id(best)])]
     return selected

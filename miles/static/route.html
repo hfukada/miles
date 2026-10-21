@@ -244,7 +244,10 @@
       return;
     }
     el.classList.remove('skeleton');
-    if (!elevChart) elevChart = echarts.init(el);
+    if (!elevChart) {
+      elevChart = echarts.init(el);
+      linkChartToMap(elevChart, () => routeMap, classedProfile);
+    }
     elevChart.setOption(classedElevationOption(chartTheme(), classedProfile()), true);
   }
 

@@ -18,7 +18,7 @@ GEOMETRY = (
 )
 
 
-def _store(conn: sqlite3.Connection, candidate_id: str, *, hours: float = 24.0, drive_s: float | None = None) -> None:
+def _store(conn: sqlite3.Connection, candidate_id: str, *, hours: float = 24.0, drive_s: float | None = None, ranking: dict | None = None) -> None:
     start = {"lat": 40.0, "lng": -105.0, "label": "Lot"}
     if drive_s is not None:
         start["drive_s"] = drive_s
@@ -31,6 +31,8 @@ def _store(conn: sqlite3.Connection, candidate_id: str, *, hours: float = 24.0, 
         "missed_constraints": [], "geometry": GEOMETRY, "ways": [],
         "sections_used": [{"section_id": 3, "block_id": 3, "name": "Ridge Loop", "length_m": 4000.0}],
     }
+    if ranking is not None:
+        data["ranking"] = ranking
     expires = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
     conn.execute("INSERT INTO net_candidates VALUES (?, ?, ?)", [candidate_id, expires, json.dumps(data)])
     conn.commit()
@@ -50,6 +52,18 @@ def test_a_set_lists_its_candidates_in_order_with_their_notes_and_summaries(conn
     assert card["start"] == {"label": "Lot", "lat": 40.0, "lng": -105.0, "drive_minutes": 10.0}
     assert (card["run_pct"], card["hike_pct"], card["singletrack_m"], card["paved_m"]) == (60.0, 15.0, 5000.0, 500.0)
     assert card["sections_used"][0]["name"] == "Ridge Loop"
+
+
+def test_a_summary_passes_the_ranking_through_as_stored_and_is_null_without_one(conn: sqlite3.Connection):
+    ranking = {"score": 1.5, "gain_fit": 0.9}
+    _store(conn, "ranked", ranking=ranking)
+    _store(conn, "plain")
+
+    set_id, _ = candidate_sets.create_set(conn, ["ranked", "plain"], "T", None)
+    ranked, plain = candidate_sets.get_set(conn, set_id)["candidates"]
+
+    assert ranked["ranking"] == ranking
+    assert plain["ranking"] is None
 
 
 def test_sharing_keeps_candidates_for_the_whole_life_of_the_set(conn: sqlite3.Connection):

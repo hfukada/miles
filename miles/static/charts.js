@@ -262,7 +262,7 @@ function classedElevationOption(theme, points) {
     ]);
   return {
     animation: false,
-    grid: { top: 12, right: 24, bottom: 32, left: 56 },
+    grid: { top: 12, right: 32, bottom: 32, left: 56 },
     tooltip: chartAxisTooltip(theme, (items) => {
       if (!items.length) return '';
       const v = items[0].data[1];
@@ -270,7 +270,10 @@ function classedElevationOption(theme, points) {
     }),
     xAxis: chartValueAxis(theme, {
       name: 'mi',
+      nameGap: 6,
       min: 0,
+      max: data.length ? data[data.length - 1][0] : undefined,
+      axisLabel: { formatter: (v) => String(+v.toFixed(1)), showMaxLabel: false },
       axisLine: { lineStyle: { color: theme.gridline } },
       splitLine: { show: false },
     }),

@@ -60,10 +60,14 @@ def _candidate_summary(candidate: route_search.RouteCandidateOut) -> dict:
         ],
         "ranking": None if ranking is None else {
             "score": _round(ranking["score"]),
+            "value_per_mile": _round(ranking["value_per_mile"]),
+            "connector_cost_per_mile": _round(ranking["connector_cost_per_mile"]),
+            "repeats_effect": _round(ranking["repeats_effect"], 2),
+            "distance_fit": _round(ranking["distance_fit"], 2),
+            "gain_fit": _round(ranking["gain_fit"], 2),
+            "shape": _round(ranking["shape"], 2),
             "section_quality_miles": _round(ranking["quality_mi"]),
             "access_cost": _round(ranking["access_cost"]),
-            "distance_fit": _round(ranking["fit"], 2),
-            "gain_fit": _round(ranking["gain_fit"], 2),
         },
         "stops": [
             {"label": st["label"], "wanted_mi": st["wanted_mi"], "at_mi": _round(st["at_mi"])}
@@ -354,15 +358,24 @@ def register_routing_tools(mcp: FastMCP) -> None:
         qualifies only if it runs at least 400 m of each named section (or a
         tenth of it, if shorter), and is scored as a whole.
 
-        Section-built candidates rank by ranking.score = section_quality_miles
-        x distance_fit x gain_fit - access_cost, in quality-miles: the adjusted
-        survey quality of the miles run on sections, 1 inside the distance
-        range and falling outside it, 1 inside the purpose's climb band (below)
-        and falling outside it, less the weighted cost of the miles on no
-        section. A stretch run again earns repeat_value (default 0.5, 0 to 1)
-        of its quality the second time and its square after that: 0 when the
+        Candidates rank by quality per mile, not total, so inside the
+        distance range a longer route does not win by length alone:
+        ranking.score = (value_per_mile - connector_cost_per_mile) x
+        distance_fit x gain_fit x shape. value_per_mile is the adjusted survey
+        quality of the miles run on sections, per mile of route (section_quality_miles
+        is the total); connector_cost_per_mile the weighted cost of the miles
+        on no section, per mile; distance_fit is 1 inside the distance range
+        and falls outside it; gain_fit is 1 inside the purpose's climb band
+        (below) and falls outside it; shape (0.6 to 1.15) rewards a route that
+        reaches out from the start and penalizes one that runs close beside
+        itself (a figure eight, a wiggle, a filler spur). A stretch run again
+        earns repeat_value (default 0.5, 0 to 1) of its quality the second time
+        and its square after that, shown as repeats_effect (the share of the
+        quality left after repeats, already in value_per_mile): 0 when the
         athlete wants no repeats, 0.8 to 1 when they do not mind retracing a
-        favorite stretch. surface_preference ("singletrack", "track", "paved",
+        favorite stretch. The returned candidates are meant to differ: one
+        sharing over 60% of its length with a higher-ranked one comes back only
+        to fill n. surface_preference ("singletrack", "track", "paved",
         "any") and unfamiliar_only are survey_area's, used to choose the
         sections when none are named.
 

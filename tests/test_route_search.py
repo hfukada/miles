@@ -530,3 +530,18 @@ def test_diversify_drops_a_duplicate_cut_at_another_point_and_ranks_a_near_dupli
     picked = route_search._diversify([best, duplicate, near_duplicate, different], rows, 2000.0, 5)
 
     assert picked == [best, different, near_duplicate]
+
+
+def test_diversify_returns_a_candidate_sharing_most_of_its_length_only_to_fill_n():
+    rows = {k: {"length_m": m} for k, m in {1: 1000.0, 2: 1000.0, 3: 600.0, 4: 1500.0}.items()}
+
+    def candidate(edge_ids: list[int], score: float) -> route_search._Candidate:
+        length_m = sum(rows[e]["length_m"] for e in edge_ids)
+        return route_search._Candidate(
+            "loop", {"lat": 0.0, "lng": 0.0}, [(e, True) for e in edge_ids], {"distance_m": length_m}, [], "sections", {"score": score}
+        )
+
+    best, similar, different = candidate([1, 2], 10.0), candidate([1, 3], 9.9), candidate([2, 4], 5.0)
+
+    assert route_search._diversify([best, similar, different], rows, 2000.0, 2) == [best, different]
+    assert route_search._diversify([best, similar], rows, 2000.0, 2) == [best, similar]

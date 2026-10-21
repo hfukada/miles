@@ -143,3 +143,24 @@ function drawClassedRoute(layer, points, theme) {
   L.marker(allLatLngs[allLatLngs.length - 1], { icon: dotIcon('#111'), zIndexOffset: 1000 }).addTo(layer);
   return allLatLngs;
 }
+
+// Shows a cased dot on `getMap()` at the route point matching the elevation
+// chart's pointer (mouse hover or touch), and hides it when the pointer
+// leaves. The getters let callers redraw the map or points between events.
+function linkChartToMap(chart, getMap, getPoints) {
+  const marker = L.circleMarker([0, 0], {
+    radius: 6, color: '#ffffff', weight: 3, fillColor: '#2563eb', fillOpacity: 1, interactive: false,
+  });
+  chart.on('updateAxisPointer', (e) => {
+    const map = getMap();
+    const mi = e.axesInfo?.[0]?.value;
+    if (!map || mi == null) return;
+    const target = mi * MILE_METERS;
+    let nearest = null;
+    for (const p of getPoints()) {
+      if (nearest === null || Math.abs(p.dist_m - target) < Math.abs(nearest.dist_m - target)) nearest = p;
+    }
+    if (nearest) marker.setLatLng([nearest.lat, nearest.lng]).addTo(map);
+  });
+  chart.getZr().on('globalout', () => marker.remove());
+}

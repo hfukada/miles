@@ -1,4 +1,5 @@
 import itertools
+import math
 import sqlite3
 
 import pytest
@@ -197,7 +198,7 @@ def ring_loop_scores(conn: sqlite3.Connection, **extra) -> dict[str, float]:
     result = route_search.find_routes(conn, request(pt(0, 600), 1500, 1700, **extra))
     best: dict[str, float] = {}
     for c in result["candidates"]:
-        best[c["shape"]] = max(best.get(c["shape"], -1e9), c["ranking"]["score"])
+        best[c["shape"]] = max(best.get(c["shape"], -1e9), c["ranking"]["score"] / c["ranking"]["shape"])
     return best
 
 
@@ -395,9 +396,14 @@ def test_a_candidate_reports_the_terms_of_its_score_and_the_sections_it_ran(conn
 
     chained = next(c for c in result["candidates"] if len(blocks_used(c)) == 2)
     ranking = chained["ranking"]
-    assert ranking["fit"] == pytest.approx(1.0)
+    assert ranking["distance_fit"] == pytest.approx(1.0)
     assert ranking["gain_fit"] == 1.0  # no purpose
-    assert ranking["score"] == pytest.approx(ranking["quality_mi"] * ranking["fit"] - ranking["access_cost"])
+    miles = chained["distance_m"] / MILE
+    assert ranking["value_per_mile"] == pytest.approx(ranking["quality_mi"] / miles)
+    assert ranking["repeats_effect"] == pytest.approx(1.0)  # a loop of three stretches repeats none
+    assert ranking["score"] == pytest.approx(
+        (ranking["value_per_mile"] - ranking["connector_cost_per_mile"]) * ranking["distance_fit"] * ranking["shape"]
+    )
     assert sum(u["length_m"] for u in chained["sections_used"]) == pytest.approx(chained["distance_m"], rel=0.02)
 
 
@@ -510,3 +516,48 @@ def test_a_candidate_that_runs_none_of_a_named_section_is_excluded(conn: sqlite3
     assert result["candidates"]
     for c in result["candidates"]:
         assert {"Alder Trail trail system", "River Path"} <= used(c)
+
+
+# --- ranking per mile and shape ----------------------------------------------
+
+
+def test_inside_the_range_a_shorter_route_of_higher_quality_per_mile_beats_a_padded_one(conn: sqlite3.Connection):
+    m = Map()
+    m.square(0, 0, 500, name="Ridge Loop")
+    m.line([(500, 500), (500, 1500)], "track", name="Ridge Loop Track")
+    m.build(conn)
+
+    result = route_search.find_routes(conn, request(START, 1900, 4300, shape="any"))
+
+    top, padded = result["candidates"][0], max(result["candidates"], key=lambda c: c["distance_m"])
+    assert top["distance_m"] < 2100 and padded["distance_m"] > 3500
+    assert top["ranking"]["value_per_mile"] > padded["ranking"]["value_per_mile"]
+
+
+def shape_fit_of(edges: dict[int, list[tuple[float, float]]], walk: list[tuple[int, bool]]) -> float:
+    """The shape term of a route that runs the given edges (polylines of
+    (north, east) meters) in the order and direction of `walk`."""
+    asm = assemble.Assembly.__new__(assemble.Assembly)
+    asm._points = {k: [pt(*p) for p in leg] for k, leg in edges.items()}
+    asm.rows = {k: {"length_m": sum(math.dist(a, b) for a, b in zip(leg, leg[1:]))} for k, leg in edges.items()}
+    return asm._shape_fit(walk)
+
+
+def test_a_figure_eight_scores_lower_on_shape_than_an_open_loop_of_the_same_length():
+    open_loop = shape_fit_of({1: [(0, 0), (0, 1000), (1000, 1000), (1000, 0), (0, 0)]}, [(1, True)])
+    eight = shape_fit_of(
+        {1: [(0, 0), (500, 500), (0, 1000), (-500, 500), (0, 0)], 2: [(0, 0), (500, -500), (0, -1000), (-500, -500), (0, 0)]},
+        [(1, True), (2, True)],
+    )
+    assert eight < open_loop - 0.1
+
+
+def test_a_route_that_doubles_back_alongside_itself_scores_lower_than_one_that_does_not():
+    plain = shape_fit_of({1: [(0, 0), (0, 2000), (1000, 2000), (1000, 0), (0, 0)]}, [(1, True)])
+    folded = shape_fit_of({1: [(0, 0), (0, 2000), (30, 2000), (30, 200), (60, 200), (60, 2000), (90, 2000), (90, 0), (0, 0)]}, [(1, True)])
+    assert folded < plain - 0.1
+
+
+def test_a_deliberate_out_and_back_is_not_penalized_for_retracing_itself():
+    out = {1: [(0, 0), (0, 500), (400, 1000)]}
+    assert shape_fit_of(out, [(1, True), (1, False)]) == pytest.approx(assemble.SHAPE_MAX)

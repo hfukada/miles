@@ -30,7 +30,7 @@ walk runs it as a piece or crosses it inside a connector; only miles on no
 stretch are charged. Repeats are counted per piece, or per edge off the chosen
 stretches, whichever way the mile was run.
 
-    score = quality x fit x gain_fit - access_cost
+    score = (quality - access_cost) per mile x fit x gain_fit x shape
 
     quality     = sum over the miles run on stretches of density x meters,
                   repeats discounted as above
@@ -40,6 +40,17 @@ stretches, whichever way the mile was run.
                   with no purpose
     access_cost = the weighted miles of connector on no stretch at
                   CONNECTOR_CHARGE_PER_WEIGHTED_MI
+    shape       = SHAPE_MIN..SHAPE_MAX: how far the route reaches from the start
+                  as a share of its length (a route that stays near home folds
+                  back on itself), less the share of its length that runs within
+                  PROXIMITY_M of a part of itself at least PROXIMITY_APART_M away
+                  along the route. Miles run twice are left out of that share:
+                  repeat_value has already charged them.
+
+A route is ranked per mile because its value otherwise grows with its length,
+and inside the range the longest padded walk would always win. The beam's
+bound on partial walks stays in total value, which is what the miles left can
+still earn; finished walks are compared per mile.
 """
 
 import itertools
@@ -103,6 +114,14 @@ ROUND_DISCOUNT = 0.4
 SCANNED_COMPLETIONS = 600
 MAX_COMPLETIONS = 60
 MAX_WALKS = 120
+
+# The shape term (module docstring). A plain loop reaches about a third of its
+# length from the start, so a quarter counts as fully open.
+SHAPE_MIN = 0.6
+SHAPE_MAX = 1.15
+OPEN_REACH = 0.25
+PROXIMITY_M = 50.0
+PROXIMITY_APART_M = 400.0
 
 # A walk that repeats this share of its length is an out-and-back, and one whose
 # last edges retrace its first by MIN_STEM_M or more, a lollipop.
@@ -387,6 +406,9 @@ class Walk:
     # Total vertical travel (climb plus descent) in meters, which is twice a
     # closed route's gain.
     vert_m: float
+    # The value before repeats were discounted, and the shape term.
+    full_value: float
+    shape_fit: float
 
 
 @dataclass
@@ -462,6 +484,7 @@ class Assembly:
         self._sink_links: dict[int, list[_Link]] = {}
         self._home_m: Mapping[int, float] = {}
         self._worth: dict[int, float] = {}
+        self._points: dict[int, list[tuple[float, float]]] = {}
 
     # -----------------------------------------------------------------------
     # The graph
@@ -664,8 +687,61 @@ class Assembly:
             return 1.0
         return survey.gain_fit(gain_m * FT_PER_M / (max(distance_m, 1.0) / MILE_M), self.plan.gain_band)
 
+    @staticmethod
+    def _per_mile(value: float, cost: float, distance_m: float) -> float:
+        return (value - cost) / max(distance_m / MILE_M, 1e-9)
+
     def _score(self, state: _State) -> float:
-        return state.value * self._fit(state.dist_m) * self._gain_fit(state.vert_m / 2.0, state.dist_m) - state.cost
+        return self._per_mile(state.value, state.cost, state.dist_m) * self._fit(state.dist_m) * self._gain_fit(state.vert_m / 2.0, state.dist_m)
+
+    def _shape_fit(self, segments: Sequence[tuple[int, bool]]) -> float:
+        """The shape term of a route (see the module docstring)."""
+        if not segments:
+            return 1.0
+        runs = Counter(key for key, _ in segments)
+        first = self._edge_points(segments[0][0])
+        lat0, lng0 = first[0] if segments[0][1] else first[-1]
+        kx = math.cos(math.radians(lat0)) * routes_spatial.METERS_PER_DEG_LAT
+        points: list[tuple[float, float, float, float, bool]] = []
+        arc = reach = 0.0
+        for key, forward in segments:
+            raw = self._edge_points(key)
+            if not forward:
+                raw = raw[::-1]
+            length = self.rows[key]["length_m"]
+            step = length / max(len(raw) - 1, 1)
+            for i, (lat, lng) in enumerate(raw):
+                x, y = (lng - lng0) * kx, (lat - lat0) * routes_spatial.METERS_PER_DEG_LAT
+                reach = max(reach, math.hypot(x, y))
+                if i < len(raw) - 1:
+                    points.append((x, y, arc + i * step, step, runs[key] > 1))
+            arc += length
+        if arc <= 0:
+            return 1.0
+        cells: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
+        for i, (x, y, _s, _w, repeated) in enumerate(points):
+            if not repeated:
+                cells[int(x // PROXIMITY_M), int(y // PROXIMITY_M)].append(i)
+        near_m = 0.0
+        for members in cells.values():
+            for i in members:
+                x, y, s, w, _r = points[i]
+                cx, cy = int(x // PROXIMITY_M), int(y // PROXIMITY_M)
+                if any(
+                    min(abs(points[j][2] - s), arc - abs(points[j][2] - s)) >= PROXIMITY_APART_M
+                    and math.hypot(points[j][0] - x, points[j][1] - y) <= PROXIMITY_M
+                    for dx in (-1, 0, 1) for dy in (-1, 0, 1) for j in cells.get((cx + dx, cy + dy), ())
+                ):
+                    near_m += w
+        openness = SHAPE_MIN + (SHAPE_MAX - SHAPE_MIN) * min(reach / arc / OPEN_REACH, 1.0)
+        return min(max(openness * (1.0 - near_m / arc), SHAPE_MIN), SHAPE_MAX)
+
+    def _edge_points(self, key: int) -> list[tuple[float, float]]:
+        found = self._points.get(key)
+        if found is None:
+            row = self.rows[key]
+            found = self._points[key] = [(p[0], p[1]) for p in network.unpack_edge_points(bytes(row["points_blob"]))]
+        return found
 
     def _earn(self, state: _State, entries: Sequence[_Entry]) -> tuple[float, int, int]:
         """What running `entries` after `state` earns, and the repeat counts after."""
@@ -791,7 +867,7 @@ class Assembly:
         traversal: Traversal = []
         block_m: defaultdict[int, float] = defaultdict(float)
         passes: Counter[int] = Counter()
-        value = 0.0
+        value = full_value = 0.0
         for before, s in zip(chain, chain[1:]):
             action = s.action
             if isinstance(action, _Run):
@@ -805,6 +881,7 @@ class Assembly:
             for entry in entries:
                 block_m[entry.block] += entry.meters
                 value += entry.value * self.repeat_value ** min(passes[entry.bit], 2)
+                full_value += entry.value
                 passes[entry.bit] += 1
         reached: list[dict] = []
         for spec in self.stops:
@@ -813,8 +890,9 @@ class Assembly:
                 "label": spec.stop.get("label"), "lat": spec.stop["lat"], "lng": spec.stop["lng"],
                 "wanted_mi": spec.stop.get("at_mi"), "at_mi": None if visit is None else visit.dist_m / MILE_M,
             })
-        score = value * self._fit(state.dist_m) * self._gain_fit(state.vert_m / 2.0, state.dist_m) - state.cost
-        return Walk(start, traversal, _shape(traversal), state.dist_m, value, state.cost, score, block_m, reached, state.vert_m)
+        shape_fit = self._shape_fit(route_search._flatten(traversal))
+        score = self._per_mile(value, state.cost, state.dist_m) * self._fit(state.dist_m) * self._gain_fit(state.vert_m / 2.0, state.dist_m) * shape_fit
+        return Walk(start, traversal, _shape(traversal), state.dist_m, value, state.cost, score, block_m, reached, state.vert_m, full_value, shape_fit)
 
     def rank_path(self, start: Start, segments: Sequence[tuple[int, bool]], distance_m: float, gain_m: float | None) -> dict:
         """The terms of a path's score that was not built by this search: the
@@ -822,7 +900,7 @@ class Assembly:
         on the rest, as `rank` gives a walk."""
         passes: Counter[int] = Counter()
         block_m: defaultdict[int, float] = defaultdict(float)
-        value = weighted = vert_m = 0.0
+        value = full_value = weighted = vert_m = 0.0
         for key, _ in segments:
             vert_m += self._vertical(key)
             entries = self._entries_of(key)
@@ -831,13 +909,16 @@ class Assembly:
             for entry in entries:
                 block_m[entry.block] += entry.meters
                 value += entry.value * self.repeat_value ** min(passes[entry.bit], 2)
+                full_value += entry.value
                 passes[entry.bit] += 1
         cost = CONNECTOR_CHARGE_PER_WEIGHTED_MI * weighted / MILE_M
-        return self.rank(Walk(start, [], "", distance_m, value, cost, 0.0, block_m, [], vert_m), gain_m)
+        walk = Walk(start, [], "", distance_m, value, cost, 0.0, block_m, [], vert_m, full_value, self._shape_fit(segments))
+        return self.rank(walk, gain_m)
 
     def rank(self, walk: Walk, gain_m: float | None) -> dict:
         """The terms of a walk's score and the sections it runs, the climb
-        being the route's own when it is known and else the walk's estimate."""
+        being the route's own when it is known and else the walk's estimate.
+"""
         fit = self._fit(walk.distance_m)
         gain_fit = self._gain_fit(walk.vert_m / 2.0 if gain_m is None else gain_m, walk.distance_m)
         used = [
@@ -850,11 +931,17 @@ class Assembly:
             for i, m in sorted(walk.block_m.items(), key=lambda kv: -kv[1])
             if m >= MIN_INCLUDE_M
         ]
+        miles = max(walk.distance_m / MILE_M, 1e-9)
+        value_per_mile, cost_per_mile = walk.value / miles, walk.cost / miles
         return {
-            "score": walk.value * fit * gain_fit - walk.cost,
+            "score": (value_per_mile - cost_per_mile) * fit * gain_fit * walk.shape_fit,
             "quality_mi": walk.value,
-            "fit": fit,
+            "value_per_mile": value_per_mile,
+            "connector_cost_per_mile": cost_per_mile,
+            "repeats_effect": walk.value / walk.full_value if walk.full_value > 0 else 1.0,
+            "distance_fit": fit,
             "gain_fit": gain_fit,
+            "shape": walk.shape_fit,
             "access_cost": walk.cost,
             "sections_used": used,
         }

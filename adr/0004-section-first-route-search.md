@@ -219,11 +219,29 @@ out-and-back when its stretch is better.
   ways, and per route preferences and terrain model (their edge costs), bounded to
   3 areas and 1000 trees each. Trees from the start and the stops depend on the
   request's own splice of those points into the graph and are computed per request.
-- **Ranking, in quality-miles:** `score = quality x fit x gain_fit - access_cost`, with
-  `quality` the miles run on stretches weighted as above, `fit` 1 inside the range and falling by
+- **Ranking, per mile:** `score = (quality - access_cost) / miles x fit x gain_fit x shape`,
+  with `quality` the miles run on stretches weighted as above, `fit` 1 inside the range and falling by
   twice the miss as a share of the target outside it. A candidate reports
   `built_from`, `sections_used` (section, stretch and meters, a meter run twice counted
-  twice, those with 400 m or more) and these terms.
+  twice, those with 400 m or more) and these terms (`value_per_mile`,
+  `connector_cost_per_mile`, `repeats_effect`, `distance_fit`, `gain_fit`, `shape`, `score`).
+  Total quality grew with length, so inside the range the longest walk always won and
+  the search padded to the maximum; per mile it must be better, not longer. The beam's
+  bound on partial walks stays in total value (what the miles left can still earn);
+  finished walks are ordered per mile, as the final ranking is. `repeat_value` still
+  discourages retracing, since a repeated mile lowers the average.
+- **`shape`** (0.6 to 1.15, multiplicative) is the route's reach (farthest straight-line
+  distance from the start as a share of its length, full credit at a quarter) mapped onto
+  that range, times one minus the share of its length that runs within 50 m of a part of
+  itself at least 400 m away along the route (the route is closed at the start, so the
+  distance is taken either way round). Miles run twice are left out of that share, since
+  `repeat_value` has charged them. It separates a figure eight, a wiggle or a filler spur
+  from an open loop; reach was chosen over enclosed area because a loop's area is
+  sensitive to a single detour while its reach is not.
+- **The returned candidates differ.** One sharing more than `SIMILAR_SHARE` (60%) of its
+  length, by original edge, with a higher-ranked returned one is passed over while a more
+  distinct one remains, and is returned only to fill `n`. The 95% rule still drops a
+  duplicate from the pool.
 - **Fallback.** The random walk runs only for a request that names no sections and
   has no stops, when no section-built candidate meets the request; the section search
   then uses 60% of the time budget and leaves the rest to the walk.
