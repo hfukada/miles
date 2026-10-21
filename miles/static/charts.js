@@ -367,7 +367,7 @@ function renderLoadCharts(acwrEl, monotonyEl, data) {
     const d = data.days[params[0].dataIndex];
     const lines = [
       d.acwr != null ? `Ratio: ${d.acwr.toFixed(2)} (${bandLabel[d.acwr_band]})` : 'Ratio: not enough history',
-      `Day load: ${Math.round(d.load)}`,
+      d.load_other ? `Day load: ${Math.round(d.load)} (run ${Math.round(d.load_run)} · other ${Math.round(d.load_other)})` : `Day load: ${Math.round(d.load)}`,
       `7-day load: ${Math.round(d.acute)}`,
       d.chronic_weekly != null ? `28-day weekly avg: ${Math.round(d.chronic_weekly)}` : null,
       d.monotony != null ? `Monotony: ${d.monotony.toFixed(2)}` : null,
@@ -445,5 +445,6 @@ function renderLoadCharts(acwrEl, monotonyEl, data) {
   if (c && c.acwr != null) parts.push(`Today: ratio ${c.acwr.toFixed(2)} (${bandLabel[c.acwr_band].toLowerCase()})`);
   if (c && c.monotony != null) parts.push(`monotony ${c.monotony.toFixed(2)}${c.monotony > MONOTONY_HIGH ? ' (high)' : ''}`);
   if (data.estimated_runs) parts.push(`${data.estimated_runs} run${data.estimated_runs === 1 ? '' : 's'} without HR charged the median rate`);
+  if (data.unscored_other) parts.push(`${data.unscored_other} non-run activit${data.unscored_other === 1 ? 'y' : 'ies'} without HR not counted`);
   return { charts: [acwrChart, monotonyChart], captionText: parts.join(' · ') };
 }
