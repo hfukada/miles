@@ -156,3 +156,26 @@ def test_load_without_max_hr_reports_why():
     result = load.load_series(conn, 4, today=TODAY)
 
     assert result["days"] == [] and result["note"] is not None
+
+
+def test_a_non_run_activity_adds_load_from_its_average_hr():
+    conn = memory_db()
+    db.upsert_athlete(conn, max_hr=200, long_run_floor_miles=None)
+    insert_activity(conn, 1, start_date=_day(1), moving_time_s=1800, distance_m=5000, average_heartrate=150)  # 75% -> x3
+    insert_activity(conn, 2, start_date=_day(1), sport_type="RockClimbing", moving_time_s=6000, average_heartrate=110)  # 55% -> x1
+
+    day = load.load_series(conn, 4, today=TODAY)["days"][-2]
+
+    assert (day["load_run"], day["load_other"], day["load"]) == (90.0, 100.0, 190.0)
+
+
+def test_a_non_run_without_hr_adds_nothing_and_is_counted():
+    conn = memory_db()
+    db.upsert_athlete(conn, max_hr=200, long_run_floor_miles=None)
+    insert_activity(conn, 1, start_date=_day(2), moving_time_s=1800, distance_m=5000, average_heartrate=150)
+    insert_activity(conn, 2, start_date=_day(1), sport_type="WeightTraining", moving_time_s=1800)
+
+    result = load.load_series(conn, 4, today=TODAY)
+
+    assert result["unscored_other"] == 1 and result["estimated_runs"] == 0
+    assert result["days"][-2]["load"] == 0.0

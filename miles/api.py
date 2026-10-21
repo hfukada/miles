@@ -17,7 +17,7 @@ import pandas as pd
 import uvicorn
 from typing_extensions import NotRequired, TypedDict
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import Response
@@ -531,7 +531,9 @@ class ActivityListRow(TypedDict):
     id: int
     name: str | None
     start_date: str | None
-    run_type: str
+    sport_type: str | None
+    is_run: bool
+    run_type: str | None  # null for non-runs
     distance_mi: float | None
     moving_time_s: int | None
     pace_min_per_mile: float | None
@@ -543,30 +545,123 @@ class ActivityListPage(TypedDict):
     has_more: bool
 
 
+class SportCount(TypedDict):
+    sport_type: str
+    count: int
+
+
+class RunTypeCount(TypedDict):
+    run_type: str
+    count: int
+
+
+class ActivityFilters(TypedDict):
+    sports: list[SportCount]  # most activities first
+    run_types: list[RunTypeCount]  # effective run types of sport_type 'Run'
+    first_month: str | None  # YYYY-MM
+    last_month: str | None
+
+
+@app.get("/api/activity-filters")
+def get_activity_filters() -> ActivityFilters:
+    """Options for the activities page filters: the sport types and Run's
+    effective run types present in the DB, and the span of months covered."""
+    conn = _conn()
+    sports = conn.execute("""
+        SELECT sport_type, COUNT(*) AS n FROM activities
+        WHERE sport_type IS NOT NULL
+        GROUP BY sport_type ORDER BY n DESC, sport_type
+    """).fetchall()
+    run_types = conn.execute(f"""
+        SELECT {db.EFFECTIVE_RUN_TYPE_SQL} AS t, COUNT(*) AS n FROM activities
+        WHERE sport_type = 'Run' AND {db.EFFECTIVE_RUN_TYPE_SQL} IS NOT NULL
+        GROUP BY t ORDER BY n DESC
+    """).fetchall()
+    span = conn.execute("SELECT MIN(start_date) AS lo, MAX(start_date) AS hi FROM activities").fetchone()
+    return ActivityFilters(
+        sports=[SportCount(sport_type=r["sport_type"], count=r["n"]) for r in sports],
+        run_types=[RunTypeCount(run_type=r["t"], count=r["n"]) for r in run_types],
+        first_month=span["lo"][:7] if span["lo"] else None,
+        last_month=span["hi"][:7] if span["hi"] else None,
+    )
+
+
+def _month_start(month: str) -> date:
+    year, mon = month.split("-")
+    return date(int(year), int(mon), 1)
+
+
+def _activity_filter_sql(
+    sport: list[str], run_type: list[str], from_month: str | None, to_month: str | None,
+) -> tuple[str, list[object]]:
+    """WHERE clause for the activities list. `run_type` narrows only
+    sport_type 'Run' rows; empty lists mean no filter."""
+    conds: list[str] = []
+    params: list[object] = []
+    run_cond = f"{db.EFFECTIVE_RUN_TYPE_SQL} IN ({','.join('?' * len(run_type))})"
+    if sport:
+        others = [s for s in sport if s != "Run"]
+        alts: list[str] = []
+        if others:
+            alts.append(f"sport_type IN ({','.join('?' * len(others))})")
+            params.extend(others)
+        if "Run" in sport:
+            alts.append(f"(sport_type = 'Run' AND {run_cond})" if run_type else "sport_type = 'Run'")
+            params.extend(run_type)
+        conds.append(f"({' OR '.join(alts)})")
+    elif run_type:
+        conds.append(f"(sport_type IS NOT 'Run' OR {run_cond})")
+        params.extend(run_type)
+    if from_month:
+        conds.append("DATE(start_date) >= ?")
+        params.append(_month_start(from_month).isoformat())
+    if to_month:
+        end = _month_start(to_month)
+        next_month = date(end.year + end.month // 12, end.month % 12 + 1, 1)
+        conds.append("DATE(start_date) < ?")
+        params.append(next_month.isoformat())
+    return (" AND ".join(conds) or "1"), params
+
+
+_MONTH_PATTERN = r"^\d{4}-(0[1-9]|1[0-2])$"
+
+
 @app.get("/api/activities-list")
-def get_activities_list(offset: int = 0, limit: int = 50) -> ActivityListPage:
+def get_activities_list(
+    offset: int = 0,
+    limit: int = 50,
+    sport: list[str] = Query(default=[]),
+    run_type: list[str] = Query(default=[]),
+    from_month: str | None = Query(default=None, pattern=_MONTH_PATTERN),
+    to_month: str | None = Query(default=None, pattern=_MONTH_PATTERN),
+) -> ActivityListPage:
     """
-    Paginated activity index, newest first, run sports only (Run/TrailRun/
-    VirtualRun). limit is capped at 200.
+    Paginated activity index, newest first, every sport. Non-runs carry no
+    run_type or pace, and distance only when they have one. limit is capped
+    at 200. Filters: `sport` (repeatable sport_type), `run_type` (repeatable;
+    narrows only 'Run' rows), `from_month`/`to_month` (YYYY-MM, inclusive).
     """
     limit = min(limit, 200)
     conn = _conn()
     sport_clause, sport_params = run_sport_filter()
+    where, where_params = _activity_filter_sql(sport, run_type, from_month, to_month)
     rows = conn.execute(f"""
         SELECT
             activity_id,
             name,
             start_date,
+            sport_type,
+            {sport_clause} AS is_run,
             {db.EFFECTIVE_RUN_TYPE_SQL} AS run_type,
-            ROUND(distance_m / 1609.34, 2) AS distance_mi,
+            ROUND(NULLIF(distance_m, 0) / 1609.34, 2) AS distance_mi,
             moving_time_s,
             {db.pace_sql("average_speed_mps")} AS pace_min_per_mile,
             ROUND(average_heartrate) AS avg_hr
         FROM activities
-        WHERE {sport_clause}
+        WHERE {where}
         ORDER BY start_date DESC
         LIMIT ? OFFSET ?
-    """, [*sport_params, limit + 1, offset]).fetchall()
+    """, [*sport_params, *where_params, limit + 1, offset]).fetchall()
 
     has_more = len(rows) > limit
     rows = rows[:limit]
@@ -577,10 +672,12 @@ def get_activities_list(offset: int = 0, limit: int = 50) -> ActivityListPage:
                 id=r["activity_id"],
                 name=r["name"],
                 start_date=r["start_date"],
-                run_type=r["run_type"],
+                sport_type=r["sport_type"],
+                is_run=bool(r["is_run"]),
+                run_type=r["run_type"] if r["is_run"] else None,
                 distance_mi=r["distance_mi"],
                 moving_time_s=r["moving_time_s"],
-                pace_min_per_mile=r["pace_min_per_mile"],
+                pace_min_per_mile=r["pace_min_per_mile"] if r["is_run"] else None,
                 avg_hr=int(r["avg_hr"]) if r["avg_hr"] is not None else None,
             )
             for r in rows
