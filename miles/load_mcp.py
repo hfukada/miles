@@ -31,15 +31,18 @@ def register_load_tools(mcp: FastMCP) -> None:
     @mcp.tool()
     def get_training_load(weeks: int = 8) -> str:
         """
-        Daily running load (Edwards TRIMP: minutes in each 10%-of-max-HR band
-        weighted 1-5) with injury-risk signals per day: `acwr` (last 7 days of
+        Daily HR load (Edwards TRIMP: minutes in each 10%-of-max-HR band
+        weighted 1-5) from runs plus non-run activities (climbing, lifting,
+        skiing...; scored from average HR, so intermittent efforts read low),
+        split per day as `load_run` / `load_other`, with injury-risk signals per day: `acwr` (last 7 days of
         load / 28-day weekly average; bands low < 0.8, optimal 0.8-1.3, caution
         1.3-1.5, high > 1.5), `monotony` (7-day mean / sd of daily load; > 2 is
         flagged in the literature) and `strain` (7-day load x monotony).
         `current` is today. Ratios are null until 28 days of history exist.
         These are population heuristics with contested evidence, not a
         diagnosis — cite the number and band, never predict an injury.
-        `estimated_runs` counts runs without HR charged the median rate.
+        `estimated_runs` counts runs without HR charged the median rate;
+        `unscored_other` counts non-run activities without HR (no load).
         """
         weeks = max(1, min(weeks, 156))
         with db.connection(connect_derived) as conn:

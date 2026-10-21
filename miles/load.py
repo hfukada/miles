@@ -1,13 +1,15 @@
 """
 Running load and injury-risk signals. Daily load is Edwards TRIMP (minutes in
 each 10%-of-max-HR band x 1..5), from the same per-run HR time as intensity.py;
-a run with no HR is charged the window's median TRIMP per minute. From the
-daily series:
+a run with no HR is charged the window's median TRIMP per minute. Non-run
+activities (climbing, lifting, skiing...) add load from their average HR over
+their moving time; one without HR adds nothing (that median is a running
+rate). From the daily series:
 - acute:chronic workload ratio: last 7 days vs the 28-day weekly average
   (rolling, coupled);
 - monotony (7-day mean / standard deviation of daily load) and strain
   (7-day load x monotony), Foster.
-Runs only, matching the rest of the app. Computed on request; nothing is stored.
+Computed on request; nothing is stored.
 """
 
 import sqlite3
@@ -19,7 +21,7 @@ from typing_extensions import TypedDict
 
 from . import db
 from .intensity import hr_pct_seconds, runs_between
-from .races import run_sport_filter
+from .races import RUN_SPORT_TYPES
 
 AcwrBand = Literal["low", "optimal", "caution", "high"]
 
@@ -34,7 +36,9 @@ CHRONIC_DAYS = 28
 
 class DayLoad(TypedDict):
     date: str
-    load: float
+    load: float  # load_run + load_other
+    load_run: float
+    load_other: float
     acute: float
     chronic_weekly: float | None
     acwr: float | None
@@ -48,6 +52,7 @@ class LoadResponse(TypedDict):
     days: list[DayLoad]
     current: DayLoad | None
     estimated_runs: int  # runs (incl. the 28-day lead-in) charged the median rate (no HR)
+    unscored_other: int  # non-run activities (incl. the lead-in) without HR, so no load
     note: str | None
 
 
@@ -67,9 +72,17 @@ def acwr_band(ratio: float) -> AcwrBand:
     return "high"
 
 
-def daily_loads(conn: sqlite3.Connection, start: date, end: date, max_hr: int) -> tuple[dict[str, float], int]:
-    """TRIMP per calendar day on start..end (days without runs absent), and
-    how many runs were charged the median rate for lack of HR."""
+class DailyLoads(TypedDict):
+    run: dict[str, float]  # TRIMP per calendar day; days without activity absent
+    other: dict[str, float]
+    estimated_runs: int
+    unscored_other: int
+
+
+def daily_loads(conn: sqlite3.Connection, start: date, end: date, max_hr: int) -> DailyLoads:
+    """TRIMP per calendar day on start..end, runs and non-run activities
+    apart, with how many runs were charged the median rate for lack of HR
+    and how many non-runs had no HR to score."""
     runs = runs_between(conn, start, end)
     pcts = hr_pct_seconds(conn, runs, max_hr)
     per_run: dict[int, float] = {
@@ -79,20 +92,36 @@ def daily_loads(conn: sqlite3.Connection, start: date, end: date, max_hr: int) -
     rates = [per_run[r["activity_id"]] / (r["moving_time_s"] / 60.0) for r in runs if r["activity_id"] in per_run]
     median_rate = statistics.median(rates) if rates else 0.0
 
-    out: dict[str, float] = {}
+    run_loads: dict[str, float] = {}
     estimated = 0
     for r in runs:
         load = per_run.get(r["activity_id"])
         if load is None:
             load = median_rate * r["moving_time_s"] / 60.0
             estimated += 1
-        out[r["date"]] = out.get(r["date"], 0.0) + load
-    return out, estimated
+        run_loads[r["date"]] = run_loads.get(r["date"], 0.0) + load
+
+    ph = ",".join("?" * len(RUN_SPORT_TYPES))
+    other_rows = conn.execute(f"""
+        SELECT DATE(start_date) AS d, moving_time_s, average_heartrate
+        FROM activities
+        WHERE sport_type NOT IN ({ph}) AND moving_time_s > 0
+          AND DATE(start_date) >= ? AND DATE(start_date) <= ?
+    """, [*RUN_SPORT_TYPES, start.isoformat(), end.isoformat()]).fetchall()
+    other_loads: dict[str, float] = {}
+    unscored = 0
+    for r in other_rows:
+        if r["average_heartrate"] is None:
+            unscored += 1
+            continue
+        pct = int(float(r["average_heartrate"]) * 100.0 / max_hr)
+        other_loads[r["d"]] = other_loads.get(r["d"], 0.0) + float(r["moving_time_s"]) / 60.0 * edwards_weight(pct)
+
+    return DailyLoads(run=run_loads, other=other_loads, estimated_runs=estimated, unscored_other=unscored)
 
 
-def _first_run_date(conn: sqlite3.Connection) -> date | None:
-    clause, params = run_sport_filter()
-    row = conn.execute(f"SELECT MIN(DATE(start_date)) AS d FROM activities WHERE {clause}", params).fetchone()
+def _first_activity_date(conn: sqlite3.Connection) -> date | None:
+    row = conn.execute("SELECT MIN(DATE(start_date)) AS d FROM activities WHERE moving_time_s > 0").fetchone()
     return date.fromisoformat(row["d"]) if row and row["d"] else None
 
 
@@ -104,25 +133,27 @@ def load_series(conn: sqlite3.Connection, weeks: int, today: date | None = None)
     max_hr = athlete["max_hr"] if athlete else None
     if not max_hr:
         return LoadResponse(
-            max_hr=None, days=[], current=None, estimated_runs=0,
+            max_hr=None, days=[], current=None, estimated_runs=0, unscored_other=0,
             note="No max HR configured; TRIMP load needs it.",
         )
 
     n_days = weeks * 7
     first_day = today - timedelta(days=n_days - 1)
     lead_start = first_day - timedelta(days=CHRONIC_DAYS - 1)
-    loads, estimated = daily_loads(conn, lead_start, today, max_hr)
-    first_run = _first_run_date(conn)
+    loads = daily_loads(conn, lead_start, today, max_hr)
+    first_activity = _first_activity_date(conn)
 
     span = [lead_start + timedelta(days=i) for i in range((today - lead_start).days + 1)]
-    series = [loads.get(d.isoformat(), 0.0) for d in span]
+    run_series = [loads["run"].get(d.isoformat(), 0.0) for d in span]
+    other_series = [loads["other"].get(d.isoformat(), 0.0) for d in span]
+    series = [r + o for r, o in zip(run_series, other_series)]
 
     days: list[DayLoad] = []
     for i in range(CHRONIC_DAYS - 1, len(span)):
         d = span[i]
         acute_window = series[i - ACUTE_DAYS + 1:i + 1]
         acute = sum(acute_window)
-        has_history = first_run is not None and d - timedelta(days=CHRONIC_DAYS - 1) >= first_run
+        has_history = first_activity is not None and d - timedelta(days=CHRONIC_DAYS - 1) >= first_activity
         chronic_weekly = sum(series[i - CHRONIC_DAYS + 1:i + 1]) / (CHRONIC_DAYS / ACUTE_DAYS) if has_history else None
         ratio = acute / chronic_weekly if chronic_weekly else None
         sd = statistics.pstdev(acute_window)
@@ -130,6 +161,8 @@ def load_series(conn: sqlite3.Connection, weeks: int, today: date | None = None)
         days.append(DayLoad(
             date=d.isoformat(),
             load=round(series[i], 1),
+            load_run=round(run_series[i], 1),
+            load_other=round(other_series[i], 1),
             acute=round(acute, 1),
             chronic_weekly=round(chronic_weekly, 1) if chronic_weekly is not None else None,
             acwr=round(ratio, 2) if ratio is not None else None,
@@ -142,6 +175,7 @@ def load_series(conn: sqlite3.Connection, weeks: int, today: date | None = None)
         max_hr=max_hr,
         days=days,
         current=days[-1] if days else None,
-        estimated_runs=estimated,
+        estimated_runs=loads["estimated_runs"],
+        unscored_other=loads["unscored_other"],
         note=None,
     )
