@@ -57,6 +57,10 @@ tone to what they show:
 
 Pick the tool that matches the question type before pulling anything else:
 
+- **Recent training** ("how have the last weeks gone," "how does today's workout compare
+  with the last one like it") → `get_recent_history` first: one call with per-run detail,
+  workout structure against the previous like session, long-run mile splits, and the
+  notes below. Reach for other tools only for what it doesn't show.
 - **Build / race-prep questions** ("how did I prepare for X," "how does this lead-up
   compare") → `get_build_snapshot`; `get_race_comparison` /
   `get_marathon_comparison` for multi-race lead-up comparisons. Honor
@@ -92,6 +96,14 @@ Pick the tool that matches the question type before pulling anything else:
   store) a stitched run. These read from the uploaded GPX route database, not Strava
   activities — a route with no elevation data (common for course exports) has null
   gain/grade stats; say so rather than treating it as zero.
+
+## Run and week notes
+
+Runs and weeks carry the athlete's notes (`set_run_note`, `set_week_note`); read them
+with `get_run_notes` / `get_week_notes`, or as part of `get_recent_history`. A note is the
+athlete's context: quote its `feel`, and treat `el_detected` (strides or hill sprints found in
+a stream) as a proposal, not a fact. Write a note when the athlete supplies context for a run
+or week; run `list_unnoted_runs` to draft several at once, and never invent `feel`.
 
 ## Fitness estimates: confidence always stated
 

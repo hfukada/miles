@@ -208,11 +208,9 @@ who did just avoided running the wrong workout.
 
 ## Sensitivity: story vs. data
 
-Injury history and personal context are more sensitive than raw Strava rows and are never
-written to the database as structured fields. They may inform the draft, and a version `note`
-may carry a structural summary when relevant ("quality stays flat — calf history"), but the
-story itself lives in conversation (and agent memory across sessions), not a DB column. Intake
-is re-asked per plan.
+The database is the athlete's own, so personal context, illness, injury notes, and quoted feel
+may be stored in run and week notes (`set_run_note`, `set_week_note`). Plan version `note`s stay
+structural ("quality stays flat — calf history"), and intake is re-asked per plan.
 
 ## Tone, inherited from `miles:miles`
 
@@ -229,7 +227,7 @@ and direct for a high-volume athlete, gentler and consistency-first for low-volu
 - A bare number with no record behind it. If you can't cite a past build, a checkpoint, or a
   consistency stat, the number isn't ready to propose.
 - Treating a named coach, book, or plan template as authority instead of evidence.
-- Persisting injury history or personal context as a structured field.
+- Putting injury history or personal context in a plan version `note` rather than a run or week note.
 - Re-litigating a risk-shaped disagreement once the athlete's version has been written.
 - Cheerleading. This is a planner, not a hype machine — prescriptions are earned by the record,
   not enthusiasm.

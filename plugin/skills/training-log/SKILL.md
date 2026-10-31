@@ -16,6 +16,11 @@ something in the wrong one.
 | Size | About a page, and stays there | One block, older weeks folded down |
 | Lifetime | Indefinite | Closed out at block end; a new one per block |
 
+Per-run and per-week facts (a session's paces, how a week went, its tags) belong in
+miles' run and week notes, not here; the log keeps capacities, reference
+sessions, the watch list, an adjustments summary, and the block close-out, and
+points at notes instead of copying per-run numbers.
+
 Until the miles server stores these, they are markdown files the deployment
 keeps outside this plugin. The session's context names where they are. If it
 doesn't, ask before creating them anywhere.
@@ -81,9 +86,9 @@ One per block, with these sections:
 - **Reference sessions** — pinned activities with their id and one line on
   why: the bar a later session will be judged against. Pin few; replace a
   reference when a better example of the same thing comes along.
-- **Recent weeks** — the last ~4 weeks, one line each: miles against the
-  plan band, the key sessions, how it felt in the athlete's words. Fold
-  older weeks into one summary line.
+- **Recent weeks** — a short summary of the last few weeks' direction.
+  The per-week numbers and per-run detail live in `get_recent_history` and
+  the notes; don't copy them here.
 - **Adjustments** — dated what-and-why for each plan change. The record of
   truth is the plan version note or the `log_plan_adjustment` entry; write
   there first, then summarize here. A decision that changed nothing in the
@@ -98,8 +103,8 @@ One per block, with these sections:
 
 - **After a notable session**: update *Last stimulus* for any capacity it
   met; pin it if it sets a bar; add anything surprising to the watch list.
-- **End of the week**: add the week's line, fold the oldest, and check each
-  capacity's upkeep window against the record.
+- **End of the week**: write a week note in miles, and check each capacity's
+  upkeep window against the record.
 - **After a plan revision or adjustment**: an Adjustments line, and a status
   change for any capacity whose focus moved.
 - **At block end**: the close-out, then the promotion review with the
@@ -117,6 +122,6 @@ in-progress week.
 - Restating plan targets or adjustment reasoning the plan already holds,
   rather than summarizing and pointing at the version.
 - Upkeep rules too vague to check ("regular hills").
-- A recent-weeks list that grows without folding.
+- Per-run or per-week numbers copied from the record into the log.
 - Coaching in the log. It records what is being built and why; prescribing
   what to run next is `miles-plan`'s job, in conversation.
