@@ -7,7 +7,7 @@ from typing import Literal, Sequence, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from . import areas_mcp, db, elevation, heat, load_mcp, outbound, outbound_mcp, route_locations, routing_mcp
+from . import areas_mcp, db, elevation, heat, load_mcp, notes_mcp, outbound, outbound_mcp, route_locations, routing_mcp
 from . import routes as routes_service
 from .terrain_mcp import register_terrain_tools
 from .weather import ATTRIBUTION as WEATHER_ATTRIBUTION
@@ -1753,18 +1753,6 @@ def _day_with_target(d: db.PlanDayRow) -> dict[str, object]:
     return out
 
 
-def _days_stale(last_sync_at: str | None) -> int | None:
-    """Whole days between last_sync_at (meta.last_sync_at, a UTC ISO
-    timestamp stamped by miles-sync) and today, or None when the DB has
-    never been synced. A plan tool surfacing this alongside last_sync_at
-    lets a planner catch "0 miles this week" reading as a stale sync rather
-    than a slow start before it narrates the number."""
-    if last_sync_at is None:
-        return None
-    synced_date = datetime.fromisoformat(last_sync_at).date()
-    return (date.today() - synced_date).days
-
-
 def _resolve_draft(conn: sqlite3.Connection) -> tuple[int, int] | dict[str, str]:
     """Locates the one in-progress draft (a plan_versions row with
     committed_at IS NULL) and returns (plan_id, version_id). Every
@@ -1810,7 +1798,7 @@ def _draft_state(conn: sqlite3.Connection, plan_id: int) -> dict[str, object]:
         "week_mileage": week_mileage,
         "warnings": warnings,
         "last_sync_at": last_sync_at,
-        "days_stale": _days_stale(last_sync_at),
+        "days_stale": db.days_stale(last_sync_at),
     }
 
 
@@ -2312,7 +2300,7 @@ def get_training_plan(version_n: int | None = None, compare_to: int | None = Non
             "governing_version_n": governing["version"]["version_n"] if governing else None,
             "this_week": this_week,
             "last_sync_at": last_sync_at,
-            "days_stale": _days_stale(last_sync_at),
+            "days_stale": db.days_stale(last_sync_at),
         }
 
         if compare_to is not None:
@@ -2861,6 +2849,7 @@ areas_mcp.register_area_tools(mcp)
 outbound_mcp.register_outbound_tools(mcp)
 routing_mcp.register_routing_tools(mcp)
 load_mcp.register_load_tools(mcp)
+notes_mcp.register_notes_tools(mcp)
 
 
 def main() -> None:

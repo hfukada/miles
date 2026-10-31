@@ -47,6 +47,7 @@ def test_an_activity_changed_on_strava_has_its_laps_description_terrain_and_weat
             [activity_id],
         )
         conn.execute("INSERT INTO weather (activity_id, fetched_at) VALUES (?, 'now')", [activity_id])
+    conn.execute("INSERT INTO run_notes (activity_id, short, updated_at) VALUES (1, 'Hard day', 'now')")
     conn.commit()
 
     changed = _row(1, workout_type=3)
@@ -56,6 +57,7 @@ def test_an_activity_changed_on_strava_has_its_laps_description_terrain_and_weat
     got = conn.execute("SELECT * FROM activities WHERE activity_id = 1").fetchone()
     assert (got["description"], got["laps_synced_at"]) == (None, None)
     assert (got["race_effort"], got["workout_label"]) == ("hard", "steady")  # locally owned columns survive
+    assert conn.execute("SELECT short FROM run_notes WHERE activity_id = 1").fetchone()[0] == "Hard day"
     assert conn.execute("SELECT COUNT(*) FROM laps WHERE activity_id = 1").fetchone()[0] == 0
     for table in ("terrain_segments", "terrain_segment_dates", "weather"):
         remaining = {r[0] for r in conn.execute(f"SELECT activity_id FROM {table}")}

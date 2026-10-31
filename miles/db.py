@@ -3,7 +3,7 @@ import os
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing_extensions import NotRequired, TypedDict
 
@@ -224,7 +224,7 @@ def connection(opener: Callable[[], sqlite3.Connection] | None = None) -> Iterat
         conn.close()
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def add_missing_columns(conn: sqlite3.Connection, table: str, *columns: str) -> bool:
@@ -656,6 +656,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     from .events import init_event_schema
     from .extracts import init_extract_schema
     from .network import init_network_schema
+    from .notes import init_notes_schema
     from .route_search import init_search_schema
     from .sections import init_section_schema
     from .terrain import init_terrain_schema
@@ -668,6 +669,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     init_search_schema(conn)
     init_candidate_set_schema(conn)
     init_section_schema(conn)
+    init_notes_schema(conn)
     # Graphs and sections built before the trail kind, bridge marks and
     # stretches carry none of these; their areas rebuild on the next
     # NETWORK_DERIVE_VERSION check. A judgment stored before sections had
@@ -948,6 +950,16 @@ def get_last_sync_at(conn: sqlite3.Connection) -> str | None:
     without guessing from activities.start_date, which says nothing once a
     sync completes with zero new activities."""
     return get_meta(conn, "last_sync_at")
+
+
+def days_stale(last_sync_at: str | None) -> int | None:
+    """Whole days between last_sync_at (meta.last_sync_at) and today, or None
+    when the DB has never been synced. Shown beside last_sync_at so "0 miles
+    this week" reads as a stale sync, not a slow start."""
+    if last_sync_at is None:
+        return None
+    synced_date = datetime.fromisoformat(last_sync_at).date()
+    return (date.today() - synced_date).days
 
 
 def get_athlete(conn: sqlite3.Connection) -> AthleteRow | None:
