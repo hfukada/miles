@@ -117,7 +117,8 @@ def register_notes_tools(mcp: FastMCP) -> None:
         ft). Weeks back to 26 are one line each (`earlier_weeks`: miles, long
         run, sessions, strides count, tags); older history is one line per
         training period. `last_sync_at` and `days_stale` say how fresh it is.
-        Detections are proposals, not facts. Paces are min/mile, temps °F.
+        Detections are proposals, not facts. `struct` comes from the lap
+        classifier and can be wrong; a run note's `long` is where to correct it. Paces are min/mile, temps °F.
         """
         if weeks < 1:
             raise ValueError("weeks must be at least 1")

@@ -37,6 +37,10 @@ HILL_SPRINTS = _with_bursts(5, (4, 3.6, 6.0))
         (STRIDES, [(3900.0, 20000.0)], []),
         # a three-minute tempo is too long for a stride, and the run's own median stays easy
         (_run([(300, 3.0, 0.0), (36, 4.2, 0.0), (300, 3.0, 0.0)]), [], []),
+        # a long steady climb at a higher effort than the run's flat running
+        (_run([(150, 3.0, 0.0), (200, 3.6, 5.0), (150, 3.0, 0.0)]), [], []),
+        # a progression: each stretch faster than the last, never a burst against its neighbours
+        (_run([(60, 3.0, 0.0), (60, 3.4, 0.0), (60, 3.8, 0.0), (60, 4.2, 0.0), (60, 4.6, 0.0)]), [], []),
         # a mild surge below the burst ratio
         (_with_bursts(5, (6, 3.6, 0.0)), [], []),
     ],

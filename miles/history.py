@@ -147,17 +147,19 @@ def _mile_splits(segments: list[elements.Segment]) -> list[str]:
     miles: dict[int, list[elements.Segment]] = defaultdict(list)
     for s in segments:
         miles[int(s.dist_m // elements.M_PER_MILE)].append(s)
+    last_mile = max(miles)
     out = []
     for index in sorted(miles):
         group = miles[index]
         meters = len(group) * elements.SEGMENT_M
-        if meters < 0.25 * elements.M_PER_MILE:
+        span_mi = (group[-1].dist_m - group[0].dist_m + elements.SEGMENT_M) / elements.M_PER_MILE
+        if span_mi < 0.25:
             continue
         seconds = sum(elements.SEGMENT_M / s.speed_mps for s in group)
         hrs = [s.heartrate for s in group if s.heartrate]
         rise = sum(max(0.0, s.grade_pct) for s in group) * elements.SEGMENT_M / 100 * FT_PER_M
         fall = sum(max(0.0, -s.grade_pct) for s in group) * elements.SEGMENT_M / 100 * FT_PER_M
-        label = str(index + 1) if meters >= 0.9 * elements.M_PER_MILE else f"{index + 1} ({meters / elements.M_PER_MILE:.1f}mi)"
+        label = str(index + 1) if span_mi >= 0.9 or index != last_mile else f"{index + 1} ({span_mi:.1f}mi)"
         hr = f" hr{round(statistics.fmean(hrs))}" if hrs else ""
         out.append(f"{label}: {_pace(meters, seconds)}{hr} +{round(rise)}/-{round(fall)}")
     return out

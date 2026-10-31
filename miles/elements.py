@@ -8,18 +8,29 @@ from collections.abc import Callable, Sequence
 from typing import NamedTuple
 from typing_extensions import TypedDict
 
+import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
+
 from . import terrain
 
 M_PER_MILE = 1609.34
 SEGMENT_M = 20.0
-# A burst is a stretch of segments whose grade-adjusted speed is this multiple
-# of the run's own median; strides and sprints are far above easy running, a
-# tempo or progression stays below it or runs too long.
+# Below this a segment is standing or GPS drift, not running; steep hiking is ~1 m/s.
+MIN_MOVING_MPS = 0.6
+# A burst is a short stretch clearly faster than the running just before and
+# just after it (and than its own surroundings): strides on raw speed, hill
+# sprints on speed relative to the model's speed for the grade. A sustained
+# climb, progression or tempo has no slower side, or lasts too long.
+CANDIDATE_RATIO = 1.15
 BURST_RATIO = 1.3
+GRADE_SMOOTH_SEGMENTS = 3
+SURROUND_SEGMENTS = 15
+SIDE_SEGMENTS = 10
+MIN_SIDE_SEGMENTS = 5
 STRIDE_S = (10.0, 40.0)
 HILL_SPRINT_S = (8.0, 25.0)
 HILL_GRADE_PCT = 4.0
-MIN_BURSTS = 2
+MIN_BURSTS = 3
 
 
 class Segment(NamedTuple):
@@ -37,39 +48,70 @@ class Element(TypedDict):
     source: str
 
 
+def _smooth(values: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving average; DEM grades jump segment to segment and would fake bursts."""
+    padded = np.pad(values, window // 2, mode="edge")
+    return np.convolve(padded, np.ones(window) / window, mode="valid")
+
+
+def _bursts(metric: np.ndarray) -> list[tuple[int, int]]:
+    """Index spans [i, j) of the metric that beat their surroundings and both neighbours."""
+    padded = np.pad(metric, SURROUND_SEGMENTS, mode="edge")
+    surround = np.median(sliding_window_view(padded, 2 * SURROUND_SEGMENTS + 1), axis=1)
+    hot = metric >= CANDIDATE_RATIO * surround
+    overall = np.median(metric)
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while i < len(metric):
+        if not hot[i]:
+            i += 1
+            continue
+        j = i
+        while j < len(metric) and hot[j]:
+            j += 1
+        sides = [metric[max(0, i - SIDE_SEGMENTS) : i], metric[j : j + SIDE_SEGMENTS]]
+        refs = [np.percentile(w, 25) for w in sides if len(w) >= MIN_SIDE_SEGMENTS]
+        level = np.median(metric[i:j])
+        if refs and level >= BURST_RATIO * max(max(refs), overall):
+            spans.append((i, j))
+        i = j
+    return spans
+
+
 def detect_elements(
     segments: Sequence[Segment],
     expected_speed: Callable[[float], float],
     exclude_m: Sequence[tuple[float, float]] = (),
 ) -> list[Element]:
-    """Bursts of stride or hill-sprint length well above the run's median effort
-    (speed divided by the model's speed for the grade), skipping any that overlap
-    an `exclude_m` distance span (a workout's work laps)."""
-    if len(segments) < 2:
+    """Strides and hill sprints: at least MIN_BURSTS bursts of the right length
+    and grade, skipping any that overlap an `exclude_m` distance span (a
+    workout's work laps)."""
+    if len(segments) < 2 * SIDE_SEGMENTS:
         return []
-    effort = [s.speed_mps / expected_speed(s.grade_pct) for s in segments]
-    threshold = BURST_RATIO * statistics.median(effort)
+    speed = np.array([s.speed_mps for s in segments])
+    raw_grade = np.array([s.grade_pct for s in segments])
+    grade = _smooth(raw_grade, GRADE_SMOOTH_SEGMENTS)
+    effort = speed / np.array([expected_speed(g) for g in grade])
 
-    bursts: list[tuple[float, float, float, float]] = []  # start_m, end_m, seconds, mean grade
-    i = 0
-    while i < len(segments):
-        if effort[i] < threshold:
-            i += 1
-            continue
-        j = i
-        while j < len(segments) and effort[j] >= threshold:
-            j += 1
-        start, end = segments[i].dist_m, segments[j - 1].dist_m + SEGMENT_M
-        seconds = sum(SEGMENT_M / segments[k].speed_mps for k in range(i, j))
-        grade = sum(segments[k].grade_pct for k in range(i, j)) / (j - i)
-        if not any(start < hi and end > lo for lo, hi in exclude_m):
-            bursts.append((start, end, seconds, grade))
-        i = j
+    bursts: list[tuple[float, float, float, str]] = []  # start_m, end_m, seconds, kind
+    for metric, uphill, kind in ((speed, False, "strides"), (effort, True, "hill_sprints")):
+        for i, j in _bursts(metric):
+            start, end = segments[i].dist_m, segments[j - 1].dist_m + SEGMENT_M
+            seconds = float(np.sum(SEGMENT_M / speed[i:j]))
+            mean_grade = float(np.mean(raw_grade[i:j]))
+            lo, hi = HILL_SPRINT_S if uphill else STRIDE_S
+            # A hill sprint may be slow, but never slower than the run's own pace.
+            if (mean_grade >= HILL_GRADE_PCT) == uphill and lo <= seconds <= hi and (
+                not uphill or np.mean(speed[i:j]) >= np.median(speed)
+            ) and not any(
+                start < xhi and end > xlo for xlo, xhi in exclude_m
+            ):
+                bursts.append((start, end, seconds, kind))
 
     total_mi = (segments[-1].dist_m + SEGMENT_M) / M_PER_MILE
     found: list[Element] = []
-    for kind, (lo, hi), uphill in (("strides", STRIDE_S, False), ("hill_sprints", HILL_SPRINT_S, True)):
-        group = [b for b in bursts if lo <= b[2] <= hi and (b[3] >= HILL_GRADE_PCT) == uphill]
+    for kind in ("strides", "hill_sprints"):
+        group = [b for b in bursts if b[3] == kind]
         if len(group) < MIN_BURSTS:
             continue
         first_mi, last_mi = group[0][0] / M_PER_MILE, group[-1][1] / M_PER_MILE
@@ -90,9 +132,9 @@ def load_segments(conn: sqlite3.Connection, activity_ids: Sequence[int]) -> dict
     rows = conn.execute(
         f"""
         SELECT activity_id, dist_m, speed_cms, grade_dpct, heartrate FROM terrain_segments
-        WHERE activity_id IN ({','.join('?' * len(activity_ids))}) AND speed_cms > 0 ORDER BY activity_id, idx
+        WHERE activity_id IN ({','.join('?' * len(activity_ids))}) AND speed_cms >= ? ORDER BY activity_id, idx
         """,
-        list(activity_ids),
+        [*activity_ids, MIN_MOVING_MPS * 100],
     )
     for r in rows:
         out[r["activity_id"]].append(Segment(r["dist_m"], r["speed_cms"] / 100.0, r["grade_dpct"] / 10.0, r["heartrate"]))
