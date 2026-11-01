@@ -17,6 +17,7 @@ from miles.streams import (
     median_per_window,
     min_median_max_per_window,
     minetti_cost_ratio,
+    rise_descent_per_window,
     minetti_cost_ratios,
 )
 
@@ -213,3 +214,13 @@ def test_fetch_and_cache_streams_fetches_once_when_the_raw_file_is_missing(monke
     # A second call must not refetch -- the raw file is now on disk.
     fetch_and_cache_streams(777)
     assert calls == [777]
+
+
+def test_rise_and_descent_sum_each_laps_ups_and_downs():
+    df = pd.DataFrame({"time_s": [0, 1, 2, 3, 4, 5], "altitude_m": [10.0, 12.0, None, 11.0, 15.0, 14.0]})
+    # windows: [0,3) -> +2 (10->12); [3,6) -> -1 (12->11, across the gap and the boundary), +4, -1
+    first, second = rise_descent_per_window(df, [0, 3, 6])
+    assert (first["rise"], first["descent"]) == (pytest.approx(2.0), pytest.approx(0.0))
+    assert (second["rise"], second["descent"]) == (pytest.approx(4.0), pytest.approx(2.0))
+    assert rise_descent_per_window(df, [0, 1, 6])[0] == {"rise": None, "descent": None}  # the first sample has no difference
+    assert rise_descent_per_window(df, [0, 6], "no_such_column") == []

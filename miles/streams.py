@@ -268,3 +268,37 @@ def min_median_max_per_window(
         else:
             results.append(WindowStats(min=None, median=None, max=None))
     return results
+
+
+class RiseDescent(TypedDict):
+    rise: float | None
+    descent: float | None
+
+
+def rise_descent_per_window(
+    df: pd.DataFrame,
+    boundaries_s: list[float],
+    value_column: str = "altitude_m",
+) -> list[RiseDescent]:
+    """Summed climbing and descending of value_column within each
+    [boundaries_s[i], boundaries_s[i+1]) window, from raw sample-to-sample
+    differences (the same as activity-detail's elevation loss). Each
+    difference belongs to the window of its later sample, so the step across
+    a lap boundary is counted in the lap it ends in. Returns
+    len(boundaries_s) - 1 entries; windows with no difference -> both None."""
+    if value_column not in df.columns or len(boundaries_s) < 2:
+        return []
+    known = cast(pd.DataFrame, df.loc[df[value_column].notna(), ["time_s", value_column]])
+    diffs = cast(pd.Series, known[value_column].diff())
+    times = cast(pd.Series, known["time_s"])
+    results: list[RiseDescent] = []
+    for start, end in zip(boundaries_s[:-1], boundaries_s[1:]):
+        window = cast(pd.Series, diffs[(times >= start) & (times < end)]).dropna()
+        if len(window):
+            results.append(RiseDescent(
+                rise=float(cast(float, window[window > 0].sum())),
+                descent=-float(cast(float, window[window < 0].sum())),
+            ))
+        else:
+            results.append(RiseDescent(rise=None, descent=None))
+    return results

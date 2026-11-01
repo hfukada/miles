@@ -322,6 +322,7 @@
     paceMedian: true,
     hrMedian: true,
     gap: false,
+    elevation: true,
   };
 
   async function main() {
@@ -404,6 +405,7 @@
               ${toggle('hr', 'HR', HR_COLOR)}
               ${toggle('paceMedian', 'Pace median/lap', PACE_COLOR)}
               ${toggle('hrMedian', 'HR median/lap', HR_COLOR)}
+              ${toggle('elevation', 'Elevation', 'var(--muted)')}
             </div>
           </div>
           <div id="chart-main"></div>
@@ -426,6 +428,9 @@
                   <th class="r">Min HR</th>
                   <th class="r">Median HR</th>
                   <th class="r">Max HR</th>
+                  <th class="r">Elev Gain</th>
+                  <th class="r">Rise</th>
+                  <th class="r">Descent</th>
                 </tr>
               </thead>
               <tbody id="body-laps"></tbody>
@@ -957,6 +962,34 @@
 
     if (lapMarkLine && series.length) series[0].markLine = mergeMarkLines(series[0].markLine, lapMarkLine);
 
+    // Elevation as a faint backdrop: shape only, on a hidden axis scaled so
+    // the profile fills the bottom ~40% of the plot. A 100 ft floor on the
+    // range keeps a flat run looking flat instead of magnifying GPS noise.
+    const elevAxis = { type: 'value', show: false };
+    if (toggleState.elevation) {
+      const elev = streamsData.elevation_ft;
+      const known = elev.filter(v => v != null);
+      if (known.length) {
+        const lo = Math.min(...known);
+        const range = Math.max(Math.max(...known) - lo, 100);
+        elevAxis.min = lo;
+        elevAxis.max = lo + range / 0.4;
+        const step = Math.max(1, Math.floor(t.length / 800));
+        series.push({
+          name: 'Elevation',
+          type: 'line',
+          yAxisIndex: 2,
+          data: t.filter((_, i) => i % step === 0).map((s, j) => [s, elev[j * step]]),
+          showSymbol: false,
+          silent: true,
+          lineStyle: { width: 0 },
+          areaStyle: { color: theme.muted, opacity: 0.12 },
+          itemStyle: { color: theme.muted },
+          z: 0,
+        });
+      }
+    }
+
     if (!mainChart) mainChart = echarts.init(document.getElementById('chart-main'));
     mainChart.setOption({
       animation: false,
@@ -1017,6 +1050,7 @@
           axisLabel: { color: HR_COLOR, fontSize: 10 },
           splitLine: { show: false },
         },
+        elevAxis,
       ],
       series,
     }, { notMerge: true });
@@ -1096,7 +1130,7 @@
     if (!body || !streamsData) return;
     const markers = streamsData.lap_markers;
     if (!markers.length) {
-      body.innerHTML = '<tr><td colspan="9" class="dash">No lap data.</td></tr>';
+      body.innerHTML = '<tr><td colspan="12" class="dash">No lap data.</td></tr>';
       return;
     }
     const medianField = toggleState.gap ? 'median_gap_min_per_mile' : 'median_pace_min_per_mile';
@@ -1111,6 +1145,9 @@
         <td class="r">${m.min_hr != null ? Math.round(m.min_hr) : '—'}</td>
         <td class="r">${m.median_hr != null ? Math.round(m.median_hr) : '—'}</td>
         <td class="r">${m.max_hr != null ? Math.round(m.max_hr) : '—'}</td>
+        <td class="r">${m.elevation_gain_ft != null ? `${m.elevation_gain_ft > 0 ? '+' : ''}${Math.round(m.elevation_gain_ft)} ft` : '—'}</td>
+        <td class="r">${m.rise_ft != null ? `${Math.round(m.rise_ft)} ft` : '—'}</td>
+        <td class="r">${m.descent_ft != null ? `${Math.round(m.descent_ft)} ft` : '—'}</td>
       </tr>
     `).join('');
   }
