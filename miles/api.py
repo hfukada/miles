@@ -969,6 +969,9 @@ class LapMarker(TypedDict):
     max_pace_min_per_mile: float | None
     min_hr: float | None
     max_hr: float | None
+    elevation_gain_ft: float | None
+    rise_ft: float | None
+    descent_ft: float | None
 
 
 class ActivityStreams(TypedDict):
@@ -1058,10 +1061,15 @@ def get_activity_streams(id: int) -> ActivityStreams:
         min_speed_mps = 26.8224 / 25.0
         velocity_stats = streams.min_median_max_per_window(df, boundaries, "velocity_smooth_mps", min_value=min_speed_mps)
         hr_stats = streams.min_median_max_per_window(df, boundaries, "heartrate")
+        elevation = streams.rise_descent_per_window(df, boundaries)
 
-        for (lap_index, cum_distance_m, own_distance_m, duration_s), pace_v, gap_v, hr_v, vstat, hstat, boundary_t in zip(
-            marker_meta, pace_medians, gap_medians, hr_medians, velocity_stats, hr_stats, boundaries[1:]
+        def ft(m: float | None) -> float | None:
+            return round(m * FT_PER_M, 1) if m is not None else None
+
+        for (lap_index, cum_distance_m, own_distance_m, duration_s), pace_v, gap_v, hr_v, vstat, hstat, elev, boundary_t in zip(
+            marker_meta, pace_medians, gap_medians, hr_medians, velocity_stats, hr_stats, elevation, boundaries[1:]
         ):
+            rise, descent = elev["rise"], elev["descent"]
             # velocity is inverted to pace, so its max speed -> min pace and vice versa.
             lap_markers.append(LapMarker(
                 lap_index=lap_index,
@@ -1076,6 +1084,9 @@ def get_activity_streams(id: int) -> ActivityStreams:
                 max_pace_min_per_mile=_speed_to_pace(vstat["min"]) if vstat["min"] is not None else None,
                 min_hr=hstat["min"],
                 max_hr=hstat["max"],
+                elevation_gain_ft=ft(rise - descent) if rise is not None and descent is not None else None,
+                rise_ft=ft(rise),
+                descent_ft=ft(descent),
             ))
 
     return ActivityStreams(
